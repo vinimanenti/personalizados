@@ -13,6 +13,7 @@ const MODELS = Array.from({ length: 18 }, (_, i) => {
     fontSize: 715.51,
     fontSource: "default",
     glyphMap: {}, defaultAdv: 504, textCenters: {},
+    fieldTypes: [], fieldPerType: {}, allGlyphMaps: {},
   };
 });
 const STORES = ["TR Etiquetas", "Jd Adesivos", "Casa do Condi", "VM Adesivos", "IG Stickers"];
@@ -38,59 +39,127 @@ const analyzeSvg = (svgText) => {
   const fields = Object.keys(fieldMap).sort((a, b) => parseInt(a.split("_")[2]) - parseInt(b.split("_")[2]))
     .map(name => ({ name, occurrences: fieldMap[name].length, positions: fieldMap[name] }));
 
-  // Detect which fnt class is used by campo_nome fields
-  const fntClassMatch = svgText.match(/id="campo_nome_\d+"[^>]*class="[^"]*\b(fnt\d+)\b/);
-  const fntClass = fntClassMatch ? fntClassMatch[1] : "fnt0";
+  // Detect fnt class PER FIELD for multi-type layouts
+  const fieldFntMap = {}; // { campo_nome_1: "fnt1", campo_nome_2: "fnt0", ... }
+  for (const f of fields) {
+    // Try both attribute orders: id before class, and class before id
+    const re1 = new RegExp(`<text[^>]*id="${f.name}"[^>]*class="([^"]*)"`);
+    const re2cls = new RegExp(`<text[^>]*class="([^"]*)"[^>]*id="${f.name}"`);
+    const pm = svgText.match(re1) || svgText.match(re2cls);
+    const cls = pm ? pm[1] : "";
+    const fntMatch = cls.match(/fnt(\d+)/);
+    fieldFntMap[f.name] = fntMatch ? `fnt${fntMatch[1]}` : "fnt0";
+  }
 
-  let fontSize = 715.51;
-  const fsRe = new RegExp(`\\.${fntClass}\\s*\\{[^}]*font-size:\\s*([0-9.]+)px`);
-  const fsMatch = svgText.match(fsRe);
-  if (fsMatch) fontSize = parseFloat(fsMatch[1]);
+  // Extract font-size per fnt class
+  const fntSizeMap = {}; // { "fnt0": 278.95, "fnt1": 445, ... }
+  const fntFamilyMap = {}; // { "fnt0": "Times New Roman", ... }
+  const allFntClasses = [...new Set(Object.values(fieldFntMap))];
+  for (const cls of allFntClasses) {
+    const fsRe = new RegExp(`\\.${cls}\\s*\\{[^}]*font-size:\\s*([0-9.]+)px`);
+    const fsMatch = svgText.match(fsRe);
+    fntSizeMap[cls] = fsMatch ? parseFloat(fsMatch[1]) : 715.51;
+    const ffRe = new RegExp(`\\.${cls}\\s*\\{[^}]*font-family:\\s*'([^']+)'`);
+    const ffMatch = svgText.match(ffRe);
+    fntFamilyMap[cls] = ffMatch ? ffMatch[1] : "DK Coal Brush";
+  }
 
-  let fontFamily = "DK Coal Brush";
-  const ffRe = new RegExp(`\\.${fntClass}\\s*\\{[^}]*font-family:\\s*'([^']+)'`);
-  const ffMatch = svgText.match(ffRe);
-  if (ffMatch) fontFamily = ffMatch[1];
+  // Use the first field's font as the "primary" font
+  const primaryFnt = fieldFntMap[fields[0]?.name] || "fnt0";
+  const fontSize = fntSizeMap[primaryFnt] || 715.51;
+  const fontFamily = fntFamilyMap[primaryFnt] || "DK Coal Brush";
 
-  // Extract SVG embedded font glyph widths for precise text centering
-  // Step 1: Find which FontID is used by the campo_nome font family via @font-face CSS
-  const fontFaceRe = new RegExp(`font-family:"${fontFamily.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^}]*src:url\\("#(\\w+)"\\)`, "i");
-  const fontFaceMatch = svgText.match(fontFaceRe);
-  const targetFontId = fontFaceMatch ? fontFaceMatch[1] : "FontID0";
+  // Detect field types: group by font-size to find repeating pattern
+  // Each unique font-size = a "type" (e.g., title, subtitle, phrase)
+  const fieldPerType = {}; // { fieldName: typeIndex }
+  const uniqueSizes = [...new Set(fields.map(f => fntSizeMap[fieldFntMap[f.name]]))];
+  // Determine group size (how many types per sticker)
+  const groupSize = uniqueSizes.length > 1 ? uniqueSizes.length : 1;
 
-  // Step 2: Get default horiz-adv-x for that specific font
-  const defaultAdvRe = new RegExp(`id="${targetFontId}"[^>]*horiz-adv-x="(\\d+)"`);
-  const defaultAdvMatch = svgText.match(defaultAdvRe);
-  const defaultAdv = defaultAdvMatch ? parseInt(defaultAdvMatch[1]) : 504;
+  // If multiple types exist, assign type by position within repeating group
+  const fieldTypes = []; // Array of { label, fontSize, maxWidth, fontFamily, fieldNames[] }
+  if (groupSize > 1) {
+    // Detect the repeating pattern from the first N fields
+    const pattern = [];
+    const seen = new Map();
+    for (let i = 0; i < Math.min(fields.length, groupSize * 2); i++) {
+      const sz = fntSizeMap[fieldFntMap[fields[i].name]];
+      if (!seen.has(sz) && pattern.length < groupSize) {
+        seen.set(sz, pattern.length);
+        pattern.push(sz);
+      }
+    }
+    // Create type configs
+    for (let t = 0; t < groupSize; t++) {
+      const sz = pattern[t];
+      const cls = allFntClasses.find(c => fntSizeMap[c] === sz) || primaryFnt;
+      const fNames = fields.filter((_, i) => i % groupSize === t).map(f => f.name);
+      fieldTypes.push({
+        label: `Tipo ${t + 1}`,
+        fontSize: sz,
+        origFontSize: sz,
+        maxWidth: 3600,
+        fontFamily: fntFamilyMap[cls] || fontFamily,
+        fieldNames: fNames,
+      });
+      fNames.forEach(fn => { fieldPerType[fn] = t; });
+    }
+  } else {
+    // Single type — all fields share same config
+    fields.forEach(f => { fieldPerType[f.name] = 0; });
+    fieldTypes.push({
+      label: "Tipo 1",
+      fontSize,
+      origFontSize: fontSize,
+      maxWidth: 3600,
+      fontFamily,
+      fieldNames: fields.map(f => f.name),
+    });
+  }
 
-  // Step 3: Extract glyphs ONLY from the correct font section
-  const fontStartIdx = svgText.indexOf(`id="${targetFontId}"`);
-  const fontEndIdx = svgText.indexOf("</font>", fontStartIdx);
-  const fontSection = fontStartIdx >= 0 && fontEndIdx >= 0 ? svgText.substring(fontStartIdx, fontEndIdx) : svgText;
-  const glyphMap = {};
-  const glyphRe = /<glyph\s+unicode="(.)"[^>]*horiz-adv-x="(\d+)"/g;
-  let gm;
-  while ((gm = glyphRe.exec(fontSection)) !== null) glyphMap[gm[1]] = parseInt(gm[2]);
+  // Extract ALL glyph maps from ALL fonts used
+  const allGlyphMaps = {}; // { fontFamily: { glyphMap, defaultAdv } }
+  const processedFonts = new Set();
+  for (const ff of [...new Set(Object.values(fntFamilyMap))]) {
+    if (processedFonts.has(ff)) continue;
+    processedFonts.add(ff);
+    const fontFaceRe = new RegExp(`font-family:"${ff.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^}]*src:url\\("#(\\w+)"\\)`, "i");
+    const fontFaceMatch = svgText.match(fontFaceRe);
+    const targetFontId = fontFaceMatch ? fontFaceMatch[1] : "FontID0";
+    const defaultAdvRe = new RegExp(`id="${targetFontId}"[^>]*horiz-adv-x="(\\d+)"`);
+    const defaultAdvMatch = svgText.match(defaultAdvRe);
+    const defAdv = defaultAdvMatch ? parseInt(defaultAdvMatch[1]) : 504;
+    const fontStartIdx = svgText.indexOf(`id="${targetFontId}"`);
+    const fontEndIdx = svgText.indexOf("</font>", fontStartIdx);
+    const fontSection = fontStartIdx >= 0 && fontEndIdx >= 0 ? svgText.substring(fontStartIdx, fontEndIdx) : svgText;
+    const gMap = {};
+    const glyphRe = /<glyph\s+unicode="(.)"[^>]*horiz-adv-x="(\d+)"/g;
+    let gm;
+    while ((gm = glyphRe.exec(fontSection)) !== null) gMap[gm[1]] = parseInt(gm[2]);
+    allGlyphMaps[ff] = { glyphMap: gMap, defaultAdv: defAdv };
+  }
 
-  // Step 4: Compute text centers per column dynamically
-  // Group fields by their X position (fields in the same column share the same X)
-  const measureW = (text) => {
+  // Use primary font glyph map as the main one (for backward compat)
+  const primaryGlyphs = allGlyphMaps[fontFamily] || { glyphMap: {}, defaultAdv: 504 };
+  const glyphMap = primaryGlyphs.glyphMap;
+  const defaultAdv = primaryGlyphs.defaultAdv;
+
+  // Compute text centers per column dynamically
+  const measureW = (text, ff) => {
+    const g = allGlyphMaps[ff] || primaryGlyphs;
     let t = 0;
-    for (const ch of text) t += (glyphMap[ch] || defaultAdv);
+    for (const ch of text) t += (g.glyphMap[ch] || g.defaultAdv);
     return t * fontSize / 1000;
   };
 
-  // Find reference text — the template placeholder (could be "NOME AQUI", "Nome Aqui", etc.)
-  // Use the most common text content across fields as the reference
   const contentCounts = {};
   for (const f of fields) {
     const c = f.positions[0].content;
     contentCounts[c] = (contentCounts[c] || 0) + 1;
   }
   const refText = Object.entries(contentCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || "NOME AQUI";
-  const refWidth = measureW(refText);
+  const refWidth = measureW(refText, fontFamily);
 
-  // Group fields by unique X positions (each unique X = a column)
   const xGroups = {};
   for (const f of fields) {
     const x = Math.round(f.positions[0].x);
@@ -98,24 +167,23 @@ const analyzeSvg = (svgText) => {
     xGroups[x].push(f);
   }
 
-  // For each column, compute center from the reference field's position
-  const colCenterMap = {}; // {roundedX: centerX}
+  const colCenterMap = {};
   for (const [xStr, colFields] of Object.entries(xGroups)) {
-    // Use a field with the reference text to compute center, fall back to first field
     const ref = colFields.find(f => f.positions[0].content === refText) || colFields[0];
     const refX = ref.positions[0].x;
-    const w = measureW(ref.positions[0].content);
+    const fntCls = fieldFntMap[ref.name];
+    const ff = fntFamilyMap[fntCls] || fontFamily;
+    const w = measureW(ref.positions[0].content, ff);
     colCenterMap[xStr] = refX + w / 2;
   }
 
-  // Assign center to each field based on its column
   const textCenters = {};
   for (const f of fields) {
     const x = Math.round(f.positions[0].x);
     textCenters[f.name] = colCenterMap[x] || (f.positions[0].x + refWidth / 2);
   }
 
-  return { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters };
+  return { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps };
 };
 
 /* ─── SVG font text width (uses embedded glyph advances — precise) ─── */
@@ -157,18 +225,23 @@ const injectNames = (svgText, namesList, model, fontOverrides = {}) => {
   const gm = model.glyphMap || {};
   const da = model.defaultAdv || 504;
   const tc = model.textCenters || {};
-
-  // Detect original font size from the campo_nome fnt class
-  const fntClsMatch = svgText.match(/id="campo_nome_\d+"[^>]*class="[^"]*\b(fnt\d+)\b/);
-  const fntCls = fntClsMatch ? fntClsMatch[1] : "fnt0";
-  const origSizeRe = new RegExp(`\\.${fntCls}\\s*\\{[^}]*font-size:\\s*([0-9.]+)px`);
-  const origSizeMatch = svgText.match(origSizeRe);
-  const origFontSize = origSizeMatch ? parseFloat(origSizeMatch[1]) : model.fontSize;
+  const ft = model.fieldTypes || [];
+  const fpt = model.fieldPerType || {};
+  const agm = model.allGlyphMaps || {};
 
   fieldNames.forEach((fieldName, idx) => {
     const name = idx < namesList.length ? namesList[idx] : "";
-    const fieldFontSize = fontOverrides[idx] !== undefined ? fontOverrides[idx] : model.fontSize;
-    const lines = breakLines(name, model.fontFamily, fieldFontSize, model.maxWidth);
+    // Get per-type config if available
+    const typeIdx = fpt[fieldName] !== undefined ? fpt[fieldName] : 0;
+    const typeConfig = ft[typeIdx] || {};
+    const typeFontSize = typeConfig.fontSize || model.fontSize;
+    const typeMaxWidth = typeConfig.maxWidth || model.maxWidth;
+    const typeFontFamily = typeConfig.fontFamily || model.fontFamily;
+    const origFontSize = typeConfig.origFontSize || typeFontSize;
+
+    const fieldFontSize = fontOverrides[idx] !== undefined ? fontOverrides[idx] : typeFontSize;
+    const fieldMaxWidth = typeMaxWidth;
+    const lines = breakLines(name, typeFontFamily, fieldFontSize, fieldMaxWidth);
     const field = model.fields[idx];
     if (!field) return;
 
@@ -188,9 +261,14 @@ const injectNames = (svgText, namesList, model, fontOverrides = {}) => {
     // Text area center for this field — computed from original Corel position + template text width
     const centerX = tc[fieldName] || (firstPos.x + 1500);
 
+    // Use type-specific glyph map if available
+    const typeGlyphs = agm[typeFontFamily] || { glyphMap: gm, defaultAdv: da };
+    const tgm = typeGlyphs.glyphMap;
+    const tda = typeGlyphs.defaultAdv;
+
     let replacement;
     if (lines.length === 1) {
-      const tw = measureSvgFont(lines[0], fieldFontSize, gm, da);
+      const tw = measureSvgFont(lines[0], fieldFontSize, tgm, tda);
       const cx = centerX - tw / 2;
       replacement = `<text x="${cx.toFixed(2)}" y="${baseY}" id="${fieldName}" class="${cls}"${sizeStyle}>${esc(lines[0])}</text>`;
     } else {
@@ -198,7 +276,7 @@ const injectNames = (svgText, namesList, model, fontOverrides = {}) => {
       const totalHeight = lineSpacing * (lines.length - 1);
       const startY = baseY - totalHeight / 2;
       replacement = lines.map((line, li) => {
-        const tw = measureSvgFont(line, fieldFontSize, gm, da);
+        const tw = measureSvgFont(line, fieldFontSize, tgm, tda);
         const cx = centerX - tw / 2;
         return `<text x="${cx.toFixed(2)}" y="${(startY + li * lineSpacing).toFixed(2)}" id="${fieldName}" class="${cls}"${sizeStyle}>${esc(line)}</text>`;
       }).join("\n  ");
@@ -275,90 +353,155 @@ const Tab = ({ active, onClick, icon, label }) => (
 );
 
 /* ── Calibration ── */
+const TYPE_COLORS = ["#e85d3a", "#34d399", "#a78bfa", "#fbbf24", "#f472b6"];
+
 const Calibration = ({ model, onUpdate }) => {
   const [test, setTest] = useState("JOAO PEDRO DA SILVA");
-  const [tw, setTw] = useState(model.maxWidth);
-  const [tf, setTf] = useState(model.fontSize);
-  useEffect(() => { setTw(model.maxWidth); setTf(model.fontSize); }, [model.id]);
+  const ft = model.fieldTypes || [];
+  const hasMultiTypes = ft.length > 1;
 
-  const textW = useMemo(() => measureText(test, model.fontFamily, tf), [test, model.fontFamily, tf]);
-  const lines = useMemo(() => breakLines(test, model.fontFamily, tf, tw), [test, model.fontFamily, tf, tw]);
-  const fits = textW <= tw;
+  // State for each type: { 0: { tw, tf }, 1: { tw, tf }, ... }
+  const [typeConfigs, setTypeConfigs] = useState(() => {
+    const cfg = {};
+    ft.forEach((t, i) => { cfg[i] = { tw: t.maxWidth || model.maxWidth, tf: t.fontSize || model.fontSize }; });
+    if (!ft.length) cfg[0] = { tw: model.maxWidth, tf: model.fontSize };
+    return cfg;
+  });
+  useEffect(() => {
+    const cfg = {};
+    ft.forEach((t, i) => { cfg[i] = { tw: t.maxWidth || model.maxWidth, tf: t.fontSize || model.fontSize }; });
+    if (!ft.length) cfg[0] = { tw: model.maxWidth, tf: model.fontSize };
+    setTypeConfigs(cfg);
+  }, [model.id]);
 
+  const setTc = (idx, key, val) => setTypeConfigs(p => ({ ...p, [idx]: { ...p[idx], [key]: val } }));
+
+  // Preview with current slider values
   const preview = useMemo(() => {
     if (!model.svgData) return null;
+    const previewTypes = ft.map((t, i) => ({ ...t, fontSize: typeConfigs[i]?.tf || t.fontSize, maxWidth: typeConfigs[i]?.tw || t.maxWidth }));
+    const previewModel = { ...model, fieldTypes: previewTypes };
+    if (!hasMultiTypes) {
+      previewModel.fontSize = typeConfigs[0]?.tf || model.fontSize;
+      previewModel.maxWidth = typeConfigs[0]?.tw || model.maxWidth;
+      if (previewModel.fieldTypes[0]) {
+        previewModel.fieldTypes[0].fontSize = previewModel.fontSize;
+        previewModel.fieldTypes[0].maxWidth = previewModel.maxWidth;
+      }
+    }
     const names = model.fields.map((_, i) => i === 0 ? test : "NOME AQUI");
-    return injectNames(model.svgData, names, { ...model, maxWidth: tw, fontSize: tf });
-  }, [model, test, tw, tf]);
+    return injectNames(model.svgData, names, previewModel);
+  }, [model, test, typeConfigs]);
 
-  const dirty = tw !== model.maxWidth || tf !== model.fontSize;
+  const dirty = ft.some((t, i) => {
+    const c = typeConfigs[i];
+    return c && (c.tw !== (t.maxWidth || model.maxWidth) || c.tf !== (t.fontSize || model.fontSize));
+  }) || (!ft.length && (typeConfigs[0]?.tw !== model.maxWidth || typeConfigs[0]?.tf !== model.fontSize));
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
+  const handleApply = () => {
+    if (hasMultiTypes) {
+      const updatedTypes = ft.map((t, i) => ({
+        ...t,
+        fontSize: typeConfigs[i]?.tf || t.fontSize,
+        maxWidth: typeConfigs[i]?.tw || t.maxWidth,
+      }));
+      onUpdate(model.id, { fieldTypes: updatedTypes, fontSize: updatedTypes[0].fontSize, maxWidth: updatedTypes[0].maxWidth });
+    } else {
+      const c = typeConfigs[0];
+      const updatedTypes = ft.length ? [{ ...ft[0], fontSize: c.tf, maxWidth: c.tw }] : [];
+      onUpdate(model.id, { maxWidth: c.tw, fontSize: c.tf, fieldTypes: updatedTypes });
+    }
+  };
+
+  const renderTypeSliders = (idx, label, fontFamily, origFontSize, color) => {
+    const c = typeConfigs[idx] || { tw: 3600, tf: origFontSize };
+    const textW = measureText(test, fontFamily, c.tf);
+    const lines = breakLines(test, fontFamily, c.tf, c.tw);
+    const fits = textW <= c.tw;
+    return (
+      <div key={idx} style={{ background: "var(--card)", borderRadius: 14, border: `1px solid ${color}33`, padding: 20 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
-          <h3 style={{ fontSize: 15, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}><I n="target" s={18} /> Calibração Visual</h3>
+          <h3 style={{ fontSize: 15, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 10, height: 10, borderRadius: "50%", background: color, display: "inline-block" }} />
+            {label}
+            <span style={{ fontSize: 11, color: "var(--t3)", fontWeight: 400 }}>· {fontFamily} · {Math.round(origFontSize)}px</span>
+          </h3>
           <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: fits ? "rgba(52,211,153,.12)" : lines.length > 1 ? "rgba(251,191,36,.12)" : "rgba(248,113,113,.12)", color: fits ? "#34d399" : lines.length > 1 ? "#fbbf24" : "#f87171" }}>
             {fits ? "1 linha" : lines.length > 1 ? `${lines.length} linhas` : "Excede"}
           </span>
         </div>
-        <p style={{ fontSize: 12, color: "var(--t3)", marginBottom: 14 }}>
-          Digite um nome longo. Ajuste o slider até caber na moldura do adesivo.
-        </p>
 
-        <input type="text" value={test} onChange={e => setTest(e.target.value.toUpperCase())} style={{ width: "100%", padding: "10px 14px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10, color: "var(--t1)", fontSize: 14, fontFamily: "inherit", marginBottom: 14, textTransform: "uppercase" }} />
-
-        {/* Bar */}
-        <div style={{ background: "var(--bg)", borderRadius: 10, padding: 12, marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--t2)", marginBottom: 6 }}>
+        {/* Progress bar */}
+        <div style={{ background: "var(--bg)", borderRadius: 10, padding: 10, marginTop: 10, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--t2)", marginBottom: 4 }}>
             <span>Texto: <b style={{ color: "var(--t1)", fontFamily: "mono" }}>{Math.round(textW)}</b></span>
-            <span>Limite: <b style={{ color: "#ff7b5c", fontFamily: "mono" }}>{tw}</b></span>
+            <span>Limite: <b style={{ color, fontFamily: "mono" }}>{c.tw}</b></span>
           </div>
-          <div style={{ height: 8, background: "var(--brd)", borderRadius: 4, overflow: "hidden" }}>
-            <div style={{ height: "100%", borderRadius: 4, transition: "width .15s", width: `${Math.min(100, (textW / tw) * 100)}%`, background: fits ? "#34d399" : lines.length > 1 ? "#fbbf24" : "#f87171" }} />
+          <div style={{ height: 6, background: "var(--brd)", borderRadius: 3, overflow: "hidden" }}>
+            <div style={{ height: "100%", borderRadius: 3, transition: "width .15s", width: `${Math.min(100, (textW / c.tw) * 100)}%`, background: fits ? "#34d399" : lines.length > 1 ? "#fbbf24" : "#f87171" }} />
           </div>
           {lines.length > 1 && (
-            <div style={{ marginTop: 8, fontSize: 11, color: "#fbbf24" }}>
+            <div style={{ marginTop: 6, fontSize: 10, color: "#fbbf24" }}>
               {lines.map((l, i) => <div key={i}>↳ Linha {i + 1}: "{l}"</div>)}
             </div>
           )}
         </div>
 
-        {/* Slider: largura */}
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-            <label style={{ fontSize: 12, color: "var(--t2)" }}>Largura máxima (unidades SVG)</label>
-            <input type="number" value={tw} onChange={e => setTw(parseInt(e.target.value) || 100)} style={{ width: 80, padding: "3px 8px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color: "#ff7b5c", fontSize: 13, fontFamily: "mono", textAlign: "right" }} />
+        {/* Sliders */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+            <label style={{ fontSize: 11, color: "var(--t2)" }}>Largura máxima</label>
+            <input type="number" value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value) || 100)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
           </div>
-          <input type="range" min="1000" max="6000" step="50" value={tw} onChange={e => setTw(parseInt(e.target.value))} style={{ width: "100%", accentColor: "#e85d3a" }} />
+          <input type="range" min="500" max="8000" step="50" value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value))} style={{ width: "100%", accentColor: color }} />
         </div>
-
-        {/* Slider: fonte */}
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-            <label style={{ fontSize: 12, color: "var(--t2)" }}>Tamanho da fonte (px)</label>
-            <input type="number" value={Math.round(tf)} onChange={e => setTf(parseFloat(e.target.value) || 100)} style={{ width: 80, padding: "3px 8px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color: "#ff7b5c", fontSize: 13, fontFamily: "mono", textAlign: "right" }} />
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+            <label style={{ fontSize: 11, color: "var(--t2)" }}>Tamanho fonte</label>
+            <input type="number" value={Math.round(c.tf)} onChange={e => setTc(idx, "tf", parseFloat(e.target.value) || 50)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
           </div>
-          <input type="range" min="100" max="1500" step="5" value={tf} onChange={e => setTf(parseFloat(e.target.value))} style={{ width: "100%", accentColor: "#e85d3a" }} />
+          <input type="range" min="50" max="1500" step="5" value={c.tf} onChange={e => setTc(idx, "tf", parseFloat(e.target.value))} style={{ width: "100%", accentColor: color }} />
         </div>
+      </div>
+    );
+  };
 
-        {/* Info */}
-        <div style={{ fontSize: 11, color: "var(--t3)", padding: 10, background: "var(--bg)", borderRadius: 8 }}>
-          <div>Fonte: <b style={{ color: "var(--t1)" }}>{model.fontFamily}</b> · {Math.round(tf)}px {tf !== model.fontSize && <span style={{ color: "#fbbf24" }}>(original: {model.fontSize}px)</span>}</div>
-          <div>Campos: <b style={{ color: "var(--t1)" }}>{model.fields.length}</b> ({model.fields.filter(f => f.occurrences > 1).length > 0 ? "com linhas duplas no Corel" : "linha única"})</div>
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Test input */}
+      <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
+        <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}><I n="target" s={18} /> Calibração Visual</h3>
+        <p style={{ fontSize: 12, color: "var(--t3)", marginBottom: 10 }}>
+          {hasMultiTypes ? `${ft.length} tipos de campo detectados. Ajuste cada tipo separadamente.` : "Digite um nome longo. Ajuste o slider até caber na moldura."}
+        </p>
+        <input type="text" value={test} onChange={e => setTest(e.target.value.toUpperCase())} placeholder="JOAO PEDRO DA SILVA" style={{ width: "100%", padding: "10px 14px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10, color: "var(--t1)", fontSize: 14, fontFamily: "inherit", textTransform: "uppercase" }} />
+        <div style={{ fontSize: 11, color: "var(--t3)", marginTop: 8 }}>
+          Campos: <b style={{ color: "var(--t1)" }}>{model.fields.length}</b>
+          {hasMultiTypes && <> · <b style={{ color: "var(--t1)" }}>{ft.length} tipos</b> × <b style={{ color: "var(--t1)" }}>{Math.round(model.fields.length / ft.length)} campos/tipo</b></>}
         </div>
-
-        {dirty && (
-          <button onClick={() => onUpdate(model.id, { maxWidth: tw, fontSize: tf })} style={{ width: "100%", marginTop: 12, background: "#e85d3a", color: "#fff", border: "none", padding: "12px", borderRadius: 10, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-            <I n="check" s={16} /> Aplicar: Largura {tw} · Fonte {Math.round(tf)}px
-          </button>
-        )}
       </div>
 
+      {/* Type sliders */}
+      {hasMultiTypes ? ft.map((t, i) => renderTypeSliders(
+        i,
+        `${t.label} (${t.fieldNames?.length || 0} campos)`,
+        t.fontFamily,
+        t.origFontSize || t.fontSize,
+        TYPE_COLORS[i % TYPE_COLORS.length]
+      )) : renderTypeSliders(0, "Calibração", model.fontFamily, model.fontSize, "#e85d3a")}
+
+      {/* Apply button */}
+      {dirty && (
+        <button onClick={handleApply} style={{ width: "100%", background: "#e85d3a", color: "#fff", border: "none", padding: "14px", borderRadius: 10, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <I n="check" s={16} /> Aplicar Calibração
+        </button>
+      )}
+
+      {/* Preview */}
       {preview && (
         <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
           <div style={{ fontSize: 12, color: "var(--t2)", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}><I n="eye" s={14} /> Preview ao vivo</div>
-          <div style={{ background: "#fff", borderRadius: 10, padding: 6, overflow: "auto", maxHeight: 400, border: `2px solid ${fits ? "#34d399" : "#fbbf24"}` }}
+          <div style={{ background: "#fff", borderRadius: 10, padding: 6, overflow: "auto", maxHeight: 400, border: "2px solid var(--brd)" }}
             dangerouslySetInnerHTML={{ __html: preview.replace(/<svg/, '<svg style="width:100%;height:auto"') }} />
         </div>
       )}
@@ -433,15 +576,15 @@ export default function App() {
     const r = new FileReader();
     r.onload = async (ev) => {
       const svg = ev.target.result;
-      const { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters } = analyzeSvg(svg);
+      const { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps } = analyzeSvg(svg);
+      const modelData = { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps };
       // Upload to Supabase Storage
       try {
         const svgUrl = await db.uploadSvg(selId, svg);
-        upd(selId, { svgData: svg, svgUrl, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters });
+        upd(selId, { ...modelData, svgUrl });
       } catch (err) {
         console.error("Erro ao upload SVG:", err);
-        // Still update locally even if upload fails
-        upd(selId, { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters });
+        upd(selId, modelData);
       }
     };
     r.readAsText(file); e.target.value = "";
