@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(npx skills:*)",
+      "Bash(du -sh /c/Users/User/Documents/sticker-studio/sticker-studio/*)",
+      "Bash(wc -l /c/Users/User/Documents/sticker-studio/sticker-studio/svg-templates/*.svg)",
+      "Bash(git init:*)",
+      "Bash(git remote:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
