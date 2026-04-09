@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as db from "./lib/db";
 
 /* ─── constants ─── */
 const MODELS = Array.from({ length: 18 }, (_, i) => {
   const id = String(i + 1).padStart(3, "0");
   return {
     id: `MOD${id}`,
-    thumbUrl: null, svgData: null,
+    thumbUrl: null, svgData: null, svgUrl: null,
     fields: [],
     maxWidth: 3600,
     fontFamily: "DK Coal Brush",
@@ -14,10 +15,7 @@ const MODELS = Array.from({ length: 18 }, (_, i) => {
     glyphMap: {}, defaultAdv: 504, textCenters: {},
   };
 });
-const LS_KEY = "sticker_v5";
 const STORES = ["TR Etiquetas", "Jd Adesivos", "Casa do Condi", "VM Adesivos", "IG Stickers"];
-const load = () => { try { const r = localStorage.getItem(LS_KEY); return r ? JSON.parse(r) : null; } catch { return null; } };
-const save = (m) => { try { localStorage.setItem(LS_KEY, JSON.stringify(m.map(x => ({ ...x, svgData: x.svgData ? x.svgData.substring(0, 250000) : null, thumbUrl: null })))); } catch {} };
 
 /* ─── SVG analysis ─── */
 const analyzeSvg = (svgText) => {
@@ -370,10 +368,7 @@ const Calibration = ({ model, onUpdate }) => {
 
 /* ═══ App ═══ */
 export default function App() {
-  const [models, setModels] = useState(() => {
-    const s = load();
-    return s ? MODELS.map((d, i) => ({ ...d, ...(s[i] || {}) })) : MODELS;
-  });
+  const [models, setModels] = useState(MODELS);
   const [selId, setSelId] = useState(null);
   const [tab, setTab] = useState("gallery");
   const [names, setNames] = useState("");
@@ -383,25 +378,89 @@ export default function App() {
   const [fontOv, setFontOv] = useState({}); // {nameIndex: customFontSize}
   const [orderCode, setOrderCode] = useState(""); // codigo do pedido Shopee
   const [store, setStore] = useState(STORES[0]); // loja selecionada
-  const [printQueue, setPrintQueue] = useState([]); // [{svg, label, store, orderCode, model, timestamp}]
+  const [printQueue, setPrintQueue] = useState([]); // [{id, svg, label, store, orderCode, model, timestamp}]
   const [pdfGenerating, setPdfGenerating] = useState(false);
+  const [dbLoading, setDbLoading] = useState(true);
   const fRef = useRef(null), tRef = useRef(null), foRef = useRef(null);
 
   const sel = models.find(m => m.id === selId);
-  useEffect(() => { save(models); }, [models]);
-  const upd = useCallback((id, u) => setModels(p => p.map(m => m.id === id ? { ...m, ...u } : m)), []);
+
+  // Load from Supabase on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const [dbModels, queue] = await Promise.all([
+          db.fetchModels(),
+          db.fetchPrintQueue(),
+        ]);
+        setModels(prev => prev.map(d => {
+          const remote = dbModels.find(r => r.id === d.id);
+          return remote ? { ...d, ...remote } : d;
+        }));
+        setPrintQueue(queue);
+      } catch (e) {
+        console.error("Erro ao carregar do Supabase:", e);
+      }
+      setDbLoading(false);
+    })();
+  }, []);
+
+  // Load SVG data on demand when a model is selected
+  useEffect(() => {
+    if (!sel || sel.svgData || !sel.svgUrl) return;
+    (async () => {
+      try {
+        const svgText = await db.downloadSvg(sel.svgUrl);
+        setModels(p => p.map(m => m.id === sel.id ? { ...m, svgData: svgText } : m));
+      } catch (e) {
+        console.error("Erro ao baixar SVG:", e);
+      }
+    })();
+  }, [sel?.id, sel?.svgUrl, sel?.svgData]);
+
+  const upd = useCallback((id, u) => {
+    setModels(p => p.map(m => m.id === id ? { ...m, ...u } : m));
+    // Persist to Supabase (fire and forget, non-blocking)
+    const dbUpdates = { ...u };
+    delete dbUpdates.svgData; // SVG data goes to Storage, not DB
+    if (Object.keys(dbUpdates).length > 0) {
+      db.updateModel(id, dbUpdates).catch(e => console.error("Erro ao salvar modelo:", e));
+    }
+  }, []);
 
   const onSvg = (e) => {
     const file = e.target.files[0]; if (!file || !selId) return;
     const r = new FileReader();
-    r.onload = (ev) => {
+    r.onload = async (ev) => {
       const svg = ev.target.result;
       const { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters } = analyzeSvg(svg);
-      upd(selId, { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters });
+      // Upload to Supabase Storage
+      try {
+        const svgUrl = await db.uploadSvg(selId, svg);
+        upd(selId, { svgData: svg, svgUrl, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters });
+      } catch (err) {
+        console.error("Erro ao upload SVG:", err);
+        // Still update locally even if upload fails
+        upd(selId, { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters });
+      }
     };
     r.readAsText(file); e.target.value = "";
   };
-  const onThumb = (e) => { const f = e.target.files[0]; if (!f || !selId) return; const r = new FileReader(); r.onload = (ev) => upd(selId, { thumbUrl: ev.target.result }); r.readAsDataURL(f); e.target.value = ""; };
+  const onThumb = (e) => {
+    const f = e.target.files[0]; if (!f || !selId) return;
+    const r = new FileReader();
+    r.onload = async (ev) => {
+      const dataUrl = ev.target.result;
+      try {
+        const thumbUrl = await db.uploadThumb(selId, dataUrl);
+        upd(selId, { thumbUrl });
+      } catch (err) {
+        console.error("Erro ao upload thumb:", err);
+        upd(selId, { thumbUrl: dataUrl });
+      }
+    };
+    r.readAsDataURL(f); e.target.value = "";
+  };
   const onFont = async (e) => {
     const f = e.target.files[0]; if (!f || !selId) return;
     const r = new FileReader();
@@ -442,7 +501,7 @@ export default function App() {
     const b = await z.generateAsync({ type: "blob" }); const u = URL.createObjectURL(b); const a = document.createElement("a"); a.href = u; a.download = `${sel.id}${store ? `_${store.replace(/\s+/g, "")}` : ""}${orderCode ? `_${orderCode}` : ""}_cartelas.zip`; a.click(); URL.revokeObjectURL(u);
   };
 
-  const addToQueue = () => {
+  const addToQueue = async () => {
     if (!sheets.length || !sel) return;
     const items = sheets.map(s => ({
       svg: s.svg,
@@ -451,7 +510,26 @@ export default function App() {
       names: s.n,
       timestamp: Date.now(),
     }));
-    setPrintQueue(p => [...p, ...items]);
+    try {
+      // Create order in DB
+      const orderId = await db.createOrder({
+        orderCode: orderCode || "SEM_CODIGO",
+        store,
+        modelId: sel.id,
+        names: nl,
+        fontOverrides: fontOv,
+        sheetsCount: sheets.length,
+      });
+      // Add to print queue in DB
+      await db.addToPrintQueue(items, orderId);
+      // Reload queue from DB to get IDs
+      const queue = await db.fetchPrintQueue();
+      setPrintQueue(queue);
+    } catch (err) {
+      console.error("Erro ao adicionar à fila:", err);
+      // Fallback: add locally
+      setPrintQueue(p => [...p, ...items]);
+    }
     // Reset generate data for new order
     setNames("");
     setOrderCode("");
@@ -461,7 +539,13 @@ export default function App() {
     setTab("generate");
   };
 
-  const removeFromQueue = (idx) => setPrintQueue(p => p.filter((_, i) => i !== idx));
+  const removeFromQueue = async (idx) => {
+    const item = printQueue[idx];
+    setPrintQueue(p => p.filter((_, i) => i !== idx));
+    if (item?.id) {
+      db.removeFromPrintQueue(item.id).catch(e => console.error("Erro ao remover:", e));
+    }
+  };
 
   const generatePdf = async () => {
     if (!printQueue.length) return;
@@ -534,6 +618,10 @@ export default function App() {
       // Cleanup
       images.forEach(img => URL.revokeObjectURL(img.url));
 
+      // Mark as printed in DB
+      const ids = printQueue.filter(p => p.id).map(p => p.id);
+      if (ids.length) db.markPrinted(ids).catch(e => console.error(e));
+
       // Download
       pdf.save(`impressao_${new Date().toISOString().slice(0, 10)}.pdf`);
     } catch (err) {
@@ -577,6 +665,7 @@ export default function App() {
       </header>
 
       <main style={{ padding: "24px 32px", maxWidth: 1400, margin: "0 auto" }}>
+        {dbLoading && <div style={{ textAlign: "center", padding: 40, color: "var(--t2)" }}>Carregando dados...</div>}
         {/* GALLERY */}
         {tab === "gallery" && <div style={{ animation: "fadeIn .3s" }}>
           <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Galeria de Modelos</h2>
@@ -642,7 +731,7 @@ export default function App() {
                     <button className="bs" onClick={() => { const n = prompt("Google Font:"); if (n) { const l = document.createElement("link"); l.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(n)}&display=swap`; l.rel = "stylesheet"; document.head.appendChild(l); setTimeout(() => { upd(selId, { fontFamily: n, fontSource: "google" }); setFontOk(p => ({ ...p, [selId]: true })); }, 1000); } }} style={{ flex: 1 }}>Google Fonts</button>
                   </div>
                 </div>
-                {sel.svgData && <button className="bs" onClick={() => upd(selId, { svgData: null, fields: [], thumbUrl: null })} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={16} /> Resetar</button>}
+                {sel.svgData && <button className="bs" onClick={() => upd(selId, { svgData: null, svgUrl: null, fields: [], thumbUrl: null, glyphMap: {}, defaultAdv: 504, textCenters: {} })} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={16} /> Resetar</button>}
               </div>
               <div>
                 {sel.svgData ? <Calibration model={sel} onUpdate={upd} />
@@ -785,7 +874,7 @@ export default function App() {
               <p style={{ color: "var(--t2)", fontSize: 13 }}>{printQueue.length} cartela(s) na fila</p>
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              {printQueue.length > 0 && <button className="bs" onClick={() => setPrintQueue([])} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
+              {printQueue.length > 0 && <button className="bs" onClick={() => { setPrintQueue([]); db.clearPrintQueue().catch(e => console.error(e)); }} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
               <button className="bp" onClick={generatePdf} disabled={!printQueue.length || pdfGenerating} style={{ background: printQueue.length ? "#34d399" : undefined, padding: "12px 28px" }}>
                 <I n="printer" s={18} /> {pdfGenerating ? "Gerando PDF..." : `Gerar PDF (${printQueue.length})`}
               </button>
