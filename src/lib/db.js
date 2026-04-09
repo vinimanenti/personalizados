@@ -1,8 +1,11 @@
 import { supabase } from "./supabase";
 
+export const isConnected = () => !!supabase;
+
 // ─── Models ───
 
 export async function fetchModels() {
+  if (!supabase) return [];
   const { data, error } = await supabase
     .from("models")
     .select("*")
@@ -12,6 +15,7 @@ export async function fetchModels() {
 }
 
 export async function updateModel(id, updates) {
+  if (!supabase) return;
   const row = modelToDb(updates);
   const { error } = await supabase.from("models").update(row).eq("id", id);
   if (error) throw error;
@@ -20,6 +24,7 @@ export async function updateModel(id, updates) {
 // ─── Storage (SVGs & Thumbnails) ───
 
 export async function uploadSvg(modelId, svgText) {
+  if (!supabase) return null;
   const path = `svg/${modelId}.svg`;
   const blob = new Blob([svgText], { type: "image/svg+xml" });
   const { error } = await supabase.storage
@@ -31,6 +36,7 @@ export async function uploadSvg(modelId, svgText) {
 }
 
 export async function uploadThumb(modelId, dataUrl) {
+  if (!supabase) return null;
   const res = await fetch(dataUrl);
   const blob = await res.blob();
   const ext = blob.type.split("/")[1] || "png";
@@ -52,6 +58,7 @@ export async function downloadSvg(url) {
 // ─── Orders ───
 
 export async function createOrder({ orderCode, store, modelId, names, fontOverrides, sheetsCount }) {
+  if (!supabase) return null;
   const { data, error } = await supabase
     .from("orders")
     .insert({
@@ -69,6 +76,7 @@ export async function createOrder({ orderCode, store, modelId, names, fontOverri
 }
 
 export async function fetchOrders(limit = 50) {
+  if (!supabase) return [];
   const { data, error } = await supabase
     .from("orders")
     .select("*")
@@ -90,6 +98,7 @@ export async function fetchOrders(limit = 50) {
 // ─── Print Queue ───
 
 export async function fetchPrintQueue() {
+  if (!supabase) return [];
   const { data, error } = await supabase
     .from("print_queue")
     .select("*")
@@ -112,6 +121,7 @@ export async function fetchPrintQueue() {
 }
 
 export async function addToPrintQueue(items, orderId) {
+  if (!supabase) return;
   const { data: existing } = await supabase
     .from("print_queue")
     .select("position")
@@ -134,11 +144,13 @@ export async function addToPrintQueue(items, orderId) {
 }
 
 export async function removeFromPrintQueue(id) {
+  if (!supabase) return;
   const { error } = await supabase.from("print_queue").delete().eq("id", id);
   if (error) throw error;
 }
 
 export async function clearPrintQueue() {
+  if (!supabase) return;
   const { error } = await supabase
     .from("print_queue")
     .delete()
@@ -147,6 +159,7 @@ export async function clearPrintQueue() {
 }
 
 export async function markPrinted(ids) {
+  if (!supabase) return;
   const { error } = await supabase
     .from("print_queue")
     .update({ status: "printed", printed_at: new Date().toISOString() })
