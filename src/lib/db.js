@@ -17,7 +17,8 @@ export async function fetchModels() {
 export async function updateModel(id, updates) {
   if (!supabase) return;
   const row = modelToDb(updates);
-  const { error } = await supabase.from("models").update(row).eq("id", id);
+  row.id = id;
+  const { error } = await supabase.from("models").upsert(row, { onConflict: "id" });
   if (error) throw error;
 }
 
@@ -53,6 +54,19 @@ export async function downloadSvg(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error("Failed to download SVG");
   return res.text();
+}
+
+export async function uploadFont(modelId, arrayBuffer, fileName) {
+  if (!supabase) return null;
+  const ext = fileName.split(".").pop().toLowerCase();
+  const path = `fonts/${modelId}.${ext}`;
+  const blob = new Blob([arrayBuffer], { type: "font/" + ext });
+  const { error } = await supabase.storage
+    .from("stickers")
+    .upload(path, blob, { upsert: true });
+  if (error) throw error;
+  const { data } = supabase.storage.from("stickers").getPublicUrl(path);
+  return data.publicUrl;
 }
 
 // ─── Orders ───
@@ -93,6 +107,29 @@ export async function fetchOrders(limit = 50) {
     sheetsCount: o.sheets_count,
     createdAt: o.created_at,
   }));
+}
+
+export async function updateOrder(id, updates) {
+  if (!supabase) return;
+  const row = {};
+  if (updates.fontOverrides !== undefined) row.font_overrides = updates.fontOverrides;
+  if (updates.sheetsCount !== undefined) row.sheets_count = updates.sheetsCount;
+  if (updates.store !== undefined) row.store = updates.store;
+  if (updates.orderCode !== undefined) row.order_code = updates.orderCode;
+  const { error } = await supabase.from("orders").update(row).eq("id", id);
+  if (error) throw error;
+}
+
+export async function deleteOrder(id) {
+  if (!supabase) return;
+  const { error } = await supabase.from("orders").delete().eq("id", id);
+  if (error) throw error;
+}
+
+export async function deleteAllOrders() {
+  if (!supabase) return;
+  const { error } = await supabase.from("orders").delete().neq("id", 0);
+  if (error) throw error;
 }
 
 // ─── Print Queue ───
@@ -180,9 +217,14 @@ function dbToModel(row) {
     fontFamily: row.font_family || "DK Coal Brush",
     fontSize: Number(row.font_size) || 715.51,
     fontSource: row.font_source || "default",
+    fontUrl: row.font_url || null,
     glyphMap: row.glyph_map || {},
     defaultAdv: row.default_adv || 504,
     textCenters: row.text_centers || {},
+    fieldTypes: row.field_types || [],
+    fieldPerType: row.field_per_type || {},
+    allGlyphMaps: row.all_glyph_maps || {},
+    displayName: (row.all_glyph_maps || {}).__displayName || null,
   };
 }
 
@@ -195,8 +237,16 @@ function modelToDb(m) {
   if (m.fontFamily !== undefined) row.font_family = m.fontFamily;
   if (m.fontSize !== undefined) row.font_size = m.fontSize;
   if (m.fontSource !== undefined) row.font_source = m.fontSource;
+  if (m.fontUrl !== undefined) row.font_url = m.fontUrl;
   if (m.glyphMap !== undefined) row.glyph_map = m.glyphMap;
   if (m.defaultAdv !== undefined) row.default_adv = m.defaultAdv;
   if (m.textCenters !== undefined) row.text_centers = m.textCenters;
+  if (m.fieldTypes !== undefined) row.field_types = m.fieldTypes;
+  if (m.fieldPerType !== undefined) row.field_per_type = m.fieldPerType;
+  if (m.allGlyphMaps !== undefined || m.displayName !== undefined) {
+    const agm = m.allGlyphMaps || {};
+    if (m.displayName !== undefined) agm.__displayName = m.displayName;
+    row.all_glyph_maps = agm;
+  }
   return row;
 }
