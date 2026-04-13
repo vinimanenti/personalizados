@@ -1508,7 +1508,6 @@ export default function App() {
         </div>
         <div style={{ display: "flex", gap: 4, background: "var(--card)", borderRadius: 12, padding: 4, border: "1px solid var(--brd)" }}>
           <Tab active={tab === "gallery"} onClick={() => setTab("gallery")} icon="grid" label="Modelos" />
-          <Tab active={tab === "config"} onClick={() => setTab("config")} icon="settings" label="Configurar" />
           <Tab active={tab === "generate"} onClick={() => setTab("generate")} icon="list" label="Gerar" />
           <Tab active={tab === "preview"} onClick={() => setTab("preview")} icon="eye" label="Preview" />
           <Tab active={tab === "print"} onClick={() => setTab("print")} icon="printer" label={`Impressão${printQueue.length ? ` (${printQueue.length})` : ""}`} />
@@ -1620,13 +1619,19 @@ export default function App() {
                 <div style={{ padding: "10px 14px" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <div style={{ fontWeight: 700, fontSize: 14 }}>{m.displayName || m.id}</div>
-                    <button onClick={(e) => {
-                      e.stopPropagation();
-                      const newName = prompt("Renomear modelo:", m.displayName || m.id);
-                      if (newName !== null && newName.trim()) {
-                        upd(m.id, { displayName: newName.trim() });
-                      }
-                    }} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={13} /></button>
+                    <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                      <button onClick={(e) => {
+                        e.stopPropagation();
+                        setSelId(m.id); setTab("config");
+                      }} title="Configurar" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "#34d399"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="settings" s={13} /></button>
+                      <button onClick={(e) => {
+                        e.stopPropagation();
+                        const newName = prompt("Renomear modelo:", m.displayName || m.id);
+                        if (newName !== null && newName.trim()) {
+                          upd(m.id, { displayName: newName.trim() });
+                        }
+                      }} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={13} /></button>
+                    </div>
                   </div>
                   <div style={{ fontSize: 11, color: "var(--t2)", marginTop: 2 }}>{m.fields.length > 0 ? `${m.fields.length} campos · ${m.fontFamily}` : "Sem SVG"}</div>
                 </div>
