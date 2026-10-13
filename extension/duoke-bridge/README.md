@@ -14,4 +14,6 @@ Protocolo: mensagens `window.postMessage` usam `version: 1`, `source: 'sticker-s
 
 ## Atualizar uma instalação existente
 
-A versão 1.0.1 conecta o chat em web.duoke.com. Substitua os arquivos da pasta instalada pelos do novo ZIP, abra chrome://extensions ou edge://extensions e clique em Recarregar na Ponte Duoke. Confirme a nova permissão caso o navegador a solicite. Atualize as abas do Studio e do Duoke e conecte as duas novamente.
+A versão 1.0.2 seleciona **Pedido**, digita o código, aguarda o resultado abaixo da barra e clica na linha para abrir a conversa. Não exige a lupa; se a busca não acontecer ao digitar, aciona Enter somente no campo de pesquisa. A coleta continua aguardando a confirmação do pedido e o carregamento das mensagens.
+
+Substitua os arquivos da pasta instalada pelos do novo ZIP, abra chrome://extensions ou edge://extensions e clique em **Recarregar** na Ponte Duoke. Se a extensão está carregada diretamente da pasta `extension/duoke-bridge` deste projeto, basta recarregá-la. Atualize as abas do Studio e do Duoke e conecte as duas novamente.

@@ -5,8 +5,8 @@
   const MESSAGE = '.msg_cont';
   const NOTES = ".order_item_remark, .note_detail, [class*='remark'], [class*='note_detail']";
   const HEADERS = "[data-order-id], [data-order-sn], .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']";
-  const EMPTY = ".el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text";
-  const LOADING = '.el-loading-mask, [aria-busy="true"]';
+  const EMPTY = ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text";
+  const LOADING = '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading';
   const CANCELLED = 'Coleta cancelada.';
   function deepQuery(root, selector, onRoot = () => {}) {
     const results = [];
@@ -73,12 +73,40 @@
       assertRunning(signal);
       throw new Error(error);
     }
-    function resultItems() {
-      const primary = query(RESULT).filter(visible);
+    const within = (root, selector) => deepQuery(root, selector);
+    const resultsOpen = container => container.classList.contains('show_result');
+    function resultItems(container) {
+      if (!resultsOpen(container)) return [];
+      const primary = within(container, RESULT).filter(visible);
       if (primary.length) return primary;
-      const fallback = query(RESULT_FALLBACK).filter(visible);
+      const fallback = within(container, RESULT_FALLBACK).filter(visible);
       // A generic result group is never clicked when it contains result descendants.
       return fallback.filter(node => !fallback.some(other => other !== node && node.contains?.(other)));
+    }
+    function matchesOrder(node, code) {
+      // Order links carry the ID as their title; buyer/shop names can also contain
+      // digits. Click the row, since clicking the link opens order details instead.
+      const links = within(node, '.search_result_item_info_name a[title]');
+      if (links.length) return links.every(link => link.getAttribute('title') === code) && links.some(link => hasExactCode(nodeText(link), code));
+      return hasOnlyOrderCode(node, code);
+    }
+    async function orderSearch(signal) {
+      const containers = query('.chat_search_container').filter(visible);
+      if (containers.length !== 1) throw new Error('Barra de pesquisa do chat Duoke não encontrada ou ambígua. Abra o chat da Shopee.');
+      const container = containers[0];
+      const mode = () => within(container, '.chat_search_bar .el-select input').find(visible);
+      const isOrder = () => /^pedido$/i.test(String(mode()?.value || '').trim());
+      const control = mode();
+      if (!control) throw new Error('Seletor de pesquisa Duoke não encontrado. Selecione Pedido na barra do chat.');
+      if (!isOrder()) {
+        control.click();
+        const option = await waitFor(() => within(container, '.el-select-dropdown__item').find(node => visible(node) && /^pedido$/i.test(nodeText(node))), signal, 'Opção Pedido não encontrada na barra de pesquisa Duoke.');
+        option.click();
+        await waitFor(isOrder, signal, 'Não foi possível confirmar a pesquisa por Pedido no Duoke.');
+      }
+      const input = within(container, '.chat_search_bar .input_with_select input').find(visible);
+      if (!input) throw new Error('Campo de pesquisa Duoke não encontrado. Feche a pesquisa em massa e use um pedido por vez.');
+      return { container, input, isOrder };
     }
     function headersFor(code) {
       const results = query(RESULT_FALLBACK);
@@ -115,10 +143,9 @@
     }
     async function collectOrder(code, signal) {
       assertRunning(signal);
-      const input = query('input').find(node => visible(node) && node.getAttribute?.('placeholder')?.includes('Clique duas vezes para pesquisar em massa'));
-      if (!input) throw new Error('Campo de pesquisa Duoke não encontrado.');
-      const beforeResults = snapshot(resultItems());
-      const beforeEmpty = snapshot(query(EMPTY));
+      const { container, input, isOrder } = await orderSearch(signal);
+      const beforeResults = snapshot(resultItems(container));
+      const beforeEmpty = snapshot(resultsOpen(container) ? within(container, EMPTY).filter(visible) : []);
       // Pending records from the preceding order cannot certify a fresh search.
       observer?.takeRecords?.();
       mutations.length = 0;
@@ -126,18 +153,35 @@
       const inputEvent = type => new document.defaultView.Event(type, { bubbles: true, composed: true });
       // Use the native setter so framework-controlled inputs receive the new value.
       const setter = Object.getOwnPropertyDescriptor(document.defaultView.HTMLInputElement?.prototype || {}, 'value')?.set;
-      if (setter) setter.call(input, code); else input.value = code;
-      input.dispatchEvent(inputEvent('input'));
+      const fill = value => {
+        if (setter) setter.call(input, value); else input.value = value;
+        input.dispatchEvent(inputEvent('input'));
+      };
+      input.focus();
+      fill('');
+      // Duoke resets its prior search 200 ms after clearing/changing the mode.
+      // Finish that reset before entering the next ID (including a repeated ID).
+      await sleep(250);
+      assertRunning(signal);
+      if (!isOrder()) throw new Error('A pesquisa saiu da opção Pedido. Reinicie a coleta.');
+      fill(code);
       input.dispatchEvent(inputEvent('change'));
-      const searchButton = query(".el-icon-search, [class*='search'] > i").find(visible);
-      if (!searchButton) throw new Error('Botão de pesquisa Duoke não encontrado.');
-      searchButton.click();
+      const enteredAt = clock();
+      let submitted = false;
       const found = await waitFor(() => {
+        if (!isOrder() || input.value !== code) throw new Error('A pesquisa Duoke mudou durante a coleta. Reinicie a coleta.');
         if (query(LOADING).some(visible)) return null;
-        const candidate = resultItems().find(node => hasOnlyOrderCode(node, code) && changed(node, beforeResults, searchSince));
+        const candidate = resultItems(container).find(node => matchesOrder(node, code) && changed(node, beforeResults, searchSince));
         if (candidate) return { node: candidate };
-        const empty = query(EMPTY).find(node => visible(node) && /nenhum|não encontr|sem resultado|no results?|not found|no data/i.test(nodeText(node)) && changed(node, beforeEmpty, searchSince));
-        return empty ? { notFound: true } : null;
+        const empty = resultsOpen(container) && within(container, EMPTY).find(node => visible(node) && /nenhum|não encontr|não existe|sem resultado|sem dados|no results?|not found|no data|does not exist/i.test(nodeText(node)) && changed(node, beforeEmpty, searchSince));
+        if (empty) return { notFound: true };
+        // Some layouts search as the user types. The current Pedido component
+        // also handles keyup.enter; use that only if no result has appeared.
+        if (!submitted && clock() - enteredAt >= 350) {
+          submitted = true;
+          input.dispatchEvent(new document.defaultView.KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, composed: true }));
+        }
+        return null;
       }, signal, 'Tempo esgotado ao confirmar um resultado novo da pesquisa. Nenhuma conversa antiga foi coletada.');
       if (found.notFound) return { id: code, status: 'not_found', text: '' };
       assertRunning(signal);

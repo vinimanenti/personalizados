@@ -11,32 +11,50 @@ const S = {
   result: '.search_result_item', fallback: "[class*='search_result']", message: '.msg_cont',
   notes: ".order_item_remark, .note_detail, [class*='remark'], [class*='note_detail']",
   header: "[data-order-id], [data-order-sn], .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']",
-  empty: ".el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text",
-  loading: '.el-loading-mask, [aria-busy="true"]', search: ".el-icon-search, [class*='search'] > i",
+  empty: ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text",
+  loading: '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading',
+  mode: '.chat_search_bar .el-select input', input: '.chat_search_bar .input_with_select input',
+  option: '.el-select-dropdown__item', links: '.search_result_item_info_name a[title]',
 };
 class Node {
   constructor(text = '', attrs = {}, children = []) { this.innerText = text; this.attrs = attrs; this.children = children; this.isConnected = true; this.css = { display: 'block', visibility: 'visible', backgroundColor: 'rgb(236, 238, 242)' }; this.clicks = 0; }
   getAttribute(name) { return this.attrs[name] ?? null; }
   contains(node) { return this.children.includes(node) || this.children.some(child => child.contains(node)); }
   click() { this.clicks++; this.onClick?.(); }
-  dispatchEvent() { return true; }
+  dispatchEvent(event) { this.onEvent?.(event); return true; }
+  focus() { this.focused = true; }
+  querySelectorAll(selector) { return this.routes?.get(selector) || []; }
   closest() { return null; }
 }
 function fixture() {
   let time = 0;
   let scheduled = [];
   const routes = new Map();
-  const root = { querySelectorAll: selector => routes.get(selector) || [], defaultView: { Event: class { constructor(type) { this.type = type; } }, getComputedStyle: node => node.css } };
+  class Event { constructor(type, options) { this.type = type; Object.assign(this, options); } }
+  const root = { querySelectorAll: selector => routes.get(selector) || [], defaultView: { Event, KeyboardEvent: Event, getComputedStyle: node => node.css } };
   const input = new Node('', { placeholder: 'Clique duas vezes para pesquisar em massa' });
-  const search = new Node();
-  routes.set('input', [input]); routes.set(S.search, [search]);
+  const container = new Node(); container.routes = routes; container.open = false;
+  container.classList = { contains: name => name === 'show_result' && container.open };
+  const mode = new Node(); mode.value = 'Pedido';
+  const option = new Node('Pedido'); option.css.display = 'none';
+  mode.onClick = () => { option.css.display = 'block'; };
+  option.onClick = () => { mode.value = 'Pedido'; option.css.display = 'none'; };
+  routes.set('.chat_search_container', [container]); routes.set(S.mode, [mode]); routes.set(S.option, [option]); routes.set(S.input, [input]);
+  // Existing scenarios model automatic results from typing; no search button exists.
+  const search = { onClick: null };
+  input.onEvent = event => {
+    if (event.type !== 'input') return;
+    if (!input.value) { container.open = false; return; }
+    container.open = true;
+    search.onClick?.();
+  };
   const set = (selector, nodes) => { for (const old of routes.get(selector) || []) if (!nodes.includes(old)) old.isConnected = false; routes.set(selector, nodes); };
   const after = (delay, fn) => scheduled.push({ at: time + delay, fn });
   const options = { timeout: 160, settle: 20, interval: 5, now: () => time, sleep: async ms => { time += ms; const due = scheduled.filter(item => item.at <= time); scheduled = scheduled.filter(item => item.at > time); for (const item of due) item.fn(); } };
   const collector = createCollector(root, options);
   function conversation(code, text, notes = []) { set(S.header, [new Node(`ID do Pedido: ${code}`)]); set(S.message, text ? [new Node(text)] : []); set(S.notes, notes.map(note => new Node(note))); }
-  function result(code, callback = () => conversation(code, 'Etiquetas: José, 75 unidades.')) { const node = new Node(`Pedido ${code}`); node.onClick = callback; set(S.result, [node]); set(S.fallback, [node]); return node; }
-  return { root, routes, set, after, options, collector, input, search, conversation, result, time: () => time };
+  function result(code, callback = () => conversation(code, 'Etiquetas: José, 75 unidades.')) { const node = new Node(`Pedido ${code}`); node.onClick = callback; set(S.result, [node]); set(S.fallback, [node]); container.open = true; return node; }
+  return { root, routes, set, after, options, collector, input, search, container, mode, option, conversation, result, time: () => time };
 }
 const plain = value => JSON.parse(JSON.stringify(value));
 
@@ -52,6 +70,75 @@ test('traverses nested open shadow roots without duplicating nodes', () => {
   const outerHost = new Node(); outerHost.shadowRoot = outer;
   const root = { querySelectorAll: selector => selector === '*' ? [outerHost] : [] };
   assert.deepEqual([...deepQuery(root, S.message)], [target]);
+});
+
+test('selects Pedido before entering the code and clicks the automatic result without a search button', async () => {
+  const f = fixture(); const actions = [];
+  f.mode.value = 'Comprador';
+  f.option.onClick = () => { actions.push('Pedido'); f.mode.value = 'Pedido'; };
+  f.search.onClick = () => {
+    actions.push(f.input.value);
+    f.result(f.input.value, () => { actions.push('conversa'); f.conversation(f.input.value, 'Etiquetas: Ana'); });
+  };
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected');
+  assert.deepEqual(actions, ['Pedido', '260123ABC', 'conversa']);
+  assert.equal(f.mode.clicks, 1); assert.equal(f.input.focused, true);
+});
+
+test('already selected Pedido is preserved and Enter is scoped to the input when typing has no result', async () => {
+  const f = fixture(); const events = [];
+  f.input.onEvent = event => {
+    events.push(event.type);
+    if (event.type === 'keyup') {
+      assert.equal(event.key, 'Enter'); assert.equal(event.keyCode, 13);
+      f.result(f.input.value);
+    }
+  };
+  const collector = createCollector(f.root, { ...f.options, timeout: 650 });
+  const order = await collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected'); assert.equal(f.mode.clicks, 0);
+  assert.deepEqual(events, ['input', 'input', 'change', 'keyup']);
+});
+
+test('missing Pedido option stops before typing or clicking a result', async () => {
+  const f = fixture(); f.mode.value = 'Rastreamento'; f.routes.set(S.option, []);
+  const old = f.result('260123ABC');
+  const summary = await f.collector.run(['260123ABC']);
+  assert.equal(summary.orders[0].status, 'error'); assert.match(summary.orders[0].error, /Opção Pedido/);
+  assert.equal(f.input.value, undefined); assert.equal(old.clicks, 0);
+});
+
+test('selecting a similarly named option cannot confirm Pedido', async () => {
+  const f = fixture(); f.mode.value = 'Todos'; f.option.innerText = 'Produtos pedidos';
+  const summary = await f.collector.run(['260123ABC']);
+  assert.equal(summary.orders[0].status, 'error'); assert.equal(f.option.clicks, 0);
+});
+
+test('clicks the order row instead of its details link even with digits in the buyer name', async () => {
+  const f = fixture(); const link = new Node('260123ABC', { title: '260123ABC' }); let row;
+  f.search.onClick = () => {
+    row = f.result('260123ABC'); row.innerText += ' cliente12345 loja67890';
+    row.routes = new Map([[S.links, [link]]]);
+  };
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected'); assert.equal(row.clicks, 1); assert.equal(link.clicks, 0);
+});
+
+test('does not click another order whose buyer name contains the requested code', async () => {
+  const f = fixture(); let row;
+  f.search.onClick = () => {
+    row = f.result('260123ABC');
+    row.routes = new Map([[S.links, [new Node('260999XYZ', { title: '260999XYZ' })]]]);
+  };
+  const summary = await f.collector.run(['260123ABC']);
+  assert.equal(summary.orders[0].status, 'error'); assert.equal(row.clicks, 0);
+});
+
+test('search changes by the user stop collection before opening a conversation', async () => {
+  const f = fixture(); f.search.onClick = () => f.after(10, () => { f.mode.value = 'Comprador'; });
+  const summary = await f.collector.run(['260123ABC']);
+  assert.equal(summary.orders[0].status, 'error'); assert.match(summary.orders[0].error, /mudou/);
 });
 test('unchanged exact search result times out without clicking or collecting stale messages', async () => {
   const f = fixture();
@@ -148,7 +235,7 @@ test('new explicit no-result state differs from a search timeout', async () => {
   const f = fixture(); f.search.onClick = () => f.after(10, () => f.set(S.empty, [new Node('Nenhum resultado encontrado')]));
   const summary = await f.collector.run(['260123ABC']);
   assert.deepEqual(plain(summary.orders[0]), { id: '260123ABC', status: 'not_found', text: '' });
-  const stale = fixture(); stale.set(S.empty, [new Node('Nenhum resultado encontrado')]);
+  const stale = fixture(); stale.set(S.empty, [new Node('Nenhum resultado encontrado')]); stale.container.open = true;
   assert.equal((await stale.collector.run(['260123ABC'])).orders[0].status, 'error');
 });
 test('generic search group containing another order is never clicked', async () => {

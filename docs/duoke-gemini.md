@@ -63,7 +63,8 @@ Revise as migrações pendentes antes de `db push`. Alternativamente, execute so
 
 ## Limites e diagnóstico
 
-- **Desconectado:** conecte ambas as abas no popup. A coleta só funciona na versão classic do Duoke indicada acima.
+- **Desconectado:** conecte ambas as abas no popup. A coleta funciona no chat em `web.duoke.com/?lang=pt#/dk/main/chat`.
+- **Pesquisa por pedido:** a extensão 1.0.2 seleciona **Pedido**, preenche o código e clica na linha do resultado para abrir a conversa. Se o resultado não aparecer ao digitar, aciona Enter no campo de pesquisa. Após atualizar a extensão, recarregue-a em `chrome://extensions` ou `edge://extensions`, atualize as duas abas e reconecte-as.
 - **Conversa não confirmada:** a extensão interrompe aquele pedido quando não consegue confirmar a correspondência; não aproveita as mensagens que estavam abertas antes da busca.
 - **Não Encontrado:** distingue ausência de pedido/nome de falhas de rede ou extração. Um erro não vira uma etiqueta com esse texto.
 - **Acesso recusado:** confira o código de acesso do serviço. Não coloque a chave do Gemini nesse campo.
@@ -83,3 +84,5 @@ Uma chamada ao Gemini com nomes fictícios revelou incompatibilidade no campo `r
 Após a configuração pelo usuário, a função Supabase respondeu ao teste de origem e recusou corretamente uma chamada sem código de acesso. O endereço correto do chat foi confirmado pelo usuário como `https://web.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.0.1 e o botão do frontend foram corrigidos; 55 testes e o build passaram. A publicação do frontend e do ZIP 1.0.1 foi verificada no site, inclusive pela comparação do pacote com o arquivo local. A coleta na sessão real e a extração autenticada continuam pendentes de validação.
 
 Referências: [chaves Gemini](https://ai.google.dev/gemini-api/docs/api-key), [GenerateContent e GenerationConfig](https://ai.google.dev/api/generate-content), [saídas estruturadas](https://ai.google.dev/gemini-api/docs/generate-content/structured-output), [segredos de Edge Functions](https://supabase.com/docs/guides/functions/secrets), [permissão activeTab](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab).
+
+Correção 1.0.2: o relato do usuário e o componente público `ChatSearch` do Duoke confirmaram a seleção de Pedido e o clique na linha do resultado. O botão atual usa `icon_search`, e a pesquisa por Pedido também atende `keyup.enter`. O coletor deixou de exigir a lupa e passou a limitar a busca à barra do chat, confirmar o modo Pedido e aguardar o resultado antes de abrir a conversa. Os 62 testes automatizados e o build passaram. O fluxo autenticado ainda precisa ser confirmado com um pedido na sessão do usuário.
