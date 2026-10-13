@@ -181,10 +181,10 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
   let currentJob = collectorJob;
   const values = {
     studio: { tabId: 1, origin: 'https://vinimanenti.github.io' },
-    duoke: { tabId: 2, origin: 'https://classic.duoke.com' },
+    duoke: { tabId: 2, origin: 'https://web.duoke.com' },
     ...(savedJob ? { activeJob: savedJob } : {}),
   };
-  const tabs = new Map([[1, { id: 1, url: 'https://vinimanenti.github.io/personalizados/' }], [2, { id: 2, url: 'https://classic.duoke.com/pt/index.html' }], [3, { id: 3, url: 'https://example.com/personalizados/' }]]);
+  const tabs = new Map([[1, { id: 1, url: 'https://vinimanenti.github.io/personalizados/' }], [2, { id: 2, url: 'https://web.duoke.com/?lang=pt#/dk/main/chat' }], [3, { id: 3, url: 'https://example.com/personalizados/' }]]);
   const events = [];
   const injected = [];
   const chrome = {
@@ -256,4 +256,47 @@ test('popup cannot inject into an unrelated origin and pairs Studio only on expl
   assert.equal((await f.send({ channel: 'duoke-popup', type: 'PAIR', tabId: 1 }, f.studio)).ok, false);
   assert.equal((await f.send({ channel: 'duoke-popup', type: 'PAIR', tabId: 1 }, f.popup)).ok, true);
   assert.deepEqual(plain(f.injected[0]), { target: { tabId: 1 }, files: ['studio-bridge.js'] });
+});
+
+test('popup pairs the web Duoke chat with language query and injects the collector', async () => {
+  const f = workerFixture();
+  assert.deepEqual(plain(await f.send({ channel: 'duoke-popup', type: 'PAIR', tabId: 2 }, f.popup)), { ok: true, role: 'duoke' });
+  assert.deepEqual(plain(f.injected[0]), { target: { tabId: 2 }, files: ['collector.js', 'duoke-content.js'] });
+  assert.deepEqual(plain(f.values.duoke), { tabId: 2, origin: 'https://web.duoke.com' });
+});
+
+const rejectedDuokeUrls = [
+  'https://classic.duoke.com/pt/index.html',
+  'https://web.duoke.com/?lang=pt#/dk/main/orders',
+  'https://web.duoke.com/?lang=pt#/dk/main/chatting',
+  'https://web.duoke.com/?lang=pt',
+  'https://web.duoke.com.example.org/?lang=pt#/dk/main/chat',
+  'http://web.duoke.com/?lang=pt#/dk/main/chat',
+];
+test('pairing and connection status reject other domains and non-chat routes', async () => {
+  for (const url of rejectedDuokeUrls) {
+    const f = workerFixture();
+    f.tabs.set(2, { id: 2, url });
+    assert.equal((await f.send({ channel: 'duoke-popup', type: 'PAIR', tabId: 2 }, f.popup)).ok, false, url);
+    assert.equal(f.injected.length, 0);
+    assert.equal((await f.send({ channel: 'duoke-studio', requestId: 'status-1', type: 'STATUS' })).duokeConnected, false, url);
+  }
+});
+
+test('content script accepts the web chat and stops responding after leaving its route', async () => {
+  const contentSource = await readFile(new URL('../extension/duoke-bridge/duoke-content.js', import.meta.url), 'utf8');
+  for (const url of ['https://web.duoke.com/?lang=pt#/dk/main/chat', 'https://web.duoke.com/?lang=pt#/dk/main/chat/?shop=demo']) {
+    let listener, reply;
+    const location = new URL(url);
+    const chrome = { runtime: { id: 'extension-id', onMessage: { addListener: fn => { listener = fn; } } } };
+    vm.runInNewContext(contentSource, { chrome, location });
+    const ping = () => { reply = undefined; listener({ channel: 'duoke-command', type: 'PING' }, { id: chrome.runtime.id }, value => { reply = value; }); };
+    ping(); assert.equal(reply.ok, true, url);
+    for (const denied of rejectedDuokeUrls) { location.href = denied; ping(); assert.equal(reply, undefined, denied); }
+  }
+});
+
+test('extension permissions only grant persistent access to the corrected web domain', async () => {
+  const manifest = JSON.parse(await readFile(new URL('../extension/duoke-bridge/manifest.json', import.meta.url), 'utf8'));
+  assert.deepEqual(manifest.host_permissions, ['https://web.duoke.com/*']);
 });

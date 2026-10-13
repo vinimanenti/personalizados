@@ -4,7 +4,7 @@
   let job = null;
   const validId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(value);
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
-    if (sender.id !== chrome.runtime.id || sender.tab || message?.channel !== 'duoke-command' || location.origin !== 'https://classic.duoke.com' || location.pathname !== '/pt/index.html') return;
+    if (sender.id !== chrome.runtime.id || sender.tab || message?.channel !== 'duoke-command' || location.origin !== 'https://web.duoke.com' || location.pathname !== '/' || !/^#\/dk\/main\/chat(?:[/?]|$)/.test(location.hash)) return;
     if (message.type === 'PING') { respond({ ok: true, busy: Boolean(job), jobId: job?.requestId || null }); return; }
     if (!validId(message.requestId)) { respond({ ok: false }); return; }
     if (message.type === 'CANCEL') {

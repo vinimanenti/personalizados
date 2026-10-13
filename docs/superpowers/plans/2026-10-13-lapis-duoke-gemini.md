@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Duoke origin is https://classic.duoke.com.
+- Duoke origin is https://web.duoke.com.
 - Never expose API keys in source, browser bundles, outputs, or tests.
 - CSV header is ID,Nome; sibling IDs use _1, _2; source order IDs remain unchanged internally.
 - Max 150 labels per page and max 3 names per cartela; preserve explicit quantities.
@@ -38,7 +38,7 @@
 
 **Interfaces:** Window bridge protocol is exactly the spec protocol. START carries only codes and requestId. Events retain requestId and contain no executable source strings.
 
-- [x] Create Manifest V3 with `activeTab`, `scripting`, `storage`, host permission only for classic.duoke.com. Popup pairs the current Studio tab or current Duoke tab explicitly.
+- [x] Create Manifest V3 with `activeTab`, `scripting`, `storage`, host permission only for web.duoke.com. Popup pairs the current Studio tab or current Duoke tab explicitly.
 - [x] Verify sender tab and origin in the worker, and event source/origin in the bridge. Reject commands outside the enumerated protocol. Inject the collector only into the exact paired Duoke tab.
 - [x] Implement shadow-root search and order attribution before extraction; use bounded waits, cancellation and incremental progress. Expose pure collector helpers for Node tests without introducing a production dependency.
 - [x] Test stale search results, delayed messages, duplicate notes, not-found state and cancellation using controlled DOM fixtures.
@@ -78,3 +78,6 @@
 - Verification: 51 Node tests, Vite build, SSR smoke, Edge bundle syntax, unauthenticated dev route, and ZIP credential/contents checks passed. Existing app bundle-size/import warnings remain.
 - Live synthetic Gemini check caught an incompatible responseFormat field. Corrected to documented responseMimeType/responseJsonSchema. Next request received provider HTTP503 high demand; no real extraction completed. No customer conversations sent.
 - Activation pending: authenticated browser for Duoke, production Supabase migration/function/secrets and frontend deployment. No credentials or browser surface available for those steps. Keep feature branch and unrelated dirty work intact.
+
+- User correction: use https://web.duoke.com/?lang=pt#/dk/main/chat. Extension v1.0.1 switches the host permission and both runtime guards to the exact web origin and chat route; frontend link and installation instructions follow the same URL.
+- Domain fix verified: 55 tests and build passed. Compared published and local JS to confirm only the corrected URL and asset references changed. Published the build to gh-pages; remote frontend and ZIP v1.0.1 confirmed, with ZIP bytes matching local. Supabase endpoint is online; authenticated extraction and live Duoke collection remain unverified.

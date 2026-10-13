@@ -7,12 +7,12 @@ A integração reúne coleta, extração, revisão e impressão. O computador pr
 1. Abra **Lápis** e baixe a extensão na área de importação.
 2. Extraia o ZIP para uma pasta permanente. Abra `chrome://extensions` ou `edge://extensions`, habilite o modo de desenvolvedor, escolha **Carregar sem compactação** e selecione a pasta que contém `manifest.json`.
 3. Na aba `https://vinimanenti.github.io/personalizados/`, abra o popup da extensão e conecte o Sticker Studio.
-4. Abra `https://classic.duoke.com/pt/index.html`, entre na sua conta e conecte essa aba pelo mesmo popup.
+4. Abra `https://web.duoke.com/?lang=pt#/dk/main/chat`, entre na sua conta e conecte essa aba pelo mesmo popup.
 5. Volte à aba Lápis, atualize a conexão, cole os códigos e inicie a busca. Mantenha a conversa livre de alterações manuais durante a coleta. Cancelar preserva os pedidos concluídos.
 6. Informe o **código de acesso à extração** fornecido pelo administrador. Esse código não é a chave de API do Gemini. Ele fica na memória da aba e deve ser informado novamente após recarregar.
 7. Clique para extrair, confira os nomes e as quantidades, marque os pedidos revisados e adicione-os à fila. Também é possível baixar o CSV `ID,Nome`.
 
-Ao recarregar a página, pode ser necessário conectar a aba novamente no popup. A permissão da extensão no Sticker Studio é temporária, concedida pelo clique. O único site com permissão permanente é `classic.duoke.com`.
+Ao recarregar a página, pode ser necessário conectar a aba novamente no popup. A permissão da extensão no Sticker Studio é temporária, concedida pelo clique. O único site com permissão permanente é `web.duoke.com`.
 
 O rascunho de revisão e a fila de cartelas ficam no armazenamento da sessão do navegador, isolados pelo login, por até oito horas. Trocar de aba dentro do sistema ou recarregar recupera esse trabalho; um novo login inicia outra sessão. O acesso à extração deve ser informado novamente e os resultados restaurados exigem nova revisão. As cartelas que já estão na fila não são adicionadas duas vezes; removê-las da fila permite adicioná-las novamente.
 
@@ -78,6 +78,8 @@ Os testes automatizados usam respostas simuladas para conferir erros, evidência
 
 Em 13/10/2026: 51 testes automatizados passaram; o build Vite, a renderização em código da tela e a compilação da função Edge passaram. A rota local rejeitou extração sem configuração de acesso. O ZIP contém apenas os nove arquivos da extensão; nenhuma das credenciais configuradas foi encontrada no código verificado ou no pacote publicado.
 
-Uma chamada ao Gemini com nomes fictícios revelou incompatibilidade no campo `responseFormat`; a integração foi corrigida para os campos documentados `responseMimeType` e `responseJsonSchema`. A tentativa seguinte chegou ao provedor e recebeu HTTP 503 por alta demanda. Portanto, ainda não há uma extração real concluída registrada nesta entrega. Não houve envio de conversas reais. O navegador não estava disponível para validar o Duoke autenticado; migração, segredos de produção e publicação continuam pendentes de acesso administrativo.
+Uma chamada ao Gemini com nomes fictícios revelou incompatibilidade no campo `responseFormat`; a integração foi corrigida para os campos documentados `responseMimeType` e `responseJsonSchema`. A tentativa seguinte chegou ao provedor e recebeu HTTP 503 por alta demanda. Portanto, ainda não há uma extração real concluída registrada nesta entrega. Não houve envio de conversas reais. O navegador não estava disponível para validar o Duoke autenticado.
+
+Após a configuração pelo usuário, a função Supabase respondeu ao teste de origem e recusou corretamente uma chamada sem código de acesso. O endereço correto do chat foi confirmado pelo usuário como `https://web.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.0.1 e o botão do frontend foram corrigidos; 55 testes e o build passaram. A publicação do frontend e do ZIP 1.0.1 foi verificada no site, inclusive pela comparação do pacote com o arquivo local. A coleta na sessão real e a extração autenticada continuam pendentes de validação.
 
 Referências: [chaves Gemini](https://ai.google.dev/gemini-api/docs/api-key), [GenerateContent e GenerationConfig](https://ai.google.dev/api/generate-content), [saídas estruturadas](https://ai.google.dev/gemini-api/docs/generate-content/structured-output), [segredos de Edge Functions](https://supabase.com/docs/guides/functions/secrets), [permissão activeTab](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab).

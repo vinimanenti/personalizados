@@ -1,6 +1,6 @@
 # Lápis: Duoke e Gemini
 
-Fluxo aprovado pelo usuário em 13/10/2026: colar pedidos, coletar conversas no Duoke conectado, extrair nomes pelo Gemini, revisar, exportar CSV ou adicionar à fila de etiquetas. Duoke: https://classic.duoke.com/pt/index.html.
+Fluxo aprovado pelo usuário em 13/10/2026: colar pedidos, coletar conversas no Duoke conectado, extrair nomes pelo Gemini, revisar, exportar CSV ou adicionar à fila de etiquetas. Duoke: https://web.duoke.com/?lang=pt#/dk/main/chat.
 
 ## Contrato do produto
 
@@ -13,7 +13,7 @@ Fluxo aprovado pelo usuário em 13/10/2026: colar pedidos, coletar conversas no 
 
 ## Arquitetura
 
-1. `extension/duoke-bridge`: Manifest V3, popup de pareamento, service worker e dois scripts separados (ponte do Studio e coletor Duoke). Apenas `classic.duoke.com` tem permissão permanente; Sticker Studio usa a permissão temporária activeTab ao conectar. A comunicação verifica aba, origem, tipo, versão e identificador do trabalho. O pacote ZIP é gerado no build e pode ser baixado na aba Lápis.
+1. `extension/duoke-bridge`: Manifest V3, popup de pareamento, service worker e dois scripts separados (ponte do Studio e coletor Duoke). Apenas `web.duoke.com` tem permissão permanente; Sticker Studio usa a permissão temporária activeTab ao conectar. A comunicação verifica aba, origem, tipo, versão e identificador do trabalho. O pacote ZIP é gerado no build e pode ser baixado na aba Lápis.
 2. `shared/lapis.mjs`: validação de códigos, parser TXT/CSV, normalização, CSV seguro e criação dos dados da cartela. Não depende de React nem acessa segredos.
 3. `server/gemini.mjs`: handler HTTP universal com configuração por ambiente, autenticação por código de acesso do serviço, limites de entrada/saída, JSON estruturado, timeout e erros sem segredos. Chave Gemini somente no servidor; nenhuma variável VITE contém a chave. Modelo padrão atual configurável por GEMINI_MODEL.
 4. Desenvolvimento local: plugin Vite expõe `/api/lapis/extract`. Produção: Supabase Edge Function com o mesmo handler, segredo GEMINI_API_KEY, código STICKER_AI_ACCESS_CODE, origens autorizadas e quota persistente. A autenticação local legada do aplicativo não é tratada como autenticação confiável de API.
