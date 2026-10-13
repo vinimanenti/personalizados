@@ -65,6 +65,11 @@
 .lapis-upload small { color: var(--lapis-muted); font-size: 10px; line-height: 1.6; margin-top: 5px; }
 .lapis-upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
 .lapis-upload.is-disabled, .lapis-upload.is-disabled input { opacity: .5; cursor: not-allowed; }
+.lapis-label-upload { position: relative; display: inline-flex; align-items: center; padding: 8px 12px; border: 1px dashed #4a4a58; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: border-color .15s, background .15s; }
+.lapis-label-upload:hover { border-color: var(--lapis-blue); background: rgba(67,97,238,.04); }
+.lapis-label-upload:focus-within { outline: 2px solid var(--lapis-blue); outline-offset: 3px; }
+.lapis-label-upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.lapis-label-upload.is-disabled, .lapis-label-upload.is-disabled input { opacity: .5; cursor: not-allowed; }
 .lapis-progress { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(100px, 2fr) auto; align-items: center; gap: 18px; padding: 16px 24px; background: rgba(67,97,238,.06); border-top: 1px solid var(--lapis-line); }
 .lapis-progress strong, .lapis-progress span { display: block; font-size: 12px; }
 .lapis-progress span { color: var(--lapis-muted); margin-top: 4px; font: 10px monospace; }

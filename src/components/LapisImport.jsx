@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { parseOrderCodes, parseDuokeText, parseNamesCsv, exportNamesCsv, toLabelFields } from '../../shared/lapis.mjs';
 import { extractOrders, resolveLapisEndpoint } from '../lib/lapis-api.mjs';
+import { mergeLabelCodes } from '../../shared/shopee-label.mjs';
 import './LapisImport.css';
 
 const dict = value => Object.assign(Object.create(null), value);
-const EMPTY = { codes: '', raw: '', collected: [], results: dict(), selected: dict(), reviewed: dict() };
+const EMPTY = { codes: '', raw: '', collected: [], results: dict(), selected: dict(), reviewed: dict(), shipDates: dict() };
+const SHIP_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
 const NO_REVISIONS = [];
 const MAX_DRAFT = 1500000;
 const EXPIRY = 8 * 60 * 60 * 1000;
@@ -37,7 +39,9 @@ function readDraft(key) {
     }
     const knownIds = new Set(d.collected.map(order => order.id));
     if (Object.keys(d.results).some(id => !knownIds.has(id))) return EMPTY;
-    return { codes: d.codes, raw: d.raw, collected: d.collected, results: dict(d.results), selected: dict(d.selected), reviewed: dict() };
+    // Drafts saved before label import have no shipDates; drop malformed entries instead of the whole draft.
+    const shipDates = dict(Object.fromEntries(Object.entries(d.shipDates && typeof d.shipDates === 'object' ? d.shipDates : {}).filter(([, date]) => typeof date === 'string' && SHIP_DATE.test(date))));
+    return { codes: d.codes, raw: d.raw, collected: d.collected, results: dict(d.results), selected: dict(d.selected), reviewed: dict(), shipDates };
   } catch { return EMPTY; }
 }
 
@@ -255,6 +259,35 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     finally { if (mounted.current) setUploading(false); }
   };
 
+  const uploadLabels = async event => {
+    const files = [...(event.target.files || [])]; event.target.value = '';
+    if (!files.length) return;
+    setUploading(true); setError('');
+    try {
+      // Loaded on demand so pdf.js stays out of the Lápis bundle until labels are used.
+      const { readShopeeLabels } = await import('../lib/shopee-label-pdf.mjs');
+      const labels = [];
+      let pages = 0, missing = 0;
+      for (const file of files) {
+        const read = await readShopeeLabels(file);
+        labels.push(...read.labels); pages += read.pages; missing += read.missing;
+      }
+      if (!mounted.current) return;
+      if (!labels.length) throw new Error(`Nenhum código de pedido encontrado em ${pages} página${pages === 1 ? '' : 's'}. Confira se o PDF é a etiqueta de envio da Shopee.`);
+      // The codes textarea is disabled while uploading, so draft.codes is current here.
+      const { codes, added, duplicates } = mergeLabelCodes(draft.codes, labels);
+      setDraft(current => {
+        const shipDates = dict(current.shipDates);
+        for (const label of labels) if (label.envio) shipDates[label.pedido] = label.envio;
+        return { ...current, codes, shipDates };
+      });
+      setNotice(`${labels.length} etiqueta${labels.length === 1 ? ' lida' : 's lidas'} · ${added.length} código${added.length === 1 ? ' adicionado' : 's adicionados'}` +
+        (duplicates ? ` · ${duplicates} já estava${duplicates === 1 ? '' : 'm'} na lista` : '') +
+        (missing ? ` · ${missing} página${missing === 1 ? '' : 's'} sem código` : '') + '.');
+    } catch (failure) { if (mounted.current) setError(failure.message); }
+    finally { if (mounted.current) setUploading(false); }
+  };
+
   const selectedOrders = useMemo(() => draft.collected.filter(order => draft.selected[order.id] && order.status === 'collected' && order.text.trim() && order.text.length <= 12000), [draft.collected, draft.selected]);
   const acceptedSet = useMemo(() => new Set(queuedRevisions), [queuedRevisions]);
   const readyOrders = useMemo(() => Object.values(draft.results).filter(order => draft.reviewed[order.id] === revision(order) && !acceptedSet.has(revision(order)) && !queueError(order)), [draft.results, draft.reviewed, acceptedSet]);
@@ -295,7 +328,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     if (enqueuing.current || !readyOrders.length) return;
     enqueuing.current = true; setQueueBusy(true); setError('');
     try {
-      const orders = readyOrders.map(order => ({ ...order, status: 'found', names: order.names.map(entry => ({ ...entry })) }));
+      const orders = readyOrders.map(order => ({ ...order, status: 'found', names: order.names.map(entry => ({ ...entry })), shipDate: draft.shipDates[order.id] || '' }));
       orders.forEach(toLabelFields);
       await onAddOrders(orders);
       setNotice(`${orders.length} cartela${orders.length === 1 ? '' : 's'} adicionada${orders.length === 1 ? '' : 's'} à fila de impressão.`);
@@ -327,7 +360,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       <div className="lapis-input-panel">
         <div className="lapis-section-title"><span>01</span><h3>Buscar no Duoke</h3></div>
         <label className="lapis-field">Códigos dos pedidos<textarea value={draft.codes} disabled={busy} maxLength={100000} rows={4} placeholder={'Cole os códigos, um por linha\n323265626\n323265627'} onChange={event => setDraft(current => ({ ...current, codes: event.target.value }))} /></label>
-        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !connected || connection.busy || !draft.codes.trim()} onClick={startCollection}>Coletar conversas <span aria-hidden="true">→</span></button><a href="https://web.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
+        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !connected || connection.busy || !draft.codes.trim()} onClick={startCollection}>Coletar conversas <span aria-hidden="true">→</span></button><label className={`lapis-label-upload${busy ? ' is-disabled' : ''}`} title="Lê o código do pedido e o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={busy} onChange={uploadLabels} /></label><a href="https://web.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
         <details className="lapis-help"><summary>Conectar as abas pela primeira vez</summary><ol><li><a href={`${import.meta.env.BASE_URL}downloads/duoke-bridge.zip`} download>Baixe a extensão Duoke</a> e extraia o ZIP.</li><li>Em chrome://extensions ou edge://extensions, ative o modo de desenvolvedor e escolha “Carregar sem compactação”. Selecione a pasta extraída.</li><li>Abra a extensão na aba do Sticker Studio e clique em conectar. Faça o mesmo na aba do Duoke com sua conta aberta.</li><li>Volte aqui e clique em ↻ para verificar a conexão.</li></ol><p>A extensão apenas lê as conversas dos pedidos informados.</p></details>
       </div>
       <div className="lapis-input-panel">
@@ -339,7 +372,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     </div>
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}
     {error ? <p className="lapis-alert lapis-error" role="alert">{error}</p> : null}
-    {uploading ? <p className="lapis-notice" role="status">Importando arquivo…</p> : null}
+    {uploading ? <p className="lapis-notice" role="status">Lendo arquivo…</p> : null}
     {notice ? <p className="lapis-notice" role="status">{notice}</p> : null}
     <div className="lapis-review-heading"><div className="lapis-section-title"><span>02</span><h3>Revisar pedidos <small>{draft.collected.length}</small></h3></div><div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !selectedOrders.length} onClick={runExtraction}>Extrair nomes{selectedOrders.length ? ` · ${selectedOrders.length}` : ''}</button><button type="button" disabled={busy || !draft.collected.length} onClick={exportCsv}>Exportar CSV</button><button type="button" className="lapis-link-button" disabled={busy || !draft.collected.length} onClick={() => { setDraft(EMPTY); setError(''); setNotice('Revisão limpa. As cartelas adicionadas continuam na fila.'); }}>Limpar revisão</button></div></div>
     {draft.collected.length ? <div className="lapis-orders">{draft.collected.map(source => {

@@ -153,7 +153,7 @@ export default function PrintLab() {
     const existing = new Set(pages.map(page => page.importRevision).filter(Boolean));
     const imported = orders.filter(order => !existing.has(orderRevision(order))).map(order => {
       const fields = toLabelFields(order);
-      return { pedido: order.id, dataEnvio, labels: buildLabels(fields), fields, names: fields.map(f => f.nome), importRevision: orderRevision(order) };
+      return { pedido: order.id, dataEnvio: order.shipDate || dataEnvio, labels: buildLabels(fields), fields, names: fields.map(f => f.nome), importRevision: orderRevision(order) };
     });
     if (!imported.length) return;
     setPages(previous => {
