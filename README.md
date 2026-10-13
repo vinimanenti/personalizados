@@ -19,6 +19,20 @@ Acesse `http://localhost:3000`
 4. **Preview** → Visualize e adicione à fila de impressão
 5. **Impressão** → Gere o PDF final com todas as cartelas
 
+## Lápis: Duoke e Gemini
+
+A aba **Lápis** permite coletar conversas no Duoke por uma extensão de navegador,
+extrair nomes pelo Gemini, revisar as quantidades e enviar os pedidos à fila de
+etiquetas ou exportar CSV. A API roda no servidor; a chave não vai para o site.
+
+Veja [instalação e ativação](docs/duoke-gemini.md) e o
+[TXT de demonstração com dados fictícios](docs/examples/lapis-demo.txt).
+
+```bash
+npm run test:lapis
+npm run build
+```
+
 ## SVGs do Corel Draw
 
 Os SVGs devem ter:

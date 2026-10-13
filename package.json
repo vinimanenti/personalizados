@@ -5,9 +5,12 @@
   "private": true,
   "scripts": {
     "dev": "vite",
+    "test:lapis": "node --test tests/*.test.mjs",
+    "package:duoke": "node scripts/package-duoke-extension.mjs",
+    "prebuild": "npm run package:duoke",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "vite build && gh-pages -d dist"
+    "deploy": "npm run build && gh-pages -d dist"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.0",

@@ -1,4 +1,7 @@
 import { useState, useRef, useEffect } from "react";
+import LapisImport from "./components/LapisImport";
+import { parseNamesCsv, toLabelFields } from "../shared/lapis.mjs";
+import { orderRevision, queueKey, restoreQueue, saveQueue } from "./lib/lapis-queue.mjs";
 
 /* ─── Constants ─── */
 const COLS = 6, ROWS = 25, LPP = COLS * ROWS, PPP = 12;
@@ -41,28 +44,10 @@ function autoQty(names) {
 }
 
 function parseCSV(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  if (lines.length < 2) return [];
-  const sep = lines[0].includes(";") ? ";" : ",";
-  const hdr = lines[0].split(sep).map(h => h.trim().replace(/^["'\uFEFF]+|["']+$/g, ""));
-  const hU = hdr.map(h => h.toUpperCase().replace(/[\s_-]+/g, ""));
-  const idI = hU.findIndex(h => h === "ID"), n1 = hU.findIndex(h => h === "NOME1"), n2 = hU.findIndex(h => h === "NOME2"), n3 = hU.findIndex(h => h === "NOME3"), nF = hU.findIndex(h => h === "NOME");
-  const pages = [];
-  for (let i = 1; i < lines.length; i++) {
-    const c = lines[i].split(sep).map(x => x.trim().replace(/^["']+|["']+$/g, ""));
-    const id = idI >= 0 ? (c[idI] || "").trim() : "";
-    let names;
-    if (n1 >= 0) names = [(c[n1] || "").trim(), n2 >= 0 ? (c[n2] || "").trim() : "", n3 >= 0 ? (c[n3] || "").trim() : ""];
-    else if (nF >= 0) names = [(c[nF] || "").trim(), "", ""];
-    else continue;
-    const cl = names.map(n => (n && !SKIP.has(n.toUpperCase())) ? n : "");
-    if (cl.every(n => !n)) continue;
-    const q = autoQty(cl);
-    const fields = cl.map(n => ({ nome: n, qty: n ? q : 0, fs: DFS, font: DF, emoji: "", emojiPos: "before" }));
-    const labels = buildLabels(fields);
-    if (labels.length > 0) pages.push({ pedido: id, dataEnvio: "", labels, fields, names: cl.filter(n => n) });
-  }
-  return pages;
+  return parseNamesCsv(text).filter(order => order.names.length > 0).map(order => {
+    const fields = toLabelFields(order);
+    return { pedido: order.id, dataEnvio: "", labels: buildLabels(fields), fields, names: fields.map(f => f.nome) };
+  });
 }
 
 function groupPDFs(p) { const g = []; for (let i = 0; i < p.length; i += PPP) g.push(p.slice(i, i + PPP)); return g; }
@@ -109,7 +94,13 @@ export default function PrintLab() {
   const [pedido, setPedido] = useState("");
   const [dataEnvio, setDataEnvio] = useState("");
   const [fields, setFields] = useState(emptyFields());
-  const [pages, setPages] = useState([]);
+  const [queueStorageKey] = useState(() => {
+    try { return queueKey(localStorage); } catch { return null; }
+  });
+  const [pages, setPages] = useState(() => {
+    try { return restoreQueue(sessionStorage, queueStorageKey, buildLabels); } catch { return []; }
+  });
+  const [queueSaved, setQueueSaved] = useState(true);
   const [pvIdx, setPvIdx] = useState(-1);
   const [manualOpen, setManualOpen] = useState(true);
   const fileRef = useRef(null);
@@ -129,6 +120,11 @@ export default function PrintLab() {
   const pvL = pvP.labels || [];
 
   const show = (msg, type = "success") => setToast({ msg, type });
+
+  useEffect(() => {
+    try { setQueueSaved(saveQueue(sessionStorage, queueStorageKey, pages)); }
+    catch { setQueueSaved(false); }
+  }, [pages, queueStorageKey]);
 
   // Load Google Fonts CSS for preview
   useEffect(() => {
@@ -152,22 +148,45 @@ export default function PrintLab() {
     if (!isEd) setPvIdx(-1); setLinks([]);
   };
   const addPage = () => { if (!hasC) return; setPages(p => [...p, { pedido, dataEnvio, labels: curL, fields: [...fields], names: fields.filter(f => f.nome.trim()).map(f => f.nome.trim()) }]); setFields(emptyFields()); setPvIdx(-1); setLinks([]); show("Pagina adicionada"); };
+  const addReviewedOrders = orders => {
+    // Validate the whole selection before changing the print queue.
+    const existing = new Set(pages.map(page => page.importRevision).filter(Boolean));
+    const imported = orders.filter(order => !existing.has(orderRevision(order))).map(order => {
+      const fields = toLabelFields(order);
+      return { pedido: order.id, dataEnvio, labels: buildLabels(fields), fields, names: fields.map(f => f.nome), importRevision: orderRevision(order) };
+    });
+    if (!imported.length) return;
+    setPages(previous => {
+      const revisions = new Set(previous.map(page => page.importRevision).filter(Boolean));
+      return [...previous, ...imported.filter(page => {
+        if (revisions.has(page.importRevision)) return false;
+        revisions.add(page.importRevision); return true;
+      })];
+    });
+    setPvIdx(-1);
+    setLinks([]);
+    show(`${imported.length} pedido${imported.length > 1 ? "s" : ""} adicionado${imported.length > 1 ? "s" : ""} à fila`);
+  };
   const rmPage = i => { setPages(p => p.filter((_, j) => j !== i)); if (pvIdx >= pages.length - 1) setPvIdx(-1); if (expQ === i) setExpQ(null); setLinks([]); };
   const handleCSV = e => {
     const f = e.target.files[0]; if (!f) return; setLinks([]);
     const r = new FileReader();
     r.onload = ev => {
-      const parsed = parseCSV(ev.target.result);
-      if (!parsed.length) { show("CSV invalido", "error"); return; }
-      setPages(prev => [...prev, ...parsed]); setPvIdx(pages.length);
-      show(`${parsed.length} pagina${parsed.length > 1 ? "s" : ""} importada${parsed.length > 1 ? "s" : ""}`);
+      try {
+        const parsed = parseCSV(ev.target.result);
+        if (!parsed.length) { show("CSV sem nomes para imprimir", "error"); return; }
+        setPages(prev => [...prev, ...parsed]); setPvIdx(pages.length);
+        show(`${parsed.length} pagina${parsed.length > 1 ? "s" : ""} importada${parsed.length > 1 ? "s" : ""}`);
+      } catch (error) { show(error.message || "CSV inválido", "error"); }
     };
+    r.onerror = () => show("Não foi possível ler o arquivo", "error");
     r.readAsText(f, "UTF-8"); e.target.value = "";
   };
   const upQF = (pi, fi, k, v) => {
     setPages(prev => {
       const n = [...prev]; const pg = { ...n[pi] }; const fl = [...pg.fields];
       fl[fi] = { ...fl[fi], [k]: k === "fs" ? Number(v) : v };
+      if (k === "nome" || k === "qty") delete pg.importRevision;
       pg.fields = fl; pg.labels = buildLabels(fl);
       pg.names = fl.filter(f => f.nome.trim()).map(f => f.nome.trim());
       n[pi] = pg; return n;
@@ -348,6 +367,9 @@ export default function PrintLab() {
   const pink = "#e91e8c";
 
   return (
+    <>
+    <LapisImport onAddOrders={addReviewedOrders} queuedRevisions={pages.map(page => page.importRevision).filter(Boolean)} />
+    {!queueSaved && pages.length > 0 && <p role="alert" style={{ color: "#9b3131", padding: "8px 16px" }}>Não foi possível salvar a fila nesta sessão. Gere os PDFs antes de trocar de aba ou recarregar.</p>}
     <div style={{ display: "flex", gap: 24, animation: "fadeIn .3s" }}>
       {/* Toast */}
       {toast && (
@@ -582,6 +604,7 @@ export default function PrintLab() {
         </div>
       </div>
     </div>
+    </>
   );
 }
 

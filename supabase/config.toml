@@ -1,0 +1,3 @@
+[functions.lapis-extract]
+# This endpoint validates its own access code and exact Origin allowlist.
+verify_jwt = false

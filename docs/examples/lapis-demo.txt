@@ -1,0 +1,17 @@
+==============================
+PEDIDO: DEMO260000001
+==============================
+--- MENSAGENS DO CLIENTE ---
+Olá! Nas etiquetas da minha filha, colocar Ana Exemplo.
+
+==============================
+PEDIDO: DEMO260000002
+==============================
+--- MENSAGENS DO CLIENTE ---
+Quero dividir as etiquetas entre meus filhos: Bruno Exemplo e Clara Exemplo, 75 cada.
+
+==============================
+PEDIDO: DEMO260000003
+==============================
+*** NÃO ENCONTRADO ***
+(Sem mensagens do cliente ou notas com nome)

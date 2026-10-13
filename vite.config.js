@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { lapisGeminiPlugin } from './server/vite-plugin.mjs';
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), lapisGeminiPlugin()],
   base: '/personalizados/',
   server: {
     port: 3000,
