@@ -87,6 +87,69 @@ test('upstream failures are safe, with no body or secrets in client errors',asyn
   const handler=createGeminiHandler({env,fetchImpl:async()=>{throw new Error('secret provider failure');}});
   const response=await handler(request());assert.equal(response.status,502);assert.ok(!(await response.text()).includes('secret'));
 });
+
+test('retries capacity failure once with identical orders and reserves quota for each attempt', async () => {
+  let calls = 0, quota = 0; const bodies = [];
+  const handler = createGeminiHandler({ env, retryDelayMs: 0, consumeQuota: async ({ orders }) => { quota += orders; return true; }, fetchImpl: async (_url, options) => {
+    bodies.push(options.body);
+    return ++calls === 1 ? new Response('provider-private-details', { status: 503 }) : upstream(result);
+  } });
+  const response = await handler(request());
+  assert.equal(response.status, 200); assert.equal(calls, 2); assert.equal(quota, 2);
+  assert.equal(bodies[0], bodies[1]); assert.equal((await response.json()).orders[0].status, 'found');
+});
+
+test('persistent capacity failure gives a useful safe message after only one retry', async () => {
+  let calls = 0;
+  const handler = createGeminiHandler({ env, retryDelayMs: 0, fetchImpl: async () => { calls++; return new Response('private secret', { status: 503 }); } });
+  const response = await handler(request()); const body = await response.json();
+  assert.equal(response.status, 502); assert.equal(calls, 2);
+  assert.match(body.error, /Gemini.*alta demanda.*503/); assert.doesNotMatch(body.error, /private|secret/);
+});
+
+test('long provider retry interval is honored without an early retry', async () => {
+  let calls = 0;
+  const handler = createGeminiHandler({ env, retryDelayMs: 0, fetchImpl: async () => { calls++; return new Response('', { status: 503, headers: { 'Retry-After': '60' } }); } });
+  const response = await handler(request());
+  assert.equal(response.status, 502); assert.equal(calls, 1); assert.match((await response.json()).error, /503/);
+});
+
+test('quota denial prevents retrying a failed provider request', async () => {
+  let calls = 0, quotaChecks = 0;
+  const handler = createGeminiHandler({ env, retryDelayMs: 0, consumeQuota: async () => ++quotaChecks === 1, fetchImpl: async () => { calls++; return new Response('', { status: 503 }); } });
+  assert.equal((await handler(request())).status, 429); assert.equal(calls, 1); assert.equal(quotaChecks, 2);
+});
+
+test('deadline cancels the retry delay without making another provider request', async () => {
+  let calls = 0;
+  const handler = createGeminiHandler({ env, timeoutMs: 10, retryDelayMs: 1000, fetchImpl: async () => { calls++; return new Response('', { status: 503 }); } });
+  assert.equal((await handler(request())).status, 504); assert.equal(calls, 1);
+});
+
+test('provider configuration failures are distinguished and never retried or echoed', async () => {
+  for (const [status, pattern] of [[400, /formato.*400/], [401, /chave.*recusada/], [402, /créditos/], [403, /permissões/], [404, /GEMINI_MODEL/], [429, /limite.*Gemini/], [500, /falha temporária/], [504, /prazo/]]) {
+    let calls = 0;
+    const handler = createGeminiHandler({ env, fetchImpl: async () => { calls++; return Response.json({ error: { message: `private ${env.GEMINI_API_KEY}` } }, { status }); } });
+    const response = await handler(request()); const body = await response.json();
+    assert.equal(response.status, status === 429 ? 429 : status === 504 ? 504 : 502);
+    assert.equal(calls, 1); assert.match(body.error, pattern); assert.ok(!body.error.includes(env.GEMINI_API_KEY));
+  }
+});
+
+test('structured invalid-key reason is safe even when Gemini returns HTTP 400', async () => {
+  const handler = createGeminiHandler({ env, fetchImpl: async () => Response.json({ error: {
+    message: `private ${env.GEMINI_API_KEY}`, details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', metadata: { sensitive: 'do not expose' } }],
+  } }, { status: 400 }) });
+  const response = await handler(request()); const body = await response.json();
+  assert.equal(response.status, 502); assert.match(body.error, /GEMINI_API_KEY/); assert.doesNotMatch(body.error, /private|expose|test-key/);
+});
+
+test('malformed and oversized error bodies cannot override the safe status classification', async () => {
+  for (const body of ['not json', 'x'.repeat(20000), JSON.stringify({ error: { details: 'unexpected' } })]) {
+    const handler = createGeminiHandler({ env, fetchImpl: async () => new Response(body, { status: 404 }) });
+    const response = await handler(request()); assert.equal(response.status, 502); assert.match((await response.json()).error, /GEMINI_MODEL/);
+  }
+});
 test('timeout bounds mocks ignoring abort as well as upstream body reads',async()=>{
   const handler=createGeminiHandler({env,timeoutMs:10,fetchImpl:async()=>new Promise(()=>{})});
   assert.equal((await handler(request())).status,504);
