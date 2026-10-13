@@ -3,10 +3,11 @@
   const RESULT = '.search_result_item';
   const RESULT_FALLBACK = "[class*='search_result']";
   const MESSAGE = '.msg_cont';
-  const NOTES = ".order_item_remark, .note_detail, [class*='remark'], [class*='note_detail']";
-  const HEADERS = "[data-order-id], [data-order-sn], .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']";
+  const NOTES = '.note_detail .note_content .pre_wrap';
+  const HEADERS = "[data-order-id], [data-order-sn], .order_item .order_item_title, .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']";
   const EMPTY = ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text";
   const LOADING = '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading';
+  const MESSAGE_LOADING = '.message_main > .t_c .el-icon-loading';
   const CANCELLED = 'Coleta cancelada.';
   function deepQuery(root, selector, onRoot = () => {}) {
     const results = [];
@@ -33,6 +34,7 @@
     const clock = options.now || (() => Date.now());
     const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const timeout = options.timeout ?? 12000;
+    const conversationTimeout = options.conversationTimeout ?? options.timeout ?? 30000;
     const settle = options.settle ?? 900;
     const interval = options.interval ?? 100;
     const style = options.getStyle || (node => document.defaultView.getComputedStyle(node));
@@ -62,16 +64,16 @@
       return mutations.slice(since).some(record => record.type !== 'attributes' && (record.target === node || node.contains?.(record.target) || [...(record.addedNodes || [])].some(added => added === node || added.contains?.(node))));
     }
     const assertRunning = signal => { if (signal?.aborted) throw new Error(CANCELLED); };
-    async function waitFor(probe, signal, error) {
+    async function waitFor(probe, signal, error, waitMs = timeout) {
       const start = clock();
-      while (clock() - start < timeout) {
+      while (clock() - start < waitMs) {
         assertRunning(signal);
         const result = probe();
         if (result) return result;
         await sleep(interval);
       }
       assertRunning(signal);
-      throw new Error(error);
+      throw new Error(typeof error === 'function' ? error() : error);
     }
     const within = (root, selector) => deepQuery(root, selector);
     const resultsOpen = container => container.classList.contains('show_result');
@@ -127,15 +129,25 @@
     }
     function customerMessages() {
       return query(MESSAGE).filter(node => {
-        if (!visible(node)) return false;
+        if (!visible(node) || !nodeText(node)) return false;
+        if (node.closest?.('.message_main > li.rt, .message_main > li.ct')) return false;
+        if (node.closest?.('.message_main > li.lt')) return true;
         if (node.closest?.("[data-sender-role='customer'], [data-message-direction='incoming'], .msg_customer, .customer_message")) return true;
         const color = style(node).backgroundColor || '';
         return /rgba?\(\s*236\s*,\s*238\s*,\s*242\s*(?:,\s*1(?:\.0+)?\s*)?\)/.test(color);
       });
     }
-    function extractText() {
+    function notesFor(code) {
+      return query(NOTES).filter(node => {
+        if (!visible(node) || !nodeText(node)) return false;
+        if (!code) return true;
+        const card = node.closest?.('.order_item');
+        return card && within(card, '.order_item_title').some(title => visible(title) && hasOnlyOrderCode(title, code));
+      });
+    }
+    function extractText(code) {
       const messages = customerMessages().map(nodeText).filter(Boolean);
-      const notes = [...new Set(query(NOTES).filter(visible).map(nodeText).filter(Boolean))];
+      const notes = [...new Set(notesFor(code).map(nodeText))];
       const text = [...messages, ...notes.map(note => `Observação: ${note}`)].join('\n\n');
       if (!text) throw new Error('A conversa carregou sem mensagens do cliente ou observações identificáveis. Revise no Duoke.');
       if (text.length > 12000) throw new Error('A conversa ultrapassa 12.000 caracteres. Importe um trecho revisado por TXT.');
@@ -190,21 +202,27 @@
       found.node.click();
       let stableFingerprint = null;
       let stableSince = clock();
+      let waitingFor = 'a identificação do pedido';
       await waitFor(() => {
-        if (query(LOADING).some(visible) || !headersFor(code).length) { stableFingerprint = null; stableSince = clock(); return false; }
-        const nodes = query(MESSAGE).filter(visible);
-        // All visible messages and notes must belong to a refreshed conversation.
-        // Attribute/hover mutations and one new placeholder cannot validate old text.
-        const notes = query(NOTES).filter(visible);
-        const refreshed = (nodes.some(node => nodeText(node)) || notes.some(node => nodeText(node))) && nodes.every(node => changed(node, beforeMessages, Infinity)) && notes.every(node => changed(node, beforeNotes, Infinity));
-        if (!refreshed) { stableFingerprint = null; stableSince = clock(); return false; }
-        const fingerprint = [...nodes.map(nodeText), ...query(NOTES).filter(visible).map(nodeText)].join('\u0000');
+        const reset = reason => { waitingFor = reason; stableFingerprint = null; stableSince = clock(); return false; };
+        if (query(LOADING).some(visible) || query(MESSAGE_LOADING).some(visible)) return reset('o término do carregamento no Duoke');
+        if (!headersFor(code).length) return reset('o código do pedido no painel da conversa');
+        const nodes = customerMessages();
+        // Only extracted text participates in freshness checks: seller bubbles,
+        // empty media, note headings and buttons are not customer content.
+        // Notes are limited to the card for this exact order.
+        const notes = notesFor(code);
+        if (!nodes.length && !notes.length) return reset('mensagens do cliente ou notas com texto');
+        const refreshed = nodes.every(node => changed(node, beforeMessages, Infinity)) && notes.every(node => changed(node, beforeNotes, Infinity));
+        if (!refreshed) return reset('a atualização das mensagens ou notas do pedido');
+        waitingFor = 'a estabilização do conteúdo da conversa';
+        const fingerprint = [...nodes.map(nodeText), ...notes.map(nodeText)].join('\u0000');
         if (fingerprint !== stableFingerprint) { stableFingerprint = fingerprint; stableSince = clock(); return false; }
         return clock() - stableSince >= settle;
-      }, signal, 'Tempo esgotado ao confirmar a conversa do pedido. Nenhuma mensagem antiga foi coletada.');
+      }, signal, () => `Tempo esgotado ao confirmar a conversa do pedido: aguardando ${waitingFor}. Nenhuma mensagem antiga foi coletada.`, conversationTimeout);
       assertRunning(signal);
       if (!headersFor(code).length) throw new Error('A conversa mudou durante a coleta.');
-      return { id: code, status: 'collected', text: extractText() };
+      return { id: code, status: 'collected', text: extractText(code) };
     }
     async function run(codes, { signal, onProgress = async () => {} } = {}) {
       const uniqueCodes = [...new Set(codes)];

@@ -9,10 +9,11 @@ vm.runInContext(source, context);
 const { createCollector, deepQuery, hasExactCode } = context.StickerDuokeCollector;
 const S = {
   result: '.search_result_item', fallback: "[class*='search_result']", message: '.msg_cont',
-  notes: ".order_item_remark, .note_detail, [class*='remark'], [class*='note_detail']",
-  header: "[data-order-id], [data-order-sn], .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']",
+  notes: '.note_detail .note_content .pre_wrap',
+  header: "[data-order-id], [data-order-sn], .order_item .order_item_title, .order_sn, .order_no, .order_number, .order_detail, .chat_header, .conversation_header, [class*='chat_header']",
   empty: ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text",
   loading: '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading',
+  messageLoading: '.message_main > .t_c .el-icon-loading',
   mode: '.chat_search_bar .el-select input', input: '.chat_search_bar .input_with_select input',
   option: '.el-select-dropdown__item', links: '.search_result_item_info_name a[title]',
 };
@@ -24,7 +25,7 @@ class Node {
   dispatchEvent(event) { this.onEvent?.(event); return true; }
   focus() { this.focused = true; }
   querySelectorAll(selector) { return this.routes?.get(selector) || []; }
-  closest() { return null; }
+  closest(selector) { return this.ancestors?.get(selector) || null; }
 }
 function fixture() {
   let time = 0;
@@ -52,9 +53,11 @@ function fixture() {
   const after = (delay, fn) => scheduled.push({ at: time + delay, fn });
   const options = { timeout: 160, settle: 20, interval: 5, now: () => time, sleep: async ms => { time += ms; const due = scheduled.filter(item => item.at <= time); scheduled = scheduled.filter(item => item.at > time); for (const item of due) item.fn(); } };
   const collector = createCollector(root, options);
-  function conversation(code, text, notes = []) { set(S.header, [new Node(`ID do Pedido: ${code}`)]); set(S.message, text ? [new Node(text)] : []); set(S.notes, notes.map(note => new Node(note))); }
+  const currentCard = { querySelectorAll: selector => selector === '.order_item_title' ? routes.get(S.header) || [] : [] };
+  function note(text, card = currentCard) { const node = new Node(text); node.ancestors = new Map([['.order_item', card]]); return node; }
+  function conversation(code, text, notes = []) { set(S.header, [new Node(`ID do Pedido: ${code}`)]); set(S.message, text ? [new Node(text)] : []); set(S.notes, notes.map(text => note(text))); }
   function result(code, callback = () => conversation(code, 'Etiquetas: José, 75 unidades.')) { const node = new Node(`Pedido ${code}`); node.onClick = callback; set(S.result, [node]); set(S.fallback, [node]); container.open = true; return node; }
-  return { root, routes, set, after, options, collector, input, search, container, mode, option, conversation, result, time: () => time };
+  return { root, routes, set, after, options, collector, input, search, container, mode, option, conversation, result, note, time: () => time };
 }
 const plain = value => JSON.parse(JSON.stringify(value));
 
@@ -216,7 +219,7 @@ for (const ancestry of ['parent panel', 'shadow host']) {
       hidden.css.display = 'none';
       f.set(S.header, [new Node('Pedido 260123ABC')]);
       f.set(S.message, [oldMessage, new Node('Etiquetas: José — 75')]);
-      f.set(S.notes, [oldNote, new Node('Lívia — 75')]);
+      f.set(S.notes, [oldNote, f.note('Lívia — 75')]);
     });
     const summary = await f.collector.run(['260123ABC']);
     assert.equal(summary.orders[0].status, 'collected');
@@ -260,6 +263,77 @@ test('customer color filter excludes seller messages', async () => {
   const f = fixture(); const customer = new Node('Para as etiquetas: Ana'); const seller = new Node('Olá, Maria'); seller.css.backgroundColor = 'rgb(255, 255, 255)';
   f.set(S.message, [customer, seller]);
   assert.equal(f.collector.extractText(), 'Para as etiquetas: Ana');
+});
+
+test('fixed note headings, unchanged seller bubbles and empty media do not block fresh customer text', async () => {
+  const f = fixture();
+  const seller = new Node('Mensagem automática da loja'); seller.css.backgroundColor = 'rgb(255, 255, 255)';
+  const emptyMedia = new Node('');
+  const fixedNoteHeading = new Node('Observação do vendedor\nObservação do pedido Duoke');
+  f.set(S.message, [seller, emptyMedia]);
+  f.set(".order_item_remark, .note_detail, [class*='remark'], [class*='note_detail']", [fixedNoteHeading]);
+  f.search.onClick = () => f.result('260123ABC', () => {
+    f.set(S.header, [new Node('260123ABC', { class: 'order_item_title' })]);
+    f.set(S.message, [seller, emptyMedia, new Node('Etiquetas: Ana Clara')]);
+  });
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected'); assert.equal(order.text, 'Etiquetas: Ana Clara');
+});
+
+test('only the requested order card contributes notes, even when other cards and unrelated notes are visible', async () => {
+  const f = fixture();
+  const otherCard = new Node(); otherCard.routes = new Map([['.order_item_title', [new Node('260999XYZ')]]]);
+  const otherNote = f.note('Nome de outro pedido', otherCard);
+  const unscopedNote = new Node('Nota sem pedido identificado');
+  f.search.onClick = () => f.result('260123ABC', () => {
+    f.conversation('260123ABC', 'Etiquetas: Ana');
+    f.set(S.notes, [f.note('Ana Clara, 150 unidades'), otherNote, unscopedNote]);
+  });
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected');
+  assert.equal(order.text, 'Etiquetas: Ana\n\nObservação: Ana Clara, 150 unidades');
+});
+
+test('customer and seller positions take precedence over theme bubble colors', () => {
+  const f = fixture();
+  const customer = new Node('Para as etiquetas: João'); customer.css.backgroundColor = 'rgb(200, 200, 200)';
+  customer.ancestors = new Map([['.message_main > li.lt', new Node()]]);
+  const seller = new Node('Olá, Maria'); seller.ancestors = new Map([['.message_main > li.rt, .message_main > li.ct', new Node()]]);
+  f.set(S.message, [customer, seller]);
+  assert.equal(f.collector.extractText(), 'Para as etiquetas: João');
+});
+
+test('conversation has its own longer deadline without extending search time', async () => {
+  const f = fixture();
+  const collector = createCollector(f.root, { ...f.options, conversationTimeout: 400 });
+  f.search.onClick = () => f.result('260123ABC', () => f.after(220, () => f.conversation('260123ABC', 'Etiquetas: Beatriz')));
+  const order = await collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected'); assert.equal(order.text, 'Etiquetas: Beatriz');
+  assert.ok(f.time() >= 490);
+});
+
+test('Duoke message-loading indicator prevents collecting an incomplete conversation', async () => {
+  const f = fixture();
+  f.search.onClick = () => f.result('260123ABC', () => {
+    f.conversation('260123ABC', 'Etiquetas: Ana'); f.set(S.messageLoading, [new Node()]);
+    f.after(80, () => { f.set(S.messageLoading, []); f.conversation('260123ABC', 'Etiquetas: Ana Clara'); });
+  });
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.text, 'Etiquetas: Ana Clara'); assert.ok(f.time() >= 350);
+});
+
+test('timeout identifies whether the order header, customer text or content refresh is missing', async () => {
+  for (const [state, expected] of [['header', /código do pedido no painel/], ['text', /mensagens do cliente ou notas com texto/], ['stale', /atualização das mensagens/]]) {
+    const f = fixture();
+    if (state === 'stale') f.conversation('OLD99999', 'Nome anterior');
+    f.search.onClick = () => f.result('260123ABC', () => {
+      if (state !== 'header') f.set(S.header, [new Node('260123ABC')]);
+      if (state === 'header') f.set(S.message, [new Node('Não coletar sem identificação')]);
+    });
+    const summary = await f.collector.run(['260123ABC']);
+    assert.equal(summary.orders[0].status, 'error'); assert.equal(summary.orders[0].text, '');
+    assert.match(summary.orders[0].error, expected);
+  }
 });
 
 const workerSource = await readFile(new URL('../extension/duoke-bridge/worker.js', import.meta.url), 'utf8');

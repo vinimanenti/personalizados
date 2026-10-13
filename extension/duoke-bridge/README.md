@@ -14,6 +14,10 @@ Protocolo: mensagens `window.postMessage` usam `version: 1`, `source: 'sticker-s
 
 ## Atualizar uma instalação existente
 
-A versão 1.0.2 seleciona **Pedido**, digita o código, aguarda o resultado abaixo da barra e clica na linha para abrir a conversa. Não exige a lupa; se a busca não acontecer ao digitar, aciona Enter somente no campo de pesquisa. A coleta continua aguardando a confirmação do pedido e o carregamento das mensagens.
+A versão 1.0.3 mantém a busca por **Pedido**, reconhece o código no título atual do painel e aguarda até 30 segundos para confirmar a conversa. A conferência considera mensagens com texto do cliente e o conteúdo das notas do pedido correspondente; rótulos, botões, mensagens da loja e mídias sem texto não bloqueiam a coleta. Quando a confirmação falha, a mensagem informa o que ainda estava sendo aguardado. O código do pedido e a atualização do conteúdo continuam obrigatórios.
+
+A pesquisa digita o código, aguarda o resultado abaixo da barra e clica na linha para abrir a conversa. Não exige a lupa; se a busca não acontecer ao digitar, aciona Enter somente no campo de pesquisa.
 
 Substitua os arquivos da pasta instalada pelos do novo ZIP, abra chrome://extensions ou edge://extensions e clique em **Recarregar** na Ponte Duoke. Se a extensão está carregada diretamente da pasta `extension/duoke-bridge` deste projeto, basta recarregá-la. Atualize as abas do Studio e do Duoke e conecte as duas novamente.
+
+O Duoke abre uma conversa por vez para leitura. Após a coleta, o botão de extração do Lápis envia até 10 conversas ao Gemini por chamada e aplica os nomes de cada lote juntos. Por exemplo, 16 conversas selecionadas são processadas em dois lotes, de 10 e 6. A atualização da extensão não exige alterar os segredos do Supabase.

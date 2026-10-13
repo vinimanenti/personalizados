@@ -11,6 +11,21 @@ test('endpoint prefers explicit configuration and otherwise chooses development 
   assert.equal(resolveLapisEndpoint({ DEV: true, VITE_LAPIS_API_URL: 'https://api.example.test/extract' }), 'https://api.example.test/extract');
 });
 
+test('sixteen conversations use two Gemini requests and apply each group together', async () => {
+  const source = Array.from({ length: 16 }, (_, index) => ({ ...orders[0], id: `LOTE${index}` }));
+  const requested = [], applied = [];
+  const result = await extractOrders({ orders: source, accessCode: 'test-only', endpoint: '/extract',
+    fetchImpl: async (_url, options) => {
+      const chunk = JSON.parse(options.body).orders; requested.push(chunk.map(order => order.id));
+      return Response.json(payload(chunk));
+    },
+    onChunk: (chunk, completed, total) => applied.push({ ids: chunk.map(order => order.id), completed, total }),
+  });
+  assert.deepEqual(requested.map(chunk => chunk.length), [10, 6]);
+  assert.deepEqual(applied.map(chunk => [chunk.ids.length, chunk.completed, chunk.total]), [[10, 10, 16], [6, 16, 16]]);
+  assert.deepEqual(result.map(order => order.id), source.map(order => order.id));
+});
+
 test('partial batches stay applied when a subsequent API call fails', async () => {
   const applied = []; let calls = 0;
   await assert.rejects(extractOrders({ orders, accessCode: 'test-only', endpoint: '/extract',
