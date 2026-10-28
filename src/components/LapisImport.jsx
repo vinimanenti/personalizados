@@ -99,7 +99,7 @@ function queueError(order) {
 function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, connected, sendStatus, waitingSince, onResend }) {
   const validation = queueError(result);
   const canExtract = source.status === 'collected' && source.text.trim() && source.text.length <= 12000;
-  const status = accepted ? 'Na fila' : hasNames(result) ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : 'Conversa pronta';
+  const status = accepted ? 'Na fila' : hasNames(result) ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
   let quantities = [];
   if (!validation) quantities = toLabelFields({ ...result, status: 'found' }).map(field => field.qty);
   return <article className={`lapis-order${accepted ? ' lapis-order-accepted' : ''}`}>

@@ -621,3 +621,21 @@ test('re-collecting the conversation already open for the same order reads its b
   assert.equal(order.status, 'collected');
   assert.equal(order.text, 'Observação: Nome: Augusto A. Stuepp');
 });
+
+test('a confirmed conversation with only shop messages is collected with no text', async () => {
+  const f = fixture();
+  const shopBubble = () => { const node = new Node('Obrigado pela sua compra! Informe o nome pelo chat.'); node.css.backgroundColor = 'rgb(220, 235, 255)';
+    node.ancestors = new Map([['.message_main > li.rt', new Node()]]); return node; };
+  f.search.onClick = () => f.result(f.input.value, () => { f.set(S.header, [new Node('ID do Pedido: 2610216BYGJDGR')]); f.set(S.message, [shopBubble()]); f.set(S.notes, []); });
+  const order = await f.collector.collectOrder('2610216BYGJDGR');
+  assert.deepEqual(plain(order), { id: '2610216BYGJDGR', status: 'collected', text: '' });
+});
+
+test('stale shop messages from the previous conversation never count as an empty conversation', async () => {
+  const f = fixture();
+  const stale = new Node('Obrigado pela compra'); stale.css.backgroundColor = 'rgb(220, 235, 255)'; stale.ancestors = new Map([['.message_main > li.rt', new Node()]]);
+  f.set(S.message, [stale]);
+  f.search.onClick = () => f.result(f.input.value, () => { f.set(S.header, [new Node('ID do Pedido: 2610216BYGJDGR')]); });
+  const summary = await f.collector.run(['2610216BYGJDGR']);
+  assert.equal(summary.orders[0].status, 'error'); assert.match(summary.orders[0].error, /atualização das mensagens/);
+});

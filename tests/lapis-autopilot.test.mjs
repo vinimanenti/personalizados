@@ -20,7 +20,7 @@ test('auto-approves a found order with up to three valid names', () => {
 test('each auto-approval criterion sends the order to review', () => {
   assert.equal(classifyForAutopilot(source(), found([name('Ana'), name('Bia'), name('Caio'), name('Davi')])), 'review');
   assert.equal(classifyForAutopilot(source(), found([name('Ana', 100), name('Bia', 60)])), 'review');
-  assert.equal(classifyForAutopilot(source(), found(undefined, { reason: 'Quantidade ambígua.' })), 'review');
+  assert.equal(classifyForAutopilot(source(), found(undefined, { reason: 'Nome encontrado com sucesso.' })), 'auto', 'a found reason is informational');
   assert.equal(classifyForAutopilot(source(), found(undefined, { status: 'review' })), 'review');
   assert.equal(classifyForAutopilot(source(), found(), { isQueued: () => true }), 'review');
 });
@@ -32,7 +32,9 @@ test('asks only collected conversations whose extraction found no name', () => {
   assert.equal(classifyForAutopilot(source('A1', { status: 'error', text: '', error: 'x' }), null), 'failed');
   assert.equal(classifyForAutopilot(source(), null, { extractionError: 'Gemini indisponível' }), 'failed');
   assert.equal(classifyForAutopilot(source(), null), 'pending');
-  assert.equal(classifyForAutopilot(source('A1', { text: '   ' }), null), 'failed');
+  assert.equal(classifyForAutopilot(source('A1', { text: '   ' }), null), 'ask', 'buyer never wrote');
+  assert.equal(classifyForAutopilot(source('A1', { text: '' }), null, { extractionError: 'x' }), 'failed');
+  assert.equal(classifyForAutopilot(source('A1', { text: 'x'.repeat(12001) }), null), 'failed');
 });
 
 test('validates the ask message', () => {
@@ -87,7 +89,7 @@ test('plans a processed batch: queue safe orders, ask missing names, resolve ans
   const results = new Map([
     ['A1', { ...found(), id: 'A1' }],
     ['A2', { id: 'A2', status: 'not_found', reason: '', names: [] }],
-    ['A3', { ...found(undefined, { reason: 'Dois nomes possíveis.' }), id: 'A3' }],
+    ['A3', { ...found(undefined, { status: 'review', reason: 'Dois nomes possíveis.' }), id: 'A3' }],
     ['A5', { id: 'A5', status: 'not_found', reason: '', names: [] }],
   ]);
   const awaiting = { A1: { sentAt: now - HOUR, status: 'sent' }, A5: { sentAt: now - HOUR, status: 'sent' } };

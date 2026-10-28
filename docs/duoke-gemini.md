@@ -112,9 +112,9 @@ Correção da coleta 1.0.3: a imagem `ERRO EXEMPLO.png` mostrou pedidos coletado
 
 **Processar lote** faz a coleta e a extração de sempre e, em seguida:
 
-- envia direto à fila os pedidos seguros: status encontrado, de 1 a 3 nomes com evidência literal, cartela válida (até 150 etiquetas) e nenhum motivo de dúvida. Gerar o PDF continua sendo um clique do operador;
+- envia direto à fila os pedidos seguros: status encontrado (dúvidas chegam como status de revisão), de 1 a 3 nomes com evidência literal e cartela válida (até 150 etiquetas). Gerar o PDF continua sendo um clique do operador;
 - deixa em revisão qualquer outro pedido com nomes;
-- separa em **Cobrar nome** os pedidos cuja conversa foi lida sem nenhum nome. Pedidos não encontrados no Duoke e falhas de coleta ou extração nunca são cobrados.
+- separa em **Cobrar nome** os pedidos cuja conversa foi lida sem nenhum nome, inclusive quando o cliente ainda não escreveu (só há mensagens da loja; extensão 1.1.2). Pedidos não encontrados no Duoke e falhas de coleta ou extração nunca são cobrados.
 
 O painel **Cobrar nome** mostra os códigos e a mensagem (editável, salva neste navegador, até 500 caracteres). Nada é enviado até o clique em **Enviar para N clientes**; cada envio atende até 100 pedidos, com intervalo de 2 a 4 segundos. Para cada pedido, a extensão abre a conversa com a mesma confirmação da coleta, preenche o campo de mensagem, confere de novo o pedido e clica em enviar. O resultado é:
 

@@ -7,6 +7,8 @@ export const canExtract = source => source?.status === 'collected' && Boolean(so
 export function orderBucket(source, result, extractionError) {
   // Manual corrections and imported names must never be retried automatically.
   if (hasNames(result)) return 'names';
+  // Confirmed conversation where the buyer has not written: missing name, not a failure.
+  if (!extractionError && source.status === 'collected' && !source.text?.trim()) return 'missing';
   if (extractionError || source.status === 'error' || (!result && source.status === 'collected' && !canExtract(source))) return 'errors';
   if (source.status === 'not_found' || result) return 'missing';
   return 'waiting';

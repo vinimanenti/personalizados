@@ -142,7 +142,8 @@ test('missing names, unprocessed conversations and API/collection failures have 
   assert.equal(orderBucket(s, undefined, 'Timeout'), 'errors');
   assert.equal(orderBucket({ ...s, status: 'error' }), 'errors');
   assert.equal(orderBucket({ ...s, status: 'not_found' }), 'missing');
-  assert.equal(orderBucket({ ...s, text: '' }), 'errors');
+  assert.equal(orderBucket({ ...s, text: '' }), 'missing', 'confirmed conversation where the buyer has not written');
+  assert.equal(orderBucket({ ...s, text: 'x'.repeat(12001) }), 'errors');
   assert.equal(orderBucket({ ...s, status: 'error' }, result('A')), 'names');
   assert.equal(canExtract({ ...s, text: 'x'.repeat(12001) }), false);
 });

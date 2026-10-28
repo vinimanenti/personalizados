@@ -47,6 +47,7 @@
     const conversationTimeout = options.conversationTimeout ?? options.timeout ?? 30000;
     const settle = options.settle ?? 900;
     const sendTimeout = options.sendTimeout ?? 15000;
+    const emptySettle = options.emptySettle ?? settle * 3;
     const interval = options.interval ?? 100;
     const style = options.getStyle || (node => document.defaultView.getComputedStyle(node));
     const observed = new Set();
@@ -218,6 +219,7 @@
       let stableFingerprint = null;
       let stableSince = clock();
       let waitingFor = 'a identificação do pedido';
+      let empty = false;
       await waitFor(() => {
         const reset = reason => { waitingFor = reason; stableFingerprint = null; stableSince = clock(); return false; };
         if (query(LOADING).some(visible) || query(MESSAGE_LOADING).some(visible)) return reset('o término do carregamento no Duoke');
@@ -227,7 +229,19 @@
         // empty media, note headings and buttons are not customer content.
         // Notes are limited to the card for this exact order.
         const notes = notesFor(code);
-        if (!nodes.length && !notes.length) return reset('mensagens do cliente ou notas com texto');
+        if (!nodes.length && !notes.length) {
+          // A buyer who never wrote: only shop messages (usually automatic ones).
+          // They must belong to this conversation and stay unchanged for longer
+          // than usual before the conversation counts as empty.
+          const shop = query(MESSAGE).filter(node => visible(node) && node.closest?.(SHOP_MESSAGE));
+          if (!shop.length) { empty = false; return reset('mensagens do cliente ou notas com texto'); }
+          if (!alreadyOpen && !shop.every(node => changed(node, beforeMessages, Infinity))) { empty = false; return reset('a atualização das mensagens ou notas do pedido'); }
+          waitingFor = 'a estabilização do conteúdo da conversa';
+          const fingerprint = `empty\u0000${shop.map(nodeText).join('\u0000')}`;
+          if (!empty || fingerprint !== stableFingerprint) { empty = true; stableFingerprint = fingerprint; stableSince = clock(); return false; }
+          return clock() - stableSince >= emptySettle;
+        }
+        empty = false;
         const refreshed = alreadyOpen || (nodes.every(node => changed(node, beforeMessages, Infinity)) && notes.every(node => changed(node, beforeNotes, Infinity)));
         if (!refreshed) return reset('a atualização das mensagens ou notas do pedido');
         waitingFor = 'a estabilização do conteúdo da conversa';
@@ -237,7 +251,8 @@
       }, signal, () => `Tempo esgotado ao confirmar a conversa do pedido: aguardando ${waitingFor}. Nenhuma mensagem antiga foi coletada.`, conversationTimeout);
       assertRunning(signal);
       if (!headersFor(code).length) throw new Error('A conversa mudou durante a coleta.');
-      return { id: code, status: 'collected', text: extractText(code) };
+      // Collected with no text: the buyer has not written yet, so there is no name to extract.
+      return { id: code, status: 'collected', text: empty ? '' : extractText(code) };
     }
     async function run(codes, { signal, onProgress = async () => {} } = {}) {
       const uniqueCodes = [...new Set(codes)];

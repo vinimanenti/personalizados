@@ -9,14 +9,18 @@ const AWAITING_EXPIRY = 7 * 24 * 60 * 60 * 1000;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/;
 const SENT_STATES = new Set(['sent', 'unconfirmed']);
 
-// Only orders with literal evidence, a printable cartela and no doubts skip review.
+// Only orders with literal evidence and a printable cartela skip review. Doubts
+// arrive as status 'review'; the reason of a found order is informational.
 export function classifyForAutopilot(source, result, { isQueued = () => false, extractionError } = {}) {
   if (hasNames(result)) {
-    if (result.status !== 'found' || result.names.length > 3 || result.reason?.trim() || isQueued(result)) return 'review';
+    if (result.status !== 'found' || result.names.length > 3 || isQueued(result)) return 'review';
     try { toLabelFields(result); } catch { return 'review'; }
     return 'auto';
   }
-  if (extractionError || source?.status !== 'collected' || !canExtract(source)) return 'failed';
+  if (extractionError) return 'failed';
+  // Conversation confirmed, but the buyer has not written anything yet.
+  if (source?.status === 'collected' && !source.text?.trim()) return 'ask';
+  if (source?.status !== 'collected' || !canExtract(source)) return 'failed';
   if (!result) return 'pending';
   return result.status === 'not_found' ? 'ask' : 'review';
 }
