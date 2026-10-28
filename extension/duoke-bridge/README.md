@@ -1,0 +1,27 @@
+# Ponte Duoke
+
+1. Baixe o ZIP no painel Lápis do Sticker Studio e extraia em uma pasta permanente.
+2. No Chrome, abra `chrome://extensions`; no Edge, `edge://extensions`. Ative **Modo do desenvolvedor**, escolha **Carregar sem compactação** e selecione a pasta que contém `manifest.json`.
+3. Abra `https://vinimanenti.github.io/personalizados/` (ou `http://localhost:3000/personalizados/`). Clique no ícone da extensão e em **Conectar esta aba**.
+4. Abra `https://web.duoke.com/?lang=pt#/dk/main/chat`, entre normalmente e conecte essa aba pelo mesmo popup.
+5. No painel Lápis, cole os códigos, colete e revise os resultados. Mantenha as duas abas abertas; reconecte após recarregar uma aba. Use **Cancelar coleta** para preservar os pedidos concluídos.
+
+A extensão só lê a conversa após confirmar o código e uma atualização das mensagens. Resultados antigos, conversas sem identificação, carregamento incompleto e layout incompatível geram erro para revisão. Ela não lê cookies, credenciais ou armazenamento do Duoke. Mensagens só são enviadas quando o operador confirma, no Lápis, a lista de pedidos e o texto (veja abaixo). Apenas web.duoke.com possui permissão permanente; a conexão ao Studio é concedida pelo clique no popup. Somente o Studio publicado acima e localhost/127.0.0.1:3000 em `/personalizados/` são aceitos.
+
+O coletor foi testado com DOM controlado. Confirme os seletores e a identificação do pedido na sua sessão real antes de usar um lote grande; alterações no layout do Duoke podem exigir atualização da extensão.
+
+Protocolo: mensagens `window.postMessage` usam `version: 1`, `source: 'sticker-studio'` e `requestId` único. `START` contém `codes` (máximo 200, até 80 caracteres alfanuméricos, hífen ou sublinhado por código); `STATUS` consulta conexão. `CANCEL` contém um novo `requestId` e `jobId` igual ao `requestId` do `START`. A extensão responde com `source: 'sticker-duoke'`. `PROGRESS` e a conclusão do trabalho mantêm o ID original; o cancelamento também recebe uma confirmação `COMPLETE` no seu próprio ID com `jobId`. A conclusão do trabalho inclui `completed`, `total` e `cancelled`.
+
+## Cobrança de nomes (1.1.0)
+
+`SEND` contém `codes` (máximo 100) e `message` (1 a 500 caracteres) e só é emitido pelo botão **Enviar para N clientes** do Lápis. Para cada pedido, a extensão abre a conversa com a mesma confirmação da coleta, recusa conversas com anexo, citação ou rascunho pendente e o modo **Enviar após tradução**, preenche o campo de mensagem, confere de novo o pedido e clica em enviar. `PROGRESS` informa `sent` quando a mensagem aparece na conversa como mensagem da loja, `unconfirmed` quando o clique aconteceu sem essa confirmação e `failed` quando nada foi enviado. Pedidos `unconfirmed` nunca são reenviados automaticamente. Há um intervalo de 2 a 4 segundos entre envios.
+
+## Atualizar uma instalação existente
+
+A versão 1.0.3 mantém a busca por **Pedido**, reconhece o código no título atual do painel e aguarda até 30 segundos para confirmar a conversa. A conferência considera mensagens com texto do cliente e o conteúdo das notas do pedido correspondente; rótulos, botões, mensagens da loja e mídias sem texto não bloqueiam a coleta. Quando a confirmação falha, a mensagem informa o que ainda estava sendo aguardado. O código do pedido e a atualização do conteúdo continuam obrigatórios.
+
+A pesquisa digita o código, aguarda o resultado abaixo da barra e clica na linha para abrir a conversa. Não exige a lupa; se a busca não acontecer ao digitar, aciona Enter somente no campo de pesquisa.
+
+Substitua os arquivos da pasta instalada pelos do novo ZIP, abra chrome://extensions ou edge://extensions e clique em **Recarregar** na Ponte Duoke. Se a extensão está carregada diretamente da pasta `extension/duoke-bridge` deste projeto, basta recarregá-la. Atualize as abas do Studio e do Duoke e conecte as duas novamente.
+
+O Duoke abre uma conversa por vez para leitura. Após a coleta, o botão de extração do Lápis envia até 10 conversas ao Gemini por chamada e aplica os nomes de cada lote juntos. Por exemplo, 16 conversas selecionadas são processadas em dois lotes, de 10 e 6. A atualização da extensão não exige alterar os segredos do Supabase.
