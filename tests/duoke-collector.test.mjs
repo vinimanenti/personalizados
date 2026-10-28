@@ -610,3 +610,14 @@ test('content script runs SEND through the collector send method', async () => {
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(plain(calls), [['send', ['260123ABC'], 'Qual o nome?']]);
 });
+
+test('re-collecting the conversation already open for the same order reads its buyer note', async () => {
+  const f = fixture();
+  // Only shop messages and the buyer note; the conversation was opened by a previous attempt.
+  const shop = new Node('Obrigado pela sua compra!'); shop.ancestors = new Map([['.message_main > li.rt, .message_main > li.ct', new Node()]]);
+  f.set(S.header, [new Node('ID do Pedido: 261028RC9FR80C')]); f.set(S.message, [shop]); f.set(S.notes, [f.note('Nome: Augusto A. Stuepp')]);
+  f.search.onClick = () => f.result(f.input.value, () => {});
+  const order = await f.collector.collectOrder('261028RC9FR80C');
+  assert.equal(order.status, 'collected');
+  assert.equal(order.text, 'Observação: Nome: Augusto A. Stuepp');
+});

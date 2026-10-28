@@ -38,6 +38,18 @@ function awaitingKey() {
   } catch { return null; }
 }
 
+// Remembered on this computer at the operator's request; clearing the field forgets it.
+const ACCESS_CODE_KEY = 'ss_lapis_access_code_v1';
+function readAccessCode() {
+  try {
+    const saved = localStorage.getItem(ACCESS_CODE_KEY);
+    return typeof saved === 'string' && saved.length <= 256 ? saved : '';
+  } catch { return ''; }
+}
+function saveAccessCode(value) {
+  try { if (value.trim()) localStorage.setItem(ACCESS_CODE_KEY, value); else localStorage.removeItem(ACCESS_CODE_KEY); } catch { /* Storage unavailable. */ }
+}
+
 function readAskMessage() {
   try {
     const saved = localStorage.getItem(ASK_MESSAGE_KEY);
@@ -123,7 +135,7 @@ function OrderReview({ source, result, extractionError, selected, reviewed, acce
 export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISIONS }) {
   const [storageKey] = useState(draftKey);
   const [draft, setDraft] = useState(() => readDraft(storageKey));
-  const [accessCode, setAccessCode] = useState('');
+  const [accessCode, setAccessCode] = useState(readAccessCode);
   const [connection, setConnection] = useState({ connected: false, duokeConnected: false, busy: false, checking: true });
   const [phase, setPhase] = useState('idle');
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
@@ -489,14 +501,14 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         <label className="lapis-field">Códigos dos pedidos<textarea value={draft.codes} disabled={busy} maxLength={100000} rows={4} placeholder={'Cole os códigos, um por linha\n323265626\n323265627'} onChange={event => setDraft(current => ({ ...current, codes: event.target.value }))} /></label>
         <p className="lapis-batch-hint">Até 500 pedidos por lote. Coleta em etapas automáticas, com TXT completo para download.</p>
         <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !draft.codes.trim()} onClick={() => startCollection({ autopilot: true })} title="Coleta, extrai, envia à fila os pedidos seguros e separa os clientes para cobrar">Processar lote <span aria-hidden="true">→</span></button><button type="button" disabled={busy || !draft.codes.trim()} onClick={() => startCollection()}>Coletar e extrair</button><label className={`lapis-label-upload${busy ? ' is-disabled' : ''}`} title="Lê o código do pedido e o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={busy} onChange={uploadLabels} /></label><a href="https://web.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
-        <label className="lapis-field">Código de acesso à extração<input type="password" value={accessCode} maxLength={256} autoComplete="off" disabled={busy} placeholder="Informe antes de iniciar o lote" onChange={event => setAccessCode(event.target.value)} /></label>
+        <label className="lapis-field">Código de acesso à extração<input type="password" value={accessCode} maxLength={256} autoComplete="off" disabled={busy} placeholder="Informe uma vez neste computador" onChange={event => { setAccessCode(event.target.value); saveAccessCode(event.target.value); }} /></label>
         <details className="lapis-help"><summary>Conectar as abas pela primeira vez</summary><ol><li><a href={`${import.meta.env.BASE_URL}downloads/duoke-bridge.zip`} download>Baixe a extensão Duoke</a> e extraia o ZIP.</li><li>Em chrome://extensions ou edge://extensions, ative o modo de desenvolvedor e escolha “Carregar sem compactação”. Selecione a pasta extraída.</li><li>Abra a extensão na aba do Sticker Studio e clique em conectar. Faça o mesmo na aba do Duoke com sua conta aberta.</li><li>Volte aqui e clique em ↻ para verificar a conexão.</li></ol><p>A extensão lê as conversas dos pedidos informados e só envia mensagens quando você confirma a cobrança.</p></details>
       </div>
       <div className="lapis-input-panel">
         <div className="lapis-section-title"><span>OU</span><h3>Importar um arquivo</h3></div>
         <label className={`lapis-upload${busy ? ' is-disabled' : ''}`}><span aria-hidden="true">↥</span><strong>Carregar TXT ou CSV</strong><small>TXT completo do lote, coletor antigo ou nomes já extraídos · até 24 MB</small><input type="file" accept=".txt,.csv,text/plain,text/csv" disabled={busy} onChange={upload} /></label>
         <details className="lapis-help"><summary>Colar o texto do coletor</summary><label className="lapis-field">Pedidos e conversas<textarea rows={5} disabled={busy} value={draft.raw} maxLength={MAX_BATCH_FILE_BYTES} placeholder="Cole o relatório completo do coletor…" onChange={event => setDraft(current => ({ ...current, raw: event.target.value }))} /></label><button type="button" disabled={busy || !draft.raw.trim()} onClick={() => { try { importText(draft.raw); } catch (failure) { setError(failure.message); } }}>Importar texto</button></details>
-        <p className="lapis-batch-hint">O código de acesso fica apenas na memória desta tela. Ao recarregar, informe-o novamente.</p>
+        <p className="lapis-batch-hint">O código de acesso fica guardado neste navegador. Apague o campo para esquecê-lo.</p>
       </div>
     </div>
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : phase === 'sending' ? 'Enviando mensagens no Duoke' : phase === 'queueing' ? 'Adicionando à fila' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}

@@ -43,7 +43,7 @@ test('ask panel lists only askable customers and awaiting orders show Verificar 
   const draft = { codes: '', raw: '', collected, results, selected: {}, reviewed: {}, shipDates: {}, extractionErrors: {} };
   const store = { ss_session: JSON.stringify({ user: 'test-only', ts: 1 }),
     'ss_lapis_awaiting_v1:test-only': JSON.stringify({ version: 1, awaiting: { ASKED3: { sentAt: now - 3600000, status: 'sent' }, OLD9: { sentAt: now - 7200000, status: 'unconfirmed' } } }),
-    ss_lapis_ask_message_v1: 'Qual nome vai no lápis?' };
+    ss_lapis_ask_message_v1: 'Qual nome vai no lápis?', ss_lapis_access_code_v1: 'codigo-de-teste' };
   const module = { exports: {} };
   vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: createRequire(import.meta.url), console, URL, setTimeout, clearTimeout,
     localStorage: { getItem: key => store[key] ?? null, setItem() {}, removeItem() {} },
@@ -60,4 +60,5 @@ test('ask panel lists only askable customers and awaiting orders show Verificar 
   assert.match(markup, /2 clientes aguardando resposta/);
   assert.match(markup, /Verificar respostas · 2/);
   assert.match(markup, /Processar lote/);
+  assert.match(markup, /type="password"[^>]*value="codigo-de-teste"/, 'remembered access code is restored');
 });

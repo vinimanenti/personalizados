@@ -210,6 +210,10 @@
       assertRunning(signal);
       const beforeMessages = snapshot(query(MESSAGE));
       const beforeNotes = snapshot(query(NOTES));
+      // Re-collecting the conversation that is already open does not re-render
+      // it. Content shown under this exact order is not stale, so only stability
+      // is required then.
+      const alreadyOpen = headersFor(code).length > 0;
       found.node.click();
       let stableFingerprint = null;
       let stableSince = clock();
@@ -224,7 +228,7 @@
         // Notes are limited to the card for this exact order.
         const notes = notesFor(code);
         if (!nodes.length && !notes.length) return reset('mensagens do cliente ou notas com texto');
-        const refreshed = nodes.every(node => changed(node, beforeMessages, Infinity)) && notes.every(node => changed(node, beforeNotes, Infinity));
+        const refreshed = alreadyOpen || (nodes.every(node => changed(node, beforeMessages, Infinity)) && notes.every(node => changed(node, beforeNotes, Infinity)));
         if (!refreshed) return reset('a atualização das mensagens ou notas do pedido');
         waitingFor = 'a estabilização do conteúdo da conversa';
         const fingerprint = [...nodes.map(nodeText), ...notes.map(nodeText)].join('\u0000');
