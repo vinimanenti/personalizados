@@ -4,7 +4,7 @@
   "description": "Sistema de Personalização de Adesivos para E-commerce Shopee",
   "private": true,
   "scripts": {
-    "dev": "vite",
+    "dev": "node --use-system-ca node_modules/vite/bin/vite.js",
     "test:lapis": "node --test tests/*.test.mjs",
     "package:duoke": "node scripts/package-duoke-extension.mjs",
     "prebuild": "npm run package:duoke",
@@ -13,6 +13,7 @@
     "deploy": "npm run build && gh-pages -d dist"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
     "@supabase/supabase-js": "^2.103.0",
     "jspdf": "^2.5.1",
     "jszip": "^3.10.1",

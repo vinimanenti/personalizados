@@ -39,6 +39,8 @@ Use o `.env` existente para `GEMINI_API_KEY` e um `.env.local` ignorado pelo Git
 | --- | --- |
 | `GEMINI_API_KEY` | Chave válida do Gemini, somente no servidor |
 | `GEMINI_MODEL` | Modelo configurável; padrão `gemini-3.8-flash` |
+| `ANTHROPIC_API_KEY` | Opcional: chave da Anthropic, somente no servidor. Ativa o Claude como segunda tentativa |
+| `CLAUDE_MODEL` | Modelo da segunda tentativa; padrão `claude-haiku-5-5` |
 | `STICKER_AI_ACCESS_CODE` | Código forte e exclusivo para acesso ao serviço de extração |
 | `STICKER_ALLOWED_ORIGINS` | Origens exatas autorizadas, separadas por vírgula |
 | `STICKER_AI_DAILY_LIMIT` | Limite global diário de pedidos enviados ao Gemini |
@@ -85,7 +87,7 @@ Revise as migrações pendentes antes de `db push`. Alternativamente, execute so
 - **Quota atingida:** aguarde a janela indicada ou peça ao administrador para revisar os limites.
 - **Falha no Gemini:** confira chave, modelo e quota no servidor; os detalhes secretos da resposta não são enviados ao navegador.
 - **Gemini indisponível (503):** a função corrigida tenta novamente uma vez dentro do mesmo prazo, respeitando a quota em cada tentativa. Se continuar indisponível, aguarde ou configure outro modelo compatível em `GEMINI_MODEL`. Em 13/10/2026, `gemini-3.8-flash` retornou alta demanda, enquanto `gemini-3.5-flash-lite` concluiu um teste com nome fictício e a chave local. Esse teste não comprova a configuração dos segredos no Supabase.
-- **Certificado local:** se o Node 24 retornar `UNABLE_TO_VERIFY_LEAF_SIGNATURE` em uma rede com certificados próprios, inicie o desenvolvimento com `node --use-system-ca node_modules/vite/bin/vite.js` para usar os certificados confiáveis do Windows. Mantenha a verificação TLS habilitada.
+- **Certificado local:** se o Node 24 retornar `UNABLE_TO_VERIFY_LEAF_SIGNATURE` em uma rede com certificados próprios, o `npm run dev` já inicia o Vite com `node --use-system-ca` para usar os certificados confiáveis do Windows. A causa aparece no terminal como `[lapis-extract] Falha ao conectar ao Gemini`. Mantenha a verificação TLS habilitada.
 - **CSV e quantidades:** `ID,Nome` não contém uma coluna de quantidade. O CSV é compatível com o formato solicitado; para preservar divisões personalizadas, envie os resultados diretamente à fila antes de exportar/reimportar.
 
 Os testes automatizados usam respostas simuladas para conferir erros, evidências, quantidades, comunicação e cancelamento. Não substituem o teste com uma sessão real do Duoke: seletores e estrutura de terceiros podem mudar. A instalação da extensão, migração do banco, configuração de segredos e publicação são etapas de ativação separadas do build local.
@@ -125,3 +127,9 @@ Pedidos cobrados ficam em **Aguardando cliente** neste computador, por usuário,
 Para atualizar a extensão para 1.1.0, substitua os arquivos pelo ZIP novo, recarregue a extensão, atualize as duas abas e reconecte-as. No Duoke, deixe o botão de envio em **Enviar diretamente**.
 
 Mapeamento do campo de mensagem em 28/10/2026, pelo código público do Duoke (sub-aplicativo `dk-web-vue2`, componente `InputAreaView`): `.cont_footer`, `textarea.el-textarea__inner`, ícone `.icon_send_chatbox` (`.icon_send02_chatbox` no modo de tradução), citação `.quote_content_front_block`, classe `has_attachments` e mensagens da loja em `.message_main > li.rt`. Os testes usam DOM simulado; o envio na sessão real ainda precisa ser confirmado pelo usuário, primeiro com um pedido próprio de teste.
+
+## Claude como segunda tentativa
+
+Quando `ANTHROPIC_API_KEY` está configurada no servidor, a extração usa o Claude (padrão `claude-haiku-5-5`, ajustável em `CLAUDE_MODEL`) uma vez se o Gemini falhar do lado dele: alta demanda após a nova tentativa, limite do Google, erro de rede ou certificado, demora acima de ~25 segundos, resposta inválida ou chave recusada. Código de acesso errado, origem não autorizada, limite do Lápis e pedidos inválidos nunca acionam o Claude. A resposta usa o mesmo esquema JSON e passa pela mesma conferência de evidência literal. Cada tentativa consome a quota do Lápis. Sem a chave, o comportamento é o anterior.
+
+O terminal (ou o log da função) registra `[lapis-extract] Gemini falhou (HTTP …); tentando o Claude` e `Extração concluída pelo Claude.`; nenhum segredo ou conversa é registrado. Para ativar: crie a chave no Console da Anthropic, coloque `ANTHROPIC_API_KEY` no `.env.local` (desenvolvimento) e nos segredos da Edge Function, e publique novamente `lapis-extract`.

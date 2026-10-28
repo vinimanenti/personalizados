@@ -1,5 +1,6 @@
 import { loadEnv } from 'vite';
 import { Readable } from 'node:stream';
+import Anthropic from '@anthropic-ai/sdk';
 import { createGeminiHandler } from './gemini.mjs';
 
 function localQuota(env) {
@@ -24,10 +25,13 @@ export function lapisGeminiPlugin() {
     name: 'sticker-lapis-gemini', apply: 'serve',
     configResolved(config) {
       const loaded = loadEnv(config.mode, config.envDir || config.root, '');
-      const names = ['GEMINI_API_KEY', 'GEMINI_MODEL', 'STICKER_AI_ACCESS_CODE', 'STICKER_ALLOWED_ORIGINS', 'STICKER_AI_DAILY_LIMIT', 'STICKER_AI_MINUTE_LIMIT'];
+      const names = ['GEMINI_API_KEY', 'GEMINI_MODEL', 'CLAUDE_MODEL', 'STICKER_AI_ACCESS_CODE', 'STICKER_ALLOWED_ORIGINS', 'STICKER_AI_DAILY_LIMIT', 'STICKER_AI_MINUTE_LIMIT'];
       const env = Object.fromEntries(names.map(name => [name, process.env[name] ?? loaded[name]]));
       env.STICKER_ALLOWED_ORIGINS ||= 'http://localhost:3000,http://127.0.0.1:3000';
-      handler = createGeminiHandler({ env, consumeQuota: localQuota(env) });
+      // Claude is the optional second attempt; without a key only Gemini runs.
+      const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? loaded.ANTHROPIC_API_KEY)?.trim();
+      const claudeClient = anthropicKey ? new Anthropic({ apiKey: anthropicKey, maxRetries: 1, timeout: 35000 }) : null;
+      handler = createGeminiHandler({ env, consumeQuota: localQuota(env), claudeClient });
       base = config.base.startsWith('/') ? config.base : '/';
     },
     configureServer(server) {

@@ -1,4 +1,5 @@
 // Bundle the same handler used by Vite; no credentials are sent to the browser.
+import Anthropic from 'npm:@anthropic-ai/sdk@1.3.0';
 import { createGeminiHandler } from '../../../server/gemini.mjs';
 
 const env = (name: string) => Deno.env.get(name);
@@ -42,4 +43,8 @@ async function consumeQuota({ orders, signal }: { orders: number; signal: AbortS
   return result;
 }
 
-Deno.serve(createGeminiHandler({ env, consumeQuota }));
+// Claude is the optional second attempt; without ANTHROPIC_API_KEY only Gemini runs.
+const anthropicKey = env('ANTHROPIC_API_KEY')?.trim();
+const claudeClient = anthropicKey ? new Anthropic({ apiKey: anthropicKey, maxRetries: 1, timeout: 35000 }) : null;
+
+Deno.serve(createGeminiHandler({ env, consumeQuota, claudeClient }));
