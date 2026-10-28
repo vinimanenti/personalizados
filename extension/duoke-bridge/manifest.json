@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Sticker Studio · Ponte Duoke",
-  "version": "1.0.3",
-  "description": "Coleta conversas dos pedidos selecionados no Duoke para revisão no Sticker Studio.",
+  "version": "1.1.0",
+  "description": "Coleta conversas dos pedidos selecionados no Duoke e envia a mensagem confirmada no Sticker Studio aos clientes sem nome.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["https://web.duoke.com/*"],
   "background": { "service_worker": "worker.js" },

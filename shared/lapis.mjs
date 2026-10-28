@@ -34,6 +34,7 @@ export function parseOrderCodes(text) {
 export function parseDuokeText(text) {
   if (typeof text !== 'string') throw new Error('Arquivo TXT inválido.');
   const input = text.replace(/^\uFEFF/u, '').replace(/\r\n?/g, '\n');
+  if (input.startsWith('STICKER STUDIO - CONVERSAS V1\n')) return parseBatchText(input);
   const header = /^\s*(?:[=\-*#]+\s*)?(?:PEDIDO|ORDER|ID)(?:\s+(?:N[º°o.]?|C[ÓO]DIGO))?\s*[:#-]\s*([A-Za-z0-9][A-Za-z0-9_-]{0,79})(?:\s*[=\-*#]+)?\s*$/gim;
   const matches = [...input.matchAll(header)];
   if (!matches.length) throw new Error('Nenhum bloco PEDIDO: código encontrado no TXT.');
@@ -49,6 +50,42 @@ export function parseDuokeText(text) {
     const isError = /^(?:erro|error|falha|timeout)\s*[:\-]/iu.test(body);
     return { id, status: isMissing ? 'not_found' : isError || !body ? 'error' : 'collected', text: isMissing ? '' : body,
       ...(isError || !body ? { error: body || 'Conversa vazia; colete o pedido novamente.' } : {}) };
+  });
+}
+
+// Prefix every conversation line so messages resembling "PEDIDO: ..." cannot
+// accidentally move a customer's names into another order on reimport.
+export function exportDuokeText(orders) {
+  if (!Array.isArray(orders) || !orders.length) throw new Error('Nenhuma conversa para exportar.');
+  const seen = new Set();
+  const blocks = orders.map(order => {
+    validId(order.id);
+    if (seen.has(order.id)) throw new Error('Pedido duplicado no TXT.');
+    seen.add(order.id);
+    if (!['collected', 'not_found', 'error'].includes(order.status) || typeof order.text !== 'string') throw new Error('Conversa inválida.');
+    return `PEDIDO: ${order.id}\nSTATUS: ${order.status}\nERRO: ${JSON.stringify(order.error || '')}\nMENSAGENS:\n` +
+      order.text.replace(/\r\n?/g, '\n').split('\n').map(line => `| ${line}`).join('\n');
+  });
+  return '\uFEFFSTICKER STUDIO - CONVERSAS V1\n\n' + blocks.join('\n\n') + '\n';
+}
+
+function parseBatchText(input) {
+  const headers = [...input.matchAll(/^PEDIDO: ([A-Za-z0-9][A-Za-z0-9_-]{0,79})\n/gm)];
+  if (!headers.length) throw new Error('Nenhum pedido no TXT do lote.');
+  if (input.slice(0, headers[0].index).trim() !== 'STICKER STUDIO - CONVERSAS V1') throw new Error('Cabeçalho inválido no TXT do lote.');
+  const seen = new Set();
+  return headers.map((header, index) => {
+    const id = validId(header[1]);
+    if (seen.has(id)) throw new Error('Pedido duplicado no TXT.');
+    seen.add(id);
+    const block = input.slice(header.index + header[0].length, headers[index + 1]?.index ?? input.length).replace(/\n+$/, '');
+    const match = /^STATUS: (collected|not_found|error)\nERRO: (.+)\nMENSAGENS:\n([\s\S]*)$/.exec(block);
+    if (!match) throw new Error(`Bloco inválido no TXT: ${id}.`);
+    let error;
+    try { error = JSON.parse(match[2]); } catch { throw new Error(`Erro inválido no TXT: ${id}.`); }
+    const lines = match[3].split('\n');
+    if (typeof error !== 'string' || lines.some(line => !line.startsWith('| '))) throw new Error(`Conversa inválida no TXT: ${id}.`);
+    return { id, status: match[1], text: lines.map(line => line.slice(2)).join('\n'), ...(error ? { error } : {}) };
   });
 }
 

@@ -1,10 +1,12 @@
 const DUOKE_ORIGIN = 'https://web.duoke.com';
 let activeJob = null;
 const jobReady = chrome.storage.session.get('activeJob').then(({ activeJob: saved }) => {
-  if (saved?.requestId && Array.isArray(saved.codes) && Number.isInteger(saved.studioTabId)) activeJob = { ...saved, seen: new Set(saved.seen || []) };
+  if (saved?.requestId && Array.isArray(saved.codes) && Number.isInteger(saved.studioTabId)) activeJob = { kind: 'collect', ...saved, seen: new Set(saved.seen || []) };
 });
 const validId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(value);
 const validCode = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(value);
+const validMessage = value => typeof value === 'string' && Boolean(value.trim()) && value.trim().length <= 500;
+const jobName = job => (job?.kind === 'send' ? 'O envio' : 'A coleta');
 async function saveJob() {
   if (activeJob) await chrome.storage.session.set({ activeJob: { ...activeJob, seen: [...activeJob.seen] } });
   else await chrome.storage.session.remove('activeJob');
@@ -43,7 +45,7 @@ async function reconcileJob() {
     const lost = activeJob;
     activeJob = null;
     await saveJob();
-    await deliver(lost.studioTabId, { type: 'ERROR', requestId: lost.requestId, error: 'A coleta perdeu a conexão com o Duoke. Os pedidos concluídos foram preservados.' }).catch(() => {});
+    await deliver(lost.studioTabId, { type: 'ERROR', requestId: lost.requestId, error: `${jobName(lost)} perdeu a conexão com o Duoke. Os pedidos concluídos foram preservados.` }).catch(() => {});
   }
 }
 async function handle(message, sender) {
@@ -68,18 +70,21 @@ async function handle(message, sender) {
     const event = { type: message.type, requestId: activeJob.requestId };
     if (message.type === 'PROGRESS') {
       const order = message.order;
-      if (!order || !activeJob.codes.includes(order.id) || !['collected', 'not_found', 'error'].includes(order.status) || typeof order.text !== 'string' || order.text.length > 12000 || !Number.isInteger(message.completed) || message.completed !== activeJob.completed + 1 || activeJob.seen.has(order.id)) return { ok: false };
+      const sending = activeJob.kind === 'send';
+      const validOrder = sending ? ['sent', 'unconfirmed', 'failed'].includes(order?.status)
+        : ['collected', 'not_found', 'error'].includes(order?.status) && typeof order.text === 'string' && order.text.length <= 12000;
+      if (!order || !activeJob.codes.includes(order.id) || !validOrder || !Number.isInteger(message.completed) || message.completed !== activeJob.completed + 1 || activeJob.seen.has(order.id)) return { ok: false };
       activeJob.completed = message.completed;
       activeJob.seen.add(order.id);
       await saveJob();
-      Object.assign(event, { completed: message.completed, total: activeJob.codes.length, order: { id: order.id, status: order.status, text: order.text, ...(typeof order.error === 'string' ? { error: order.error.slice(0, 300) } : {}) } });
+      Object.assign(event, { completed: message.completed, total: activeJob.codes.length, order: { id: order.id, status: order.status, ...(sending ? {} : { text: order.text }), ...(typeof order.error === 'string' ? { error: order.error.slice(0, 300) } : {}) } });
     } else if (message.type === 'COMPLETE') Object.assign(event, { completed: activeJob.completed, total: activeJob.codes.length, cancelled: Boolean(message.cancelled) });
-    else event.error = 'A coleta foi interrompida. Conecte as abas novamente.';
+    else event.error = activeJob.kind === 'send' ? 'O envio foi interrompido. Confira no Duoke os pedidos sem confirmação.' : 'A coleta foi interrompida. Conecte as abas novamente.';
     if (message.type !== 'PROGRESS') { activeJob = null; await saveJob(); }
     await deliver(studio.tabId, event);
     return { ok: true };
   }
-  if (message?.channel !== 'duoke-studio' || !validId(message.requestId) || !['STATUS', 'START', 'CANCEL'].includes(message.type)) return { type: 'ERROR', error: 'Comando inválido.' };
+  if (message?.channel !== 'duoke-studio' || !validId(message.requestId) || !['STATUS', 'START', 'SEND', 'CANCEL'].includes(message.type)) return { type: 'ERROR', error: 'Comando inválido.' };
   const studio = await senderMatches(sender, 'studio');
   if (!studio) return { type: 'ERROR', error: 'Conecte esta aba do Studio pelo popup da extensão.' };
   await reconcileJob();
@@ -90,18 +95,22 @@ async function handle(message, sender) {
     return { type: 'STATUS', connected: true, duokeConnected: ready, busy: Boolean(activeJob) };
   }
   if (message.type === 'CANCEL') {
-    if (!validId(message.jobId) || !activeJob || message.jobId !== activeJob.requestId || activeJob.studioTabId !== studio.tabId) return { type: 'ERROR', error: 'Trabalho de coleta não está ativo.' };
+    if (!validId(message.jobId) || !activeJob || message.jobId !== activeJob.requestId || activeJob.studioTabId !== studio.tabId) return { type: 'ERROR', error: 'Trabalho de coleta ou envio não está ativo.' };
     if (!duoke) return { type: 'ERROR', error: 'A aba Duoke foi desconectada.' };
     await chrome.tabs.sendMessage(duoke.tabId, { channel: 'duoke-command', type: 'CANCEL', requestId: activeJob.requestId });
     return { type: 'COMPLETE', cancelled: true, jobId: message.jobId };
   }
   if (!duoke) return { type: 'ERROR', error: 'Conecte a aba Duoke pelo popup da extensão.' };
-  if (activeJob) return { type: 'ERROR', error: 'Já existe uma coleta em andamento.' };
-  if (!Array.isArray(message.codes) || !message.codes.length || message.codes.length > 200 || message.codes.some(code => !validCode(code))) return { type: 'ERROR', error: 'Lista de pedidos inválida (máximo 200 códigos).' };
-  activeJob = { requestId: message.requestId, studioTabId: studio.tabId, codes: [...new Set(message.codes)], completed: 0, seen: new Set() };
+  if (activeJob) return { type: 'ERROR', error: `${jobName(activeJob)} já está em andamento.` };
+  const sending = message.type === 'SEND';
+  const limit = sending ? 100 : 200;
+  if (!Array.isArray(message.codes) || !message.codes.length || message.codes.length > limit || message.codes.some(code => !validCode(code))) return { type: 'ERROR', error: `Lista de pedidos inválida (máximo ${limit} códigos).` };
+  // Messages are only sent for the exact list and text the operator confirmed in the Studio.
+  if (sending && !validMessage(message.message)) return { type: 'ERROR', error: 'Mensagem inválida (de 1 a 500 caracteres).' };
+  activeJob = { kind: sending ? 'send' : 'collect', requestId: message.requestId, studioTabId: studio.tabId, codes: [...new Set(message.codes)], completed: 0, seen: new Set() };
   await saveJob();
   try {
-    const accepted = await chrome.tabs.sendMessage(duoke.tabId, { channel: 'duoke-command', type: 'START', requestId: message.requestId, codes: activeJob.codes });
+    const accepted = await chrome.tabs.sendMessage(duoke.tabId, { channel: 'duoke-command', type: message.type, requestId: message.requestId, codes: activeJob.codes, ...(sending ? { message: message.message.trim() } : {}) });
     if (!accepted?.ok) throw new Error('Collector not ready');
     return { accepted: true };
   } catch {

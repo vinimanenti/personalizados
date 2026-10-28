@@ -11,19 +11,30 @@
       if (job?.requestId === message.requestId) job.controller.abort();
       respond({ ok: true }); return;
     }
-    if (message.type !== 'START' || job || !Array.isArray(message.codes) || !message.codes.length || message.codes.length > 200 || message.codes.some(code => typeof code !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(code))) { respond({ ok: false }); return; }
+    const sending = message.type === 'SEND';
+    if (!['START', 'SEND'].includes(message.type) || (job && !job.finished) || !Array.isArray(message.codes) || !message.codes.length || message.codes.length > (sending ? 100 : 200) ||
+      (sending && (typeof message.message !== 'string' || !message.message.trim() || message.message.length > 500)) || message.codes.some(code => typeof code !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(code))) { respond({ ok: false }); return; }
     const currentJob = { requestId: message.requestId, controller: new AbortController() };
     job = currentJob;
     const send = data => chrome.runtime.sendMessage({ channel: 'duoke-collector', requestId: currentJob.requestId, ...data });
     respond({ ok: true });
-    globalThis.StickerDuokeCollector.createCollector(document).run(message.codes, {
+    const collector = globalThis.StickerDuokeCollector.createCollector(document);
+    const options = {
       signal: currentJob.controller.signal,
       onProgress: async progress => {
         const acknowledged = await send({ type: 'PROGRESS', ...progress });
         if (!acknowledged?.ok) currentJob.controller.abort();
       },
-    }).then(summary => send({ type: 'COMPLETE', completed: summary.completed, total: summary.total, cancelled: summary.cancelled }))
-      .catch(() => send({ type: 'ERROR' }).catch(() => {}))
+    };
+    (sending ? collector.send(message.codes, message.message, options) : collector.run(message.codes, options)).then(summary => {
+      // A new batch may START as soon as Studio receives COMPLETE.
+      currentJob.finished = true;
+      return send({ type: 'COMPLETE', completed: summary.completed, total: summary.total, cancelled: summary.cancelled });
+    })
+      .catch(() => {
+        currentJob.finished = true;
+        return send({ type: 'ERROR' }).catch(() => {});
+      })
       .finally(() => { if (job === currentJob) job = null; });
   });
 })();

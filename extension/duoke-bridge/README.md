@@ -6,11 +6,15 @@
 4. Abra `https://web.duoke.com/?lang=pt#/dk/main/chat`, entre normalmente e conecte essa aba pelo mesmo popup.
 5. No painel Lápis, cole os códigos, colete e revise os resultados. Mantenha as duas abas abertas; reconecte após recarregar uma aba. Use **Cancelar coleta** para preservar os pedidos concluídos.
 
-A extensão só lê a conversa após confirmar o código e uma atualização das mensagens. Resultados antigos, conversas sem identificação, carregamento incompleto e layout incompatível geram erro para revisão. Ela não lê cookies, credenciais ou armazenamento do Duoke e não envia mensagens. Apenas web.duoke.com possui permissão permanente; a conexão ao Studio é concedida pelo clique no popup. Somente o Studio publicado acima e localhost/127.0.0.1:3000 em `/personalizados/` são aceitos.
+A extensão só lê a conversa após confirmar o código e uma atualização das mensagens. Resultados antigos, conversas sem identificação, carregamento incompleto e layout incompatível geram erro para revisão. Ela não lê cookies, credenciais ou armazenamento do Duoke. Mensagens só são enviadas quando o operador confirma, no Lápis, a lista de pedidos e o texto (veja abaixo). Apenas web.duoke.com possui permissão permanente; a conexão ao Studio é concedida pelo clique no popup. Somente o Studio publicado acima e localhost/127.0.0.1:3000 em `/personalizados/` são aceitos.
 
 O coletor foi testado com DOM controlado. Confirme os seletores e a identificação do pedido na sua sessão real antes de usar um lote grande; alterações no layout do Duoke podem exigir atualização da extensão.
 
 Protocolo: mensagens `window.postMessage` usam `version: 1`, `source: 'sticker-studio'` e `requestId` único. `START` contém `codes` (máximo 200, até 80 caracteres alfanuméricos, hífen ou sublinhado por código); `STATUS` consulta conexão. `CANCEL` contém um novo `requestId` e `jobId` igual ao `requestId` do `START`. A extensão responde com `source: 'sticker-duoke'`. `PROGRESS` e a conclusão do trabalho mantêm o ID original; o cancelamento também recebe uma confirmação `COMPLETE` no seu próprio ID com `jobId`. A conclusão do trabalho inclui `completed`, `total` e `cancelled`.
+
+## Cobrança de nomes (1.1.0)
+
+`SEND` contém `codes` (máximo 100) e `message` (1 a 500 caracteres) e só é emitido pelo botão **Enviar para N clientes** do Lápis. Para cada pedido, a extensão abre a conversa com a mesma confirmação da coleta, recusa conversas com anexo, citação ou rascunho pendente e o modo **Enviar após tradução**, preenche o campo de mensagem, confere de novo o pedido e clica em enviar. `PROGRESS` informa `sent` quando a mensagem aparece na conversa como mensagem da loja, `unconfirmed` quando o clique aconteceu sem essa confirmação e `failed` quando nada foi enviado. Pedidos `unconfirmed` nunca são reenviados automaticamente. Há um intervalo de 2 a 4 segundos entre envios.
 
 ## Atualizar uma instalação existente
 

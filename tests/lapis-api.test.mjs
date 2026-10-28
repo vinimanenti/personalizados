@@ -53,3 +53,24 @@ test('invalid IDs and fabricated evidence never become applied extraction result
     assert.throws(() => validateExtractionResponse(body, orders.slice(0, 1)));
   }
 });
+
+test('only the failed chunk is flagged; completed and unattempted chunks remain distinct', async () => {
+  const source = Array.from({ length: 30 }, (_, i) => ({ ...orders[0], id: `P${i}` }));
+  const applied = [], failed = []; let calls = 0;
+  await assert.rejects(extractOrders({ orders: source, accessCode: 'test-only', endpoint: '/extract',
+    onChunk: chunk => applied.push(...chunk.map(order => order.id)),
+    onChunkError: (chunk, error) => { failed.push(...chunk.map(order => order.id)); assert.match(error.message, /limite/); },
+    fetchImpl: async (_url, options) => ++calls === 1 ? Response.json(payload(JSON.parse(options.body).orders)) : Response.json({}, { status: 429 }),
+  }), /limite/);
+  assert.equal(calls, 2);
+  assert.deepEqual(applied, source.slice(0, 10).map(order => order.id));
+  assert.deepEqual(failed, source.slice(10, 20).map(order => order.id));
+});
+
+test('cancellation is not reported as a name or extraction failure', async () => {
+  const controller = new AbortController(); let failures = 0;
+  await assert.rejects(extractOrders({ orders, accessCode: 'test-only', endpoint: '/extract', signal: controller.signal,
+    onChunkError: () => { failures++; }, fetchImpl: async () => { controller.abort(); throw new DOMException('Cancelled', 'AbortError'); },
+  }), { name: 'AbortError' });
+  assert.equal(failures, 0);
+});

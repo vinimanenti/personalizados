@@ -8,6 +8,16 @@
   const EMPTY = ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text";
   const LOADING = '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading';
   const MESSAGE_LOADING = '.message_main > .t_c .el-icon-loading';
+  // Composer of Duoke's InputAreaView (dk-web-vue2 bundle, 10/2026): an Element
+  // el-autocomplete textarea and a split send button whose icon changes when
+  // "send after translation" is selected.
+  const FOOTER = '.cont_footer';
+  const COMPOSER = 'textarea.el-textarea__inner';
+  const SEND_ICON = '.icon_send_chatbox';
+  const TRANSLATED_SEND_ICON = '.icon_send02_chatbox';
+  const QUOTE = '.quote_content_front_block';
+  const SHOP_MESSAGE = '.message_main > li.rt';
+  const MAX_MESSAGE = 500;
   const CANCELLED = 'Coleta cancelada.';
   function deepQuery(root, selector, onRoot = () => {}) {
     const results = [];
@@ -36,6 +46,7 @@
     const timeout = options.timeout ?? 12000;
     const conversationTimeout = options.conversationTimeout ?? options.timeout ?? 30000;
     const settle = options.settle ?? 900;
+    const sendTimeout = options.sendTimeout ?? 15000;
     const interval = options.interval ?? 100;
     const style = options.getStyle || (node => document.defaultView.getComputedStyle(node));
     const observed = new Set();
@@ -244,7 +255,74 @@
       finally { observer?.disconnect(); }
       return { orders, completed: orders.length, total: uniqueCodes.length, cancelled: Boolean(signal?.aborted) };
     }
-    return { run, collectOrder, extractText, disconnect: () => observer?.disconnect() };
+    const flat = value => String(value).replace(/\s+/g, ' ').trim();
+    async function sendToOrder(code, message, signal) {
+      const failed = error => ({ id: code, status: 'failed', error });
+      // A full collection confirms the exact conversation before anything is typed.
+      const opened = await collectOrder(code, signal);
+      if (opened.status === 'not_found') return failed('Pedido não encontrado no Duoke.');
+      assertRunning(signal);
+      const footers = query(FOOTER).filter(visible);
+      if (footers.length !== 1) return failed('Campo de mensagem do Duoke não encontrado.');
+      const footer = footers[0];
+      if (footer.classList?.contains('has_attachments') || within(footer, QUOTE).some(visible)) return failed('A conversa tem anexo ou citação pendente. Envie ou remova no Duoke.');
+      if (within(footer, TRANSLATED_SEND_ICON).some(visible)) return failed('Desative “Enviar após tradução” no Duoke e tente de novo.');
+      const composers = within(footer, COMPOSER).filter(visible);
+      if (composers.length !== 1) return failed('Campo de mensagem do Duoke não encontrado.');
+      const composer = composers[0];
+      if (composer.disabled || composer.readOnly) return failed('Esta conversa não aceita mensagens.');
+      if (String(composer.value || '').trim()) return failed('Há um rascunho no campo de mensagem desta conversa. Envie ou apague no Duoke.');
+      const button = within(footer, SEND_ICON).find(visible)?.closest?.('button');
+      if (!button || button.disabled) return failed('Botão de envio do Duoke não encontrado.');
+      const setter = Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement?.prototype || {}, 'value')?.set;
+      const fill = value => {
+        if (setter) setter.call(composer, value); else composer.value = value;
+        composer.dispatchEvent(new document.defaultView.Event('input', { bubbles: true, composed: true }));
+      };
+      const before = snapshot(query(MESSAGE));
+      composer.focus();
+      fill(message);
+      await sleep(150);
+      // The conversation must still be this order at the moment of sending.
+      if (signal?.aborted || composer.value !== message || !headersFor(code).length) {
+        fill('');
+        assertRunning(signal);
+        return failed('A conversa mudou antes do envio. Nada foi enviado.');
+      }
+      button.click();
+      // After the click the message may have left: never report failed from here on.
+      try {
+        await waitFor(() => query(MESSAGE).some(node => visible(node) && node.closest?.(SHOP_MESSAGE) && changed(node, before, Infinity) && flat(nodeText(node)).includes(flat(message))),
+          null, 'unconfirmed', sendTimeout);
+        return { id: code, status: 'sent' };
+      } catch {
+        return { id: code, status: 'unconfirmed', error: 'A mensagem não apareceu na conversa. Confira no Duoke antes de reenviar.' };
+      }
+    }
+    async function send(codes, message, { signal, onProgress = async () => {}, pause = () => sleep(2000 + Math.floor(Math.random() * 2001)) } = {}) {
+      const text = typeof message === 'string' ? message.trim() : '';
+      if (!text || text.length > MAX_MESSAGE) throw new Error('Mensagem inválida.');
+      const uniqueCodes = [...new Set(codes)];
+      const orders = [];
+      try {
+        for (const code of uniqueCodes) {
+          if (signal?.aborted) break;
+          if (orders.length) await pause();
+          if (signal?.aborted) break;
+          let order;
+          try { order = await sendToOrder(code, text, signal); }
+          catch (error) {
+            if (signal?.aborted) break;
+            order = { id: code, status: 'failed', error: error.message };
+          }
+          // A result is always reported, even when cancellation arrived after the click.
+          orders.push(order);
+          await onProgress({ completed: orders.length, total: uniqueCodes.length, order });
+        }
+      } finally { observer?.disconnect(); }
+      return { orders, completed: orders.length, total: uniqueCodes.length, cancelled: Boolean(signal?.aborted) };
+    }
+    return { run, send, collectOrder, sendToOrder, extractText, disconnect: () => observer?.disconnect() };
   }
   globalThis.StickerDuokeCollector = Object.freeze({ deepQuery, hasExactCode, hasOnlyOrderCode, createCollector });
 })();

@@ -348,6 +348,7 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
   const tabs = new Map([[1, { id: 1, url: 'https://vinimanenti.github.io/personalizados/' }], [2, { id: 2, url: 'https://web.duoke.com/?lang=pt#/dk/main/chat' }], [3, { id: 3, url: 'https://example.com/personalizados/' }]]);
   const events = [];
   const injected = [];
+  const commands = [];
   const chrome = {
     runtime: { id: 'extension-id', getURL: file => `chrome-extension://extension-id/${file}`, onMessage: { addListener: fn => { listener = fn; } } },
     storage: { session: {
@@ -362,7 +363,7 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
         if (id === 1) { events.push(plain(message)); return {}; }
         if (id !== 2) throw new Error('unpaired');
         if (message.type === 'PING') return { ok: true, jobId: currentJob, busy: Boolean(currentJob) };
-        if (message.type === 'START') { currentJob = message.requestId; return { ok: true }; }
+        if (['START', 'SEND'].includes(message.type)) { currentJob = message.requestId; commands.push(plain(message)); return { ok: true }; }
         if (message.type === 'CANCEL') return { ok: true };
       },
       onRemoved: { addListener: () => {} },
@@ -372,7 +373,7 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
   const studio = { id: chrome.runtime.id, tab: { id: 1 }, frameId: 0, origin: values.studio.origin, url: tabs.get(1).url };
   const duoke = { id: chrome.runtime.id, tab: { id: 2 }, frameId: 0, origin: values.duoke.origin, url: tabs.get(2).url };
   const send = (message, sender = studio) => new Promise(resolve => listener(message, sender, resolve));
-  return { send, studio, duoke, tabs, events, values, injected, popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') } };
+  return { send, studio, duoke, tabs, events, values, injected, commands, popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') } };
 }
 test('worker rejects unpaired tab, wrong origin, subframe and arbitrary commands', async () => {
   const f = workerFixture();
@@ -460,4 +461,152 @@ test('content script accepts the web chat and stops responding after leaving its
 test('extension permissions only grant persistent access to the corrected web domain', async () => {
   const manifest = JSON.parse(await readFile(new URL('../extension/duoke-bridge/manifest.json', import.meta.url), 'utf8'));
   assert.deepEqual(manifest.host_permissions, ['https://web.duoke.com/*']);
+});
+
+test('content accepts the next batch while the previous COMPLETE acknowledgement is pending', async () => {
+  const contentSource = await readFile(new URL('../extension/duoke-bridge/duoke-content.js', import.meta.url), 'utf8');
+  let listener, finishFirst, releaseAcknowledgement;
+  const runs = [], events = [];
+  const chrome = { runtime: { id: 'extension-id', onMessage: { addListener: fn => { listener = fn; } },
+    sendMessage: message => {
+      events.push(message);
+      if (message.type === 'COMPLETE') return new Promise(resolve => { releaseAcknowledgement = resolve; });
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  const collector = { createCollector: () => ({ run: codes => {
+    runs.push([...codes]);
+    return new Promise(resolve => { if (runs.length === 1) finishFirst = resolve; });
+  } }) };
+  vm.runInNewContext(contentSource, { chrome, location: new URL('https://web.duoke.com/?lang=pt#/dk/main/chat'), document: {}, AbortController, StickerDuokeCollector: collector });
+  const command = message => {
+    let reply;
+    listener({ channel: 'duoke-command', ...message }, { id: chrome.runtime.id }, value => { reply = value; });
+    return reply;
+  };
+  assert.equal(command({ type: 'START', requestId: 'first', codes: ['A'] }).ok, true);
+  assert.equal(command({ type: 'START', requestId: 'too-early', codes: ['B'] }).ok, false);
+  finishFirst({ completed: 1, total: 1, cancelled: false });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(events[0].type, 'COMPLETE');
+  assert.equal(command({ type: 'PING' }).jobId, 'first', 'worker can still reconcile the finishing job');
+  assert.equal(command({ type: 'START', requestId: 'second', codes: ['B'] }).ok, true);
+  releaseAcknowledgement({ ok: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(command({ type: 'PING' }).jobId, 'second', 'old finally must not clear the next batch');
+  assert.deepEqual(runs, [['A'], ['B']]);
+});
+
+const MSG = 'Olá! Qual nome vai nas etiquetas?';
+function composer(f, { translated = false, draft = '', onSend } = {}) {
+  const footer = new Node(); footer.routes = new Map(); footer.classList = { contains: () => false };
+  const input = new Node(); input.value = draft;
+  const icon = new Node(); const button = new Node(); icon.ancestors = new Map([['button', button]]);
+  footer.routes.set('textarea.el-textarea__inner', [input]);
+  footer.routes.set(translated ? '.icon_send02_chatbox' : '.icon_send_chatbox', [icon]);
+  f.routes.set('.cont_footer', [footer]);
+  const bubble = text => { const node = new Node(text); node.ancestors = new Map([['.message_main > li.rt', new Node()]]); f.set(S.message, [...(f.routes.get(S.message) || []), node]); };
+  button.onClick = () => (onSend ? onSend(input.value, bubble) : bubble(`Loja\n${input.value}`));
+  return { footer, input, button };
+}
+function sendFixture(extra) {
+  const f = fixture();
+  f.search.onClick = () => f.result(f.input.value, () => f.conversation(f.input.value, 'Comprei 150 etiquetas'));
+  return { f, c: composer(f, extra) };
+}
+
+test('sends only after confirming the conversation and reports the shop bubble as sent', async () => {
+  const { f, c } = sendFixture();
+  const order = await f.collector.sendToOrder('260123ABC', MSG);
+  assert.deepEqual(plain(order), { id: '260123ABC', status: 'sent' });
+  assert.equal(c.button.clicks, 1); assert.equal(c.input.value, MSG);
+});
+
+test('a conversation for another order never receives the message', async () => {
+  const f = fixture(); const c = composer(f);
+  f.search.onClick = () => f.result(f.input.value, () => f.conversation('260999XYZ', 'Outro cliente'));
+  const summary = await f.collector.send(['260123ABC'], MSG, { pause: async () => {} });
+  assert.equal(summary.orders[0].status, 'failed'); assert.equal(c.button.clicks, 0); assert.equal(c.input.value, '');
+});
+
+test('a missing composer fails without clicking', async () => {
+  const { f, c } = sendFixture();
+  f.routes.set('.cont_footer', []);
+  const order = await f.collector.sendToOrder('260123ABC', MSG);
+  assert.equal(order.status, 'failed'); assert.equal(c.button.clicks, 0);
+});
+
+test('a translated send button and an operator draft are reported clearly', async () => {
+  let { f, c } = sendFixture({ translated: true });
+  assert.match((await f.collector.sendToOrder('260123ABC', MSG)).error, /tradução/); assert.equal(c.button.clicks, 0);
+  ({ f, c } = sendFixture({ draft: 'rascunho' }));
+  assert.match((await f.collector.sendToOrder('260123ABC', MSG)).error, /rascunho/); assert.equal(c.input.value, 'rascunho');
+});
+
+test('a message that never appears is unconfirmed, never failed', async () => {
+  const { f, c } = sendFixture({ onSend: () => {} });
+  const collector = createCollector(f.root, { ...f.options, sendTimeout: 100 });
+  const order = await collector.sendToOrder('260123ABC', MSG);
+  assert.equal(order.status, 'unconfirmed'); assert.equal(c.button.clicks, 1);
+});
+
+test('the conversation switching while typing aborts before the click', async () => {
+  const { f, c } = sendFixture();
+  c.input.onEvent = event => { if (event.type === 'input' && c.input.value) f.set(S.header, [new Node('ID do Pedido: 260999XYZ')]); };
+  const order = await f.collector.sendToOrder('260123ABC', MSG);
+  assert.equal(order.status, 'failed'); assert.equal(c.button.clicks, 0); assert.equal(c.input.value, '');
+});
+
+test('duplicate codes are sent once and cancellation stops the next sends', async () => {
+  let { f, c } = sendFixture();
+  let summary = await f.collector.send(['260123ABC', '260123ABC'], MSG, { pause: async () => {} });
+  assert.equal(summary.total, 1); assert.equal(c.button.clicks, 1);
+  ({ f, c } = sendFixture());
+  const controller = new AbortController(); const pauses = [];
+  summary = await f.collector.send(['260123ABC', '260456DEF', '260789GHI'], MSG, { signal: controller.signal, pause: async () => { pauses.push(1); },
+    onProgress: async () => controller.abort() });
+  assert.equal(summary.completed, 1); assert.equal(summary.cancelled, true); assert.equal(c.button.clicks, 1); assert.equal(pauses.length, 0);
+});
+
+test('rejects empty or oversized messages before touching Duoke', async () => {
+  const { f, c } = sendFixture();
+  await assert.rejects(f.collector.send(['260123ABC'], '   '));
+  await assert.rejects(f.collector.send(['260123ABC'], 'a'.repeat(501)));
+  assert.equal(c.button.clicks, 0); assert.equal(f.input.value, undefined);
+});
+
+test('worker forwards SEND with the confirmed text only and validates send progress', async () => {
+  const f = workerFixture();
+  const sendCommand = extra => f.send({ channel: 'duoke-studio', requestId: 'send-1', type: 'SEND', codes: ['260123ABC', '260456DEF'], message: '  Qual o nome?  ', ...extra });
+  assert.equal((await sendCommand({ message: '   ' })).type, 'ERROR');
+  assert.equal((await sendCommand({ message: 'a'.repeat(501) })).type, 'ERROR');
+  assert.equal((await sendCommand({ codes: Array.from({ length: 101 }, (_, i) => `CODE${i}X`) })).type, 'ERROR');
+  assert.equal(f.commands.length, 0);
+  assert.deepEqual(plain(await sendCommand()), { accepted: true });
+  assert.deepEqual(f.commands[0], { channel: 'duoke-command', type: 'SEND', requestId: 'send-1', codes: ['260123ABC', '260456DEF'], message: 'Qual o nome?' });
+  assert.equal(f.values.activeJob.kind, 'send');
+  assert.equal((await f.send({ channel: 'duoke-studio', requestId: 'job-2', type: 'START', codes: ['260789GHI'] })).type, 'ERROR', 'collection waits for the send job');
+  const progress = (order, completed = 1) => f.send({ channel: 'duoke-collector', requestId: 'send-1', type: 'PROGRESS', completed, order }, f.duoke);
+  assert.equal((await progress({ id: '260123ABC', status: 'collected', text: 'x' })).ok, false);
+  assert.equal((await progress({ id: '260123ABC', status: 'sent' })).ok, true);
+  assert.deepEqual(f.events[0].order, { id: '260123ABC', status: 'sent' });
+  assert.equal((await progress({ id: '260456DEF', status: 'unconfirmed', error: 'Confira' }, 2)).ok, true);
+  assert.equal((await f.send({ channel: 'duoke-collector', requestId: 'send-1', type: 'COMPLETE', cancelled: false }, f.duoke)).ok, true);
+  assert.equal(f.values.activeJob, undefined);
+});
+
+test('content script runs SEND through the collector send method', async () => {
+  const contentSource = await readFile(new URL('../extension/duoke-bridge/duoke-content.js', import.meta.url), 'utf8');
+  let listener; const calls = [];
+  const chrome = { runtime: { id: 'extension-id', onMessage: { addListener: fn => { listener = fn; } }, sendMessage: async () => ({ ok: true }) } };
+  const collector = { createCollector: () => ({
+    run: async () => { calls.push('run'); return { completed: 0, total: 0, cancelled: false }; },
+    send: async (codes, message) => { calls.push(['send', [...codes], message]); return { completed: 1, total: 1, cancelled: false }; },
+  }) };
+  vm.runInNewContext(contentSource, { chrome, location: new URL('https://web.duoke.com/?lang=pt#/dk/main/chat'), document: {}, AbortController, StickerDuokeCollector: collector });
+  const command = message => { let reply; listener({ channel: 'duoke-command', ...message }, { id: chrome.runtime.id }, value => { reply = value; }); return reply; };
+  assert.equal(command({ type: 'SEND', requestId: 'bad', codes: ['260123ABC'], message: '' }).ok, false);
+  assert.equal(command({ type: 'SEND', requestId: 'send-1', codes: ['260123ABC'], message: 'Qual o nome?' }).ok, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(calls), [['send', ['260123ABC'], 'Qual o nome?']]);
 });

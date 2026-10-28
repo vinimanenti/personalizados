@@ -37,7 +37,7 @@ function responseError(status, message) {
   return typeof message === 'string' && message.length < 300 ? message : 'Não foi possível extrair este lote. Os resultados concluídos foram mantidos.';
 }
 
-export async function extractOrders({ orders, accessCode, endpoint, signal, onChunk, fetchImpl = fetch, timeoutMs = TIMEOUT_MS }) {
+export async function extractOrders({ orders, accessCode, endpoint, signal, onChunk, onChunkError, fetchImpl = fetch, timeoutMs = TIMEOUT_MS }) {
   if (!accessCode?.trim()) throw new Error('Preencha o código de acesso à extração antes de continuar.');
   if (!Array.isArray(orders) || !orders.length) throw new Error('Selecione pelo menos uma conversa para extrair.');
   for (const order of orders) {
@@ -62,9 +62,10 @@ export async function extractOrders({ orders, accessCode, endpoint, signal, onCh
       onChunk?.(result, completed.length, orders.length);
     } catch (error) {
       if (signal?.aborted) throw new DOMException('Cancelado', 'AbortError');
-      if (timedOut) throw new Error('A extração demorou mais que o esperado. Tente os pedidos restantes; os resultados concluídos foram mantidos.');
-      if (error instanceof TypeError) throw new Error('Não foi possível conectar ao serviço de extração. Confira sua conexão e a configuração do serviço para este endereço.');
-      throw error;
+      const failure = timedOut ? new Error('A extração demorou mais que o esperado. Tente os pedidos restantes; os resultados concluídos foram mantidos.')
+        : error instanceof TypeError ? new Error('Não foi possível conectar ao serviço de extração. Confira sua conexão e a configuração do serviço para este endereço.') : error;
+      onChunkError?.(chunk, failure);
+      throw failure;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
