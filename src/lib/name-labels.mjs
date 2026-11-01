@@ -15,6 +15,11 @@ export const DEFAULT_OPTS = {
   roleClear: 1,     // folga mínima entre a perna das letras (J, g, p…) e a função (mm)
   roleUpper: true,
   overprint: true,  // "Impressão sobreposta do preenchimento" no PDF
+  letter: "black",  // "black" = CMYK 100/100/100/100 + Branco + Verniz; "white" = Branco + Verniz
+  whiteLayer: true,
+  varnishLayer: true,
+  whiteSpot: "TOYO 0024pc*",
+  varnishSpot: "TOYO 0044pc*",
   defaultRole: "",
   copies: 1,
 };
@@ -147,4 +152,43 @@ const fmt = n => +n.toFixed(3);
 export function sheetToSvg(sheet) {
   const paths = sheet.placed.map(p => `<path transform="translate(${fmt(p.x)} ${fmt(p.y)})" d="${p.box.d}"/>`).join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}"><g fill="#000">${paths}</g></svg>`;
+}
+
+// Camadas do RIP, na ordem em que são impressas: CMYK > Branco > Verniz.
+// `cs` é o nome do recurso de espaço de cor da página (null = preto CMYK).
+export function pdfLayers(o) {
+  const out = [];
+  if (o.letter !== "white") out.push({ key: "cmyk", label: "CMYK 100/100/100/100", cs: null });
+  if (o.whiteLayer) out.push({ key: "white", label: o.whiteSpot, cs: "CSWhite", spot: o.whiteSpot, alt: [0, 0, 0, 0.15] });
+  if (o.varnishLayer) out.push({ key: "varnish", label: o.varnishSpot, cs: "CSVarnish", spot: o.varnishSpot, alt: [0, 0, 0.3, 0] });
+  return out;
+}
+
+// Path SVG absoluto (M/L/Q/C/Z, como o fontkit gera) → operadores de caminho do PDF.
+// (tx, ty) e o path em mm com Y para baixo; a saída em pt com Y para cima, numa página de altura pageH pt.
+export function svgPathToPdf(d, tx, ty, pageH) {
+  const MM = 72 / 25.4;
+  const X = x => fmt((tx + x) * MM), Y = y => fmt(pageH - (ty + y) * MM);
+  const t = d.match(/[MLQCZ]|-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/gi) || [];
+  let i = 0, cx = 0, cy = 0;
+  const out = [];
+  const n = () => parseFloat(t[i++]);
+  while (i < t.length) {
+    const c = t[i++].toUpperCase();
+    if (c === "M" || c === "L") { cx = n(); cy = n(); out.push(`${X(cx)} ${Y(cy)} ${c === "M" ? "m" : "l"}`); }
+    else if (c === "C") { const v = [n(), n(), n(), n(), n(), n()]; out.push(`${X(v[0])} ${Y(v[1])} ${X(v[2])} ${Y(v[3])} ${X(v[4])} ${Y(v[5])} c`); cx = v[4]; cy = v[5]; }
+    else if (c === "Q") {
+      const qx = n(), qy = n(), x = n(), y = n();
+      out.push(`${X(cx + (2 / 3) * (qx - cx))} ${Y(cy + (2 / 3) * (qy - cy))} ${X(x + (2 / 3) * (qx - x))} ${Y(y + (2 / 3) * (qy - y))} ${X(x)} ${Y(y)} c`);
+      cx = x; cy = y;
+    } else if (c === "Z") out.push("h");
+  }
+  return out.map(l => l + "\n").join("");
+}
+
+// Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior, com
+// sobreposição (gs) para o RIP não "vazar" a camada de baixo.
+export function sheetContent(sheet, layers, pageH, gs) {
+  const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y, pageH) + "f\n").join("");
+  return layers.map(l => ["q", gs && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("");
 }

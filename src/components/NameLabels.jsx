@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, packLabels, sheetToSvg } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, packLabels, sheetToSvg, pdfLayers, sheetContent } from "../lib/name-labels.mjs";
 
 const MM = 72 / 25.4; // mm → pt
 const STORE_KEY = "name_labels_v1";
@@ -58,16 +58,28 @@ export default function NameLabels() {
   const exportPdf = async () => {
     setBusy(true); setErr("");
     try {
-      const [{ PDFDocument, rgb, pushGraphicsState, setGraphicsState, popGraphicsState }] = await loadLibs();
+      const [{ PDFDocument, PDFName }] = await loadLibs();
       const doc = await PDFDocument.create();
+      const ctx = doc.context;
+      const layers = pdfLayers(opts);
+      if (!layers.length) throw new Error("nenhuma camada selecionada");
+      // Cores spot (Separation): o RIP reconhece pelo nome; `alt` é só a cor de visualização.
+      const colorSpaces = {};
+      for (const l of layers.filter(l => l.spot)) {
+        const fn = ctx.obj({ FunctionType: 2, Domain: [0, 1], C0: [0, 0, 0, 0], C1: l.alt, N: 1 });
+        colorSpaces[l.cs] = ctx.register(ctx.obj([PDFName.of("Separation"), PDFName.of(l.spot), PDFName.of("DeviceCMYK"), fn]));
+      }
+      // Sobreposição do preenchimento: /op (preenchimento) e /OP (traço) + OPM 1
+      const gsRef = opts.overprint ? ctx.register(ctx.obj({ Type: "ExtGState", op: true, OP: true, OPM: 1 })) : null;
       for (const s of sheets) {
         const pg = doc.addPage([s.w * MM, s.h * MM]);
-        // Sobreposição do preenchimento: /op (preenchimento) e /OP (traço) + OPM 1
-        // (o drawSvgPath do pdf-lib 1.17 ignora a opção graphicsState, então o gs vai direto no conteúdo)
-        if (opts.overprint) pg.pushOperators(pushGraphicsState(), setGraphicsState(pg.node.newExtGState("GS", doc.context.obj({ Type: "ExtGState", op: true, OP: true, OPM: 1 }))));
-        for (const p of s.placed) pg.drawSvgPath(p.box.d, { x: p.x * MM, y: pg.getHeight() - p.y * MM, scale: MM, color: rgb(0, 0, 0), borderWidth: 0 });
-        if (opts.overprint) pg.pushOperators(popGraphicsState());
+        const res = pg.node.normalizedEntries().Resources;
+        if (Object.keys(colorSpaces).length) res.set(PDFName.of("ColorSpace"), ctx.obj(colorSpaces));
+        if (gsRef) res.set(PDFName.of("ExtGState"), ctx.obj({ GSOver: gsRef }));
+        pg.node.addContentStream(ctx.register(ctx.flateStream(sheetContent(s, layers, pg.getHeight(), gsRef && "GSOver"))));
       }
+      doc.setTitle(`Etiquetas nome — ${layers.map(l => l.label).join(" > ")}`);
+      doc.setCreator("Sticker Studio");
       download(new Blob([await doc.save()], { type: "application/pdf" }), `etiquetas-nome-${stamp()}.pdf`);
     } catch (e) { setErr(`Erro ao gerar PDF: ${e.message}`); }
     setBusy(false);
@@ -115,7 +127,22 @@ export default function NameLabels() {
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
             <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (PDF)
           </label>
-          <button className="bs" style={{ marginTop: 6, padding: "6px 10px", fontSize: 12 }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole })}>Restaurar padrão</button>
+          <h3 style={{ fontSize: 15, margin: "10px 0 4px" }}>Camadas do RIP</h3>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["black", "Letra preta"], ["white", "Letra branca"]].map(([v, l]) => (
+              <button key={v} className={opts.letter === v ? "bp" : "bs"} style={{ flex: 1, padding: "7px 10px", fontSize: 12 }} onClick={() => up("letter", v)}>{l}</button>
+            ))}
+          </div>
+          <p style={{ fontSize: 11, color: "var(--t3)" }}>Ordem: {pdfLayers(opts).map(l => l.label).join(" > ") || "nenhuma"}</p>
+          {[["whiteLayer", "whiteSpot", "Branco"], ["varnishLayer", "varnishSpot", "Verniz"]].map(([on, name, label]) => (
+            <label key={on} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+              <input type="checkbox" checked={opts[on]} onChange={e => up(on, e.target.checked)} />
+              <span style={{ width: 60 }}>{label}</span>
+              <input value={opts[name]} onChange={e => up(name, e.target.value)}
+                style={{ flex: 1, padding: "6px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, fontFamily: "monospace" }} />
+            </label>
+          ))}
+          <button className="bs" style={{ marginTop: 6, padding: "6px 10px", fontSize: 12 }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, letter: opts.letter, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
         </div>
       </div>
 
@@ -133,8 +160,8 @@ export default function NameLabels() {
         {!fonts && !err && <p style={{ color: "var(--t2)", fontSize: 13 }}>Carregando fontes…</p>}
         <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
           {sheets.map((s, i) => (
-            <div key={i} style={{ background: "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
-              dangerouslySetInnerHTML={{ __html: sheetToSvg(s).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
+            <div key={i} style={{ background: opts.letter === "white" ? "#3a3d45" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
+              dangerouslySetInnerHTML={{ __html: sheetToSvg(s).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"').replace('fill="#000"', `fill="${opts.letter === "white" ? "#fff" : "#000"}"`) }} />
           ))}
         </div>
       </div>
