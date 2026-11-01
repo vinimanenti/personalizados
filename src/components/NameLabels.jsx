@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
+import { ART_KINDS, artBoxes } from "../lib/art-upload.mjs";
+import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
 
 const MM = 72 / 25.4; // mm → pt
 const STORE_KEY = "name_labels_v1";
@@ -53,15 +55,48 @@ function layoutJob(text, opts, loaded) {
   return packLabels(labels, opts, buildCode(fonts, opts));
 }
 
+// Arte enviada: `qty` cópias de w × h mm, com o código do pedido no canto, como as etiquetas.
+function layoutArtJob(job, loaded, prepared) {
+  const boxes = artBoxes(job.qty, job.w, job.h, { artId: job.id, preview: prepared?.preview });
+  return packLabels(boxes, job.opts, buildCode({ role: loaded.role }, job.opts));
+}
+
+// Coloca no PDF a cor (imagem ou página vetorial) e a máscara de contorno de cada arte enviada.
+async function embedArts(doc, jobs, arts) {
+  const ctx = doc.context, artRes = new Map(), xobjects = {}, embedded = new Map();
+  for (const job of jobs.filter(j => j.kind === "art")) {
+    const p = arts.get(job.artId);
+    if (!p) throw new Error(`arquivo de ${job.name} não carregado`);
+    if (!embedded.has(job.artId)) {
+      const n = embedded.size + 1;
+      let color, form = null, mask = null;
+      if (p.kind === "png") color = await doc.embedPng(p.bytes);
+      else if (p.kind === "jpg") color = await doc.embedJpg(p.bytes);
+      else { [color] = await doc.embedPdf(p.pdfBytes, [0]); form = { w: color.width, h: color.height }; }
+      xobjects[`Art${n}`] = color.ref;
+      if (p.stencil) {
+        const { w, h, bits } = p.stencil;
+        xobjects[`Mask${n}`] = ctx.register(ctx.flateStream(bits, { Type: "XObject", Subtype: "Image", Width: w, Height: h, ImageMask: true, BitsPerComponent: 1 }));
+        mask = `Mask${n}`;
+      }
+      embedded.set(job.artId, { color: `Art${n}`, form, mask });
+    }
+    const e = embedded.get(job.artId);
+    artRes.set(job.id, { ...e, mask: job.mask === "shape" ? e.mask : null });
+  }
+  return { artRes, xobjects: ctx.obj(xobjects), hasArt: embedded.size > 0 };
+}
+
 // Gera um PDF com as folhas empilhadas uma embaixo da outra. Cada folha leva as camadas do seu pedido.
-async function buildPdf(jobs, gap, art) {
+async function buildPdf(jobs, gap, art, arts = new Map()) {
   const [{ PDFDocument, PDFName }] = await loadLibs();
   const doc = await PDFDocument.create();
   const ctx = doc.context;
+  const { artRes, xobjects, hasArt } = await embedArts(doc, jobs, arts);
   // Cores spot (Separation): o RIP reconhece pelo nome; `alt` é só a cor de visualização.
   const spotKeys = new Map(), colorSpaces = {};
-  const withLayers = jobs.flatMap(({ sheets, opts }) => {
-    const layers = pdfLayers(opts).map(l => {
+  const withLayers = jobs.flatMap(({ sheets, opts, kind }) => {
+    const layers = pdfLayers(kind === "art" ? { ...opts, letter: "white" } : opts).map(l => {
       if (!l.spot) return l;
       if (!spotKeys.has(l.spot)) {
         const key = `CS${spotKeys.size + 1}`;
@@ -71,7 +106,7 @@ async function buildPdf(jobs, gap, art) {
       }
       return { ...l, cs: spotKeys.get(l.spot) };
     });
-    if (!layers.length) throw new Error(`pedido ${opts.orderCode || "sem código"} sem nenhuma camada`);
+    if (!layers.length && kind !== "art") throw new Error(`pedido ${opts.orderCode || "sem código"} sem nenhuma camada`);
     return sheets.map(sheet => ({ ...sheet, layers, overprint: opts.overprint }));
   });
   // Sobreposição do preenchimento: /op (preenchimento) e /OP (traço) + OPM 1
@@ -81,7 +116,8 @@ async function buildPdf(jobs, gap, art) {
     const res = pg.node.normalizedEntries().Resources;
     if (spotKeys.size) res.set(PDFName.of("ColorSpace"), ctx.obj(colorSpaces));
     res.set(PDFName.of("ExtGState"), ctx.obj({ GSOver: gsRef }));
-    const content = page.items.map(({ sheet, oy }) => sheetContent(sheet, sheet.layers, pg.getHeight(), sheet.overprint && "GSOver", oy, art)).join("");
+    if (hasArt) res.set(PDFName.of("XObject"), xobjects);
+    const content = page.items.map(({ sheet, oy }) => sheetContent(sheet, sheet.layers, pg.getHeight(), sheet.overprint && "GSOver", oy, art, artRes)).join("");
     pg.node.addContentStream(ctx.register(ctx.flateStream(content)));
   }
   doc.setTitle(`Etiquetas nome — ${jobs.map(j => j.opts.orderCode).filter(Boolean).join(", ") || "sem código"}`);
@@ -99,6 +135,51 @@ export default function NameLabels() {
   const [fonts, setFonts] = useState(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // ─── Modo Arquivo: arte enviada (PNG/JPG/SVG/PDF) com Branco e Verniz ───
+  const [mode, setMode] = useState(() => readJson(STORE_KEY, {}).mode || "names");
+  const [arts, setArts] = useState(() => new Map()); // id do arquivo → arte preparada (art-prepare.js)
+  const [cur, setCur] = useState(null);              // { fileId, w, h, qty, mask, lock } da arte no editor
+  const [loadingArt, setLoadingArt] = useState(false);
+  const fileRef = useRef(null);
+  const curArt = cur && arts.get(cur.fileId);
+  const readArt = async (id, file) => {
+    const { prepareArt } = await import("../lib/art-prepare.js");
+    const prepared = await prepareArt(file);
+    setArts(m => new Map(m).set(id, prepared));
+    return prepared;
+  };
+  // Artes da fila: os arquivos ficam no IndexedDB e são lidos de novo ao abrir a aba.
+  useEffect(() => {
+    for (const j of readJson(QUEUE_KEY, []).filter(j => j.kind === "art")) {
+      loadArtFile(j.artId).then(f => f ? readArt(j.artId, f) : setErr(`Arquivo de ${j.name} não encontrado — remova e envie de novo`))
+        .catch(e => setErr(`Erro ao ler ${j.name}: ${e.message}`));
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const onFile = async file => {
+    if (!file) return;
+    setErr(""); setLoadingArt(true);
+    try {
+      const id = `art-${Date.now()}`;
+      const data = { name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) };
+      const p = await readArt(id, data);
+      await saveArtFile(id, data);
+      if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
+      const maxW = opts.sheetW - 2 * opts.margin;
+      const k = p.w > maxW ? maxW / p.w : 1;
+      setCur({ fileId: id, w: +(p.w * k).toFixed(1), h: +(p.h * k).toFixed(1), qty: 1, mask: p.stencil ? "shape" : "rect", lock: true });
+    } catch (e) { setErr(`Não foi possível ler ${file.name}: ${e.message}`); }
+    setLoadingArt(false);
+  };
+  const setSize = (k, v) => setCur(c => {
+    const n = { ...c, [k]: v };
+    if (c.lock && curArt && v > 0) {
+      if (k === "w") n.h = +((v * curArt.h) / curArt.w).toFixed(1);
+      if (k === "h") n.w = +((v * curArt.w) / curArt.h).toFixed(1);
+    }
+    return n;
+  });
+  const curArtJob = cur && curArt ? { id: "current", kind: "art", artId: cur.fileId, name: curArt.name, fileType: curArt.kind, w: cur.w, h: cur.h, qty: cur.qty, mask: cur.mask, opts, count: cur.qty } : null;
 
   const [art, setArt] = useState(() => new Map()); // emoji → formas coloridas (null = sem desenho)
   const [lastEmoji, setLastEmoji] = useState("💖");
@@ -136,12 +217,14 @@ export default function NameLabels() {
     pieces[i] = `${pieces[i].trimEnd()} ${e}`;
     return pieces.join("") + (q ? q[0] : "");
   }).join("\n"));
-  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts })); } catch { /* sem storage */ } }, [text, opts]);
+  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts, mode })); } catch { /* sem storage */ } }, [text, opts, mode]);
   useEffect(() => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch { /* sem storage */ } }, [queue]);
 
   const entries = useMemo(() => parseEntries(text, opts), [text, opts]);
-  const sheets = useMemo(() => fonts ? layoutJob(text, opts, fonts) : [], [fonts, text, opts]);
-  const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: layoutJob(j.text, j.opts, fonts) })) : [], [fonts, queue]);
+  const nameSheets = useMemo(() => fonts ? layoutJob(text, opts, fonts) : [], [fonts, text, opts]);
+  const artSheets = fonts && curArtJob ? layoutArtJob(curArtJob, fonts, curArt) : [];
+  const sheets = mode === "art" ? artSheets : nameSheets;
+  const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : layoutJob(j.text, j.opts, fonts) })) : [], [fonts, queue, arts]);
   const queueH = queueJobs.flatMap(j => j.sheets).reduce((h, s, i) => h + s.h + (i ? opts.gap : 0), 0);
   const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin));
 
@@ -158,7 +241,7 @@ export default function NameLabels() {
     try {
       const seqs = [...new Set(jobs.flatMap(j => j.sheets.flatMap(s => s.placed.flatMap(p => (p.box.emojis || []).map(e => e.seq)))))];
       const full = seqs.every(q => art.has(q)) ? art : await loadArt(seqs);
-      download(new Blob([await buildPdf(jobs, opts.gap, full)], { type: "application/pdf" }), name);
+      download(new Blob([await buildPdf(jobs, opts.gap, full, arts)], { type: "application/pdf" }), name);
     }
     catch (e) { setErr(`Erro ao gerar PDF: ${e.message}`); }
     setBusy(false);
@@ -166,12 +249,35 @@ export default function NameLabels() {
   const exportSvg = () => sheets.forEach((s, i) => download(new Blob([sheetToSvg(s, { fill: letterFill(opts), art })], { type: "image/svg+xml" }), `etiquetas-nome-${stamp()}${sheets.length > 1 ? `-${i + 1}` : ""}.svg`));
 
   const addToQueue = () => {
-    setQueue(q => [...q, { id: Date.now(), text, opts, count: entries.length }]);
-    setText(""); up("orderCode", "");
+    if (mode === "art") {
+      const { opts: o, ...job } = curArtJob;
+      setQueue(q => [...q, { ...job, id: Date.now(), opts: o }]);
+      setCur(null);
+    } else {
+      setQueue(q => [...q, { id: Date.now(), text, opts, count: entries.length }]);
+      setText("");
+    }
+    up("orderCode", "");
   };
   const editJob = job => {
-    setText(job.text); setOpts({ ...DEFAULT_OPTS, ...job.opts });
+    setOpts({ ...DEFAULT_OPTS, ...job.opts });
+    if (job.kind === "art") {
+      if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
+      setMode("art");
+      setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true });
+    } else {
+      setMode("names");
+      setText(job.text);
+    }
     setQueue(q => q.filter(j => j.id !== job.id));
+  };
+  const removeJob = job => {
+    if (job.kind === "art" && cur?.fileId !== job.artId) deleteArtFile(job.artId).catch(() => {});
+    setQueue(q => q.filter(j => j.id !== job.id));
+  };
+  const clearQueue = () => {
+    queue.filter(j => j.kind === "art" && j.artId !== cur?.fileId).forEach(j => deleteArtFile(j.artId).catch(() => {}));
+    setQueue([]);
   };
   const moveJob = (i, d) => setQueue(q => { const n = [...q]; [n[i], n[i + d]] = [n[i + d], n[i]]; return n; });
 
@@ -187,10 +293,100 @@ export default function NameLabels() {
   const swatch = (color, size = 14) => <span style={{ display: "inline-block", width: size, height: size, borderRadius: 4, background: color, border: "1px solid var(--brd)", flexShrink: 0 }} />;
   const small = { padding: "5px 9px", fontSize: 12 };
 
+  const layerControls = <>
+      <p style={{ fontSize: 11, color: "var(--t3)" }}>Camadas do RIP: {(mode === "art" ? ["Cores da arte", ...pdfLayers({ ...opts, letter: "white" }).map(l => l.label)] : pdfLayers(opts).map(l => l.label)).join(" > ") || "nenhuma"}</p>
+      {[["whiteLayer", "whiteSpot", "Branco"], ["varnishLayer", "varnishSpot", "Verniz"]].map(([on, name, label]) => (
+        <label key={on} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <input type="checkbox" checked={opts[on]} onChange={e => up(on, e.target.checked)} />
+          <span style={{ width: 60 }}>{label}</span>
+          <input value={opts[name]} onChange={e => up(name, e.target.value)}
+            style={{ flex: 1, padding: "6px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, fontFamily: "monospace" }} />
+        </label>
+      ))}
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+        <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (só Branco e Verniz)
+      </label>
+    </>;
+
+  const field = { width: 80, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, textAlign: "center" };
+  const warn = t => <p style={{ fontSize: 12, color: "#fbbf24" }}>{t}</p>;
+  const dpi = curArt?.px && cur?.w > 0 ? Math.round(curArt.px[0] / (cur.w / 25.4)) : null;
+  const artEditor = <>
+    <div style={{ ...card, display: "flex", flexDirection: "column", gap: 10 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+        <span style={{ width: 120, fontWeight: 600 }}>Código do pedido</span>
+        <input value={opts.orderCode} onChange={e => up("orderCode", e.target.value)} placeholder="ex.: 251101ABC123"
+          style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "monospace" }} />
+      </label>
+      <h3 style={{ fontSize: 15 }}>Arquivo</h3>
+      <div onClick={() => fileRef.current?.click()} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); onFile(e.dataTransfer.files?.[0]); }}
+        style={{ border: "2px dashed var(--brd)", borderRadius: 10, padding: 14, textAlign: "center", cursor: "pointer", fontSize: 13, color: "var(--t2)" }}>
+        {loadingArt ? "Lendo arquivo…" : curArt
+          ? <div style={{ display: "flex", alignItems: "center", gap: 12, textAlign: "left" }}>
+              <img src={curArt.preview} alt="" style={{ width: 64, height: 64, objectFit: "contain", background: "repeating-conic-gradient(#bbb 0 25%, #eee 0 50%) 0 0/12px 12px", borderRadius: 6 }} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 600, color: "var(--t1)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{curArt.name}</div>
+                <div style={{ fontSize: 11 }}>{ART_KINDS[curArt.kind]} · original {curArt.w.toFixed(1)} × {curArt.h.toFixed(1)} mm · clique para trocar</div>
+              </div>
+            </div>
+          : <>Clique ou arraste aqui um <b>PNG, JPG, SVG ou PDF</b></>}
+      </div>
+      <input ref={fileRef} type="file" accept=".png,.jpg,.jpeg,.svg,.pdf,image/png,image/jpeg,image/svg+xml,application/pdf" style={{ display: "none" }}
+        onChange={e => { onFile(e.target.files?.[0]); e.target.value = ""; }} />
+      {cur && curArt && <>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <span style={{ width: 60 }}>Medida</span>
+          <input type="number" min={1} step={0.5} value={cur.w} onChange={e => setSize("w", parseFloat(e.target.value) || 0)} style={field} />
+          ×
+          <input type="number" min={1} step={0.5} value={cur.h} onChange={e => setSize("h", parseFloat(e.target.value) || 0)} style={field} />
+          mm
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <input type="checkbox" checked={cur.lock} onChange={e => setCur(c => ({ ...c, lock: e.target.checked }))} /> Manter proporção
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <span style={{ width: 60 }}>Quantidade</span>
+          <input type="number" min={1} value={cur.qty} onChange={e => setCur(c => ({ ...c, qty: Math.max(1, parseInt(e.target.value, 10) || 1) }))} style={field} />
+        </label>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <span style={{ width: 60 }}>Branco/Verniz</span>
+          {[["shape", "Contorno"], ["rect", "Retângulo"]].map(([v, l]) => (
+            <button key={v} className={cur.mask === v ? "bp" : "bs"} disabled={v === "shape" && !curArt.stencil} style={{ flex: 1, padding: "6px 10px", fontSize: 12 }}
+              onClick={() => setCur(c => ({ ...c, mask: v }))}>{l}</button>
+          ))}
+        </div>
+        {curArt.kind === "jpg" && warn("JPG não tem transparência: Branco e Verniz saem no retângulo da imagem.")}
+        {cur.mask === "shape" && curArt.coverage > 0.97 && warn("Este arquivo não tem fundo transparente — o contorno vai sair igual ao retângulo.")}
+        {curArt.hasText && warn("O SVG tem textos que não foram convertidos em curvas; eles podem sair com outra fonte. Converta em curvas no Corel antes de exportar.")}
+        {curArt.pages > 1 && warn(`O PDF tem ${curArt.pages} páginas; só a primeira é usada.`)}
+        {dpi && dpi < 200 && warn(`Resolução baixa para esse tamanho: ${dpi} dpi (o ideal é 300).`)}
+        {(cur.w > opts.sheetW - 2 * opts.margin) && warn("A arte é mais larga que a folha.")}
+      </>}
+    </div>
+    <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
+      <h3 style={{ fontSize: 15, marginBottom: 4 }}>Camadas</h3>
+      {layerControls}
+    </div>
+    <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
+      <h3 style={{ fontSize: 15, marginBottom: 4 }}>Folha</h3>
+      {num("Largura da folha", "sheetW", "mm")}
+      {num("Altura máx.", "maxSheetH", "mm (0 = rolo)")}
+      {num("Margem", "margin", "mm", 0.5)}
+      {num("Espaço entre", "gap", "mm", 0.5)}
+      {num("Código do pedido", "codeSize", "pt", 0.5)}
+    </div>
+  </>;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20, animation: "fadeIn .3s" }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        {[["names", "Etiquetas de nome"], ["art", "Arquivo (upload)"]].map(([m, l]) => (
+          <button key={m} className={mode === m ? "bp" : "bs"} style={{ padding: "8px 16px", fontSize: 13 }} onClick={() => setMode(m)}>{l}</button>
+        ))}
+      </div>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 380px) 1fr", gap: 20 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {mode === "art" ? artEditor : <>
           <div style={card}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginBottom: 14 }}>
               <span style={{ width: 120, fontWeight: 600 }}>Código do pedido</span>
@@ -258,18 +454,7 @@ export default function NameLabels() {
                 ))}
               </div>
             </>}
-            <p style={{ fontSize: 11, color: "var(--t3)" }}>Camadas do RIP: {pdfLayers(opts).map(l => l.label).join(" > ") || "nenhuma"}</p>
-            {[["whiteLayer", "whiteSpot", "Branco"], ["varnishLayer", "varnishSpot", "Verniz"]].map(([on, name, label]) => (
-              <label key={on} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
-                <input type="checkbox" checked={opts[on]} onChange={e => up(on, e.target.checked)} />
-                <span style={{ width: 60 }}>{label}</span>
-                <input value={opts[name]} onChange={e => up(name, e.target.value)}
-                  style={{ flex: 1, padding: "6px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, fontFamily: "monospace" }} />
-              </label>
-            ))}
-            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
-              <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (só Branco e Verniz)
-            </label>
+            {layerControls}
           </div>
 
           <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
@@ -300,25 +485,27 @@ export default function NameLabels() {
             </label>
             <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, cmyk: opts.cmyk, nameFont: opts.nameFont, lines: opts.lines, defaultTop: opts.defaultTop, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
           </div>
+          </>}
         </div>
 
         <div style={{ ...card, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
             <h3 style={{ fontSize: 15, flex: 1 }}>
-              {entries.length} etiqueta{entries.length === 1 ? "" : "s"}
+              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
               {sheets.length > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · {sheets.map(s => `${(s.w / 10).toFixed(1)} × ${(s.h / 10).toFixed(1)} cm`).join(" + ")}</span>}
             </h3>
-            <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>
-            <button className="bs" disabled={!sheets.length || busy} onClick={() => exportPdf([{ sheets, opts }], `etiquetas-nome-${opts.orderCode || stamp()}.pdf`)}>Baixar PDF</button>
+            {mode === "names" && <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>}
+            <button className="bs" disabled={!sheets.length || busy} onClick={() => exportPdf([mode === "art" ? { ...curArtJob, sheets } : { sheets, opts }], `${mode === "art" ? "arte" : "etiquetas-nome"}-${opts.orderCode || stamp()}.pdf`)}>Baixar PDF</button>
             <button className="bp" disabled={!sheets.length} onClick={addToQueue}>+ Adicionar à fila</button>
           </div>
           {err && <p style={{ color: "#f87171", fontSize: 13, marginBottom: 10 }}>{err}</p>}
           {noArt.length > 0 && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Sem desenho para: {noArt.join(" ")} — esse emoji não vai sair.</p>}
-          {tooWide && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Algum nome é mais largo que a folha — diminua o tamanho da fonte.</p>}
+          {mode === "art" && !curArt && !loadingArt && <p style={{ color: "var(--t2)", fontSize: 13 }}>Envie um arquivo para ver as cópias na folha.</p>}
+          {mode === "names" && tooWide && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Algum nome é mais largo que a folha — diminua o tamanho da fonte.</p>}
           {!fonts && !err && <p style={{ color: "var(--t2)", fontSize: 13 }}>Carregando fontes…</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
             {sheets.map((s, i) => (
-              <div key={i} style={{ background: opts.letter === "white" ? "#3a3d45" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
+              <div key={i} style={{ background: mode === "art" ? "repeating-conic-gradient(#d6d6d6 0 25%, #f4f4f4 0 50%) 0 0/16px 16px" : opts.letter === "white" ? "#3a3d45" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
                 dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: letterFill(opts), codeFill: opts.letter === "white" ? "#b8bcc6" : "#000", art }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
             ))}
           </div>
@@ -331,25 +518,29 @@ export default function NameLabels() {
             Fila de impressão ({queue.length})
             {queueH > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · PDF único com {(opts.sheetW / 10).toFixed(1)} × {(queueH / 10).toFixed(1)} cm</span>}
           </h3>
-          {queue.length > 0 && <button className="bs" onClick={() => { if (confirm("Limpar a fila de impressão?")) setQueue([]); }}>Limpar fila</button>}
+          {queue.length > 0 && <button className="bs" onClick={() => { if (confirm("Limpar a fila de impressão?")) clearQueue(); }}>Limpar fila</button>}
           <button className="bp" disabled={!queueJobs.length || busy} onClick={() => exportPdf(queueJobs, `fila-etiquetas-nome-${stamp()}.pdf`)}>{busy ? "Gerando…" : "Gerar PDF único"}</button>
         </div>
-        {!queue.length && <p style={{ fontSize: 13, color: "var(--t3)", marginTop: 8 }}>Monte um pedido acima e clique em "Adicionar à fila". No fim, "Gerar PDF único" junta todos, um embaixo do outro.</p>}
+        {!queue.length && <p style={{ fontSize: 13, color: "var(--t3)", marginTop: 8 }}>Monte um pedido ou envie um arquivo acima e clique em "Adicionar à fila". No fim, "Gerar PDF único" junta todos, um embaixo do outro.</p>}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {queue.map((job, i) => {
             const h = queueJobs[i]?.sheets.reduce((t, s) => t + s.h, 0) || 0;
             return (
               <div key={job.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10 }}>
                 <span style={{ width: 22, fontSize: 12, color: "var(--t3)" }}>{i + 1}.</span>
-                {swatch(letterFill(job.opts), 18)}
+                {job.kind === "art"
+                  ? <img src={arts.get(job.artId)?.preview} alt="" style={{ width: 18, height: 18, objectFit: "contain", flexShrink: 0 }} />
+                  : swatch(letterFill(job.opts), 18)}
                 <span style={{ fontFamily: "monospace", fontSize: 13, minWidth: 140 }}>{job.opts.orderCode || "sem código"}</span>
                 <span style={{ fontSize: 12, color: "var(--t2)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {job.count} etiqueta{job.count === 1 ? "" : "s"} · {NAME_FONTS[job.opts.nameFont]?.label || "Great Vibes"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.text.split(/\r?\n/).filter(Boolean).slice(0, 3).join(", ")}{job.text.split(/\r?\n/).filter(Boolean).length > 3 ? "…" : ""}
+                  {job.kind === "art"
+                    ? <>{job.qty} cópia{job.qty === 1 ? "" : "s"} · {job.name} · {job.w} × {job.h} mm · branco/verniz: {job.mask === "shape" ? "contorno" : "retângulo"} · {(h / 10).toFixed(1)} cm</>
+                    : <>{job.count} etiqueta{job.count === 1 ? "" : "s"} · {NAME_FONTS[job.opts.nameFont]?.label || "Great Vibes"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.text.split(/\r?\n/).filter(Boolean).slice(0, 3).join(", ")}{job.text.split(/\r?\n/).filter(Boolean).length > 3 ? "…" : ""}</>}
                 </span>
                 <button className="bs" style={small} disabled={i === 0} onClick={() => moveJob(i, -1)} title="Subir">↑</button>
                 <button className="bs" style={small} disabled={i === queue.length - 1} onClick={() => moveJob(i, 1)} title="Descer">↓</button>
                 <button className="bs" style={small} onClick={() => editJob(job)}>Editar</button>
-                <button className="bs" style={small} onClick={() => setQueue(q => q.filter(j => j.id !== job.id))}>Remover</button>
+                <button className="bs" style={small} onClick={() => removeJob(job)}>Remover</button>
               </div>
             );
           })}

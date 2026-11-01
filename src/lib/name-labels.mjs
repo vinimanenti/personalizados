@@ -224,7 +224,11 @@ export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000", art = null
     const shapes = art?.get(e.seq);
     return shapes ? `<g transform="translate(${fmt(e.x)} ${fmt(e.y)}) scale(${fmt(e.s)})">${shapes.map(s => `<path fill="${s.fill}" d="${s.d}"/>`).join("")}</g>` : "";
   }).join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${sheet.placed.map(svgPath).join("")}</g>${emojis}</svg>`;
+  // Artes enviadas (art-upload.mjs): a prévia da arte no lugar de cada cópia.
+  const arts = sheet.placed.filter(p => p.box.art && p.box.preview).map(p =>
+    `<image x="${fmt(p.x)}" y="${fmt(p.y - p.box.h)}" width="${fmt(p.box.w)}" height="${fmt(p.box.h)}" preserveAspectRatio="none" href="${p.box.preview}"/>`).join("");
+  const texts = sheet.placed.filter(p => !p.box.art).map(svgPath).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${texts}</g>${emojis}${arts}</svg>`;
 }
 
 // Camadas do RIP, na ordem em que são impressas: CMYK > Branco > Verniz.
@@ -274,18 +278,31 @@ export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
 // `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
 // Emojis (`art`, ver sheetToSvg) saem nas cores originais logo depois da camada CMYK, sem sobreposição;
 // nas camadas Branco e Verniz entra a silhueta deles, como máscara.
-export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null) {
+// Artes enviadas (`artRes`: Map artId → { color, form: { w, h } | null, mask }, nomes de XObject da
+// página): a arte sai nas cores dela depois da camada CMYK, sem sobreposição; no Branco e no Verniz
+// entra a máscara 1 bit do contorno (`mask`) ou, sem ela, o retângulo da cópia.
+export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRes = null) {
   const codePath = sheet.code ? svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH) + "f\n" : "";
   const code = codePath && `q\n1 1 1 1 k\n${codePath}Q\n`;
-  const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
+  const paths = sheet.placed.filter(p => !p.box.art).map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
+  const arts = sheet.placed.filter(p => p.box.art && artRes?.get(p.box.artId)).map(p => {
+    const MM = 72 / 25.4, r = artRes.get(p.box.artId);
+    const x = fmt(p.x * MM), y = fmt(pageH - (p.y + oy) * MM), w = p.box.w * MM, h = p.box.h * MM;
+    const cm = (sx, sy) => `${fmt(sx)} 0 0 ${fmt(sy)} ${x} ${y} cm`;
+    return {
+      color: `q\n${r.form ? cm(w / r.form.w, h / r.form.h) : cm(w, h)}\n/${r.color} Do\nQ\n`,
+      mask: r.mask ? `q\n${cm(w, h)}\n/${r.mask} Do\nQ\n` : `${x} ${y} ${fmt(w)} ${fmt(h)} re\nf\n`,
+    };
+  });
+  const artColor = arts.map(a => a.color).join(""), artMask = arts.map(a => a.mask).join("");
   const emojis = sheetEmojis(sheet).map(e => ({ e, shapes: art?.get(e.seq) })).filter(x => x.shapes);
   const emojiPath = (e, s) => svgPathToPdf(s.d, e.x, e.y + oy, pageH, e.s) + "f\n";
   const masks = emojis.map(({ e, shapes }) => shapes.map(s => emojiPath(e, s)).join("")).join("");
   const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
-  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks : "") + (l.key === "white" ? codePath : "") + "Q\n";
+  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks + artMask : "") + (l.key === "white" ? codePath : "") + "Q\n";
   const cmyk = layers.filter(l => !l.spot), spots = layers.filter(l => l.spot);
-  return cmyk.map(layer).join("") + color + code + spots.map(layer).join("");
+  return cmyk.map(layer).join("") + color + artColor + code + spots.map(layer).join("");
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.
