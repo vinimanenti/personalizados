@@ -50,15 +50,17 @@ test('upright labels pack many more per row', () => {
 
 import { parsePencilList, expandPencilRows, pencilInk, sheetContent, pdfLayers } from '../src/lib/name-labels.mjs';
 
-test('list: name, then quantity and color in any order', () => {
-  const { rows, errors } = parsePencilList('Ana Clara; 100; rosa\nBia | Rosé/Azul Marinho\nCaio\tx30\nDudu; roxo\n\n', 50);
+test('list: one name per line, optional quantity, no per-line color', () => {
+  const { rows, errors } = parsePencilList('Ana Clara; 100\nBia\nCaio\tx30\nDudu; rosa\n\n', 50);
   assert.deepEqual(rows, [
-    { name: 'Ana Clara', qty: 100, color: 'rosa', color2: '' },
-    { name: 'Bia', qty: 50, color: 'rose', color2: 'azulmarinho' },
-    { name: 'Caio', qty: 30, color: '', color2: '' },
-    { name: 'Dudu', qty: 50, color: '', color2: '' },
+    { name: 'Ana Clara', qty: 100 },
+    { name: 'Bia', qty: 50 },
+    { name: 'Caio', qty: 30 },
+    { name: 'Dudu', qty: 50 },
   ]);
-  assert.deepEqual(errors, ['Dudu: cor "roxo" não existe']);
+  assert.deepEqual(errors, ['Dudu: "rosa" não é uma quantidade']);
+  // sem cor própria: tudo sai na cor do pedido
+  assert.ok(expandPencilRows(rows).every(r => r.color === ''));
 });
 
 test('half/half splits the quantity between two colors', () => {

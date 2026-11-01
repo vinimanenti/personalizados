@@ -181,22 +181,19 @@ export function expandPencilRows(rows) {
   }).filter(r => r.qty > 0);
 }
 
-// Lista: um nome por linha; depois de ";" (ou tab ou "|") podem vir a quantidade e a cor, em qualquer
-// ordem: "Ana Clara; 100; rosa" ou "Bia | rosa/azul" (metade de cada). Sem quantidade, usa `defQty`.
-// Devolve { rows, errors } — errors lista as cores que não existem.
+// Lista: um nome por linha, todos na cor do pedido; depois de ";" (ou tab ou "|") pode vir a
+// quantidade daquele nome ("Bia; 100" ou "Bia | x100"). Sem quantidade, usa `defQty`.
+// Devolve { rows, errors } — errors lista o que veio depois do ";" e não é número.
 export function parsePencilList(text, defQty) {
   const rows = [], errors = [];
   for (const raw of String(text || "").split(/\r?\n/)) {
     const [name, ...rest] = raw.split(/\s*[;|\t]\s*/).map(s => s.trim());
     if (!name) continue;
-    const row = { name, qty: defQty, color: "", color2: "" };
+    const row = { name, qty: defQty };
     for (const part of rest.filter(Boolean)) {
       const n = part.match(/^x?\s*(\d+)$/i);
-      if (n) { row.qty = parseInt(n[1], 10); continue; }
-      const [c1, c2] = part.split("/").map(slug);
-      for (const c of [c1, c2].filter(Boolean)) if (!pencilInk(c)) errors.push(`${name}: cor "${c}" não existe`);
-      row.color = pencilInk(c1) ? c1 : "";
-      row.color2 = c2 && pencilInk(c2) ? c2 : "";
+      if (n) row.qty = parseInt(n[1], 10);
+      else errors.push(`${name}: "${part}" não é uma quantidade`);
     }
     rows.push(row);
   }

@@ -318,9 +318,15 @@ export default function NameLabels({ variant = "names" }) {
   const editJob = job => {
     setOpts({ ...DEFAULT_OPTS, ...V.defaults, ...job.opts });
     if (job.kind === "dtf") {
-      // até 3 linhas volta para os campos; mais que isso volta como lista
-      if (job.names.length <= 3) { setPencilMode("rows"); setPencil([...job.names.map(n => ({ ...n, color2: "", custom: !PENCIL_QTYS.includes(n.qty) })), ...emptyPencil()].slice(0, 3)); }
-      else { setPencilMode("list"); setListText(job.names.map(n => [n.name, n.qty, n.color].filter(Boolean).join("; ")).join(String.fromCharCode(10))); }
+      // Até 3 nomes diferentes volta para os campos (juntando as metades de cor); mais que isso, como lista.
+      const groups = [];
+      for (const n of job.names) {
+        const g = groups.find(x => x.name === n.name && !x.color2 && x.color !== n.color);
+        if (g && groups.length && g === groups[groups.length - 1]) { g.qty += n.qty; g.color2 = n.color || ""; }
+        else groups.push({ name: n.name, qty: n.qty, color: n.color || "", color2: "" });
+      }
+      if (groups.length <= 3) { setPencilMode("rows"); setPencil([...groups.map(g => ({ ...g, custom: !PENCIL_QTYS.includes(g.qty) })), ...emptyPencil()].slice(0, 3)); }
+      else { setPencilMode("list"); setListText(job.names.map(n => `${n.name}; ${n.qty}`).join(String.fromCharCode(10))); }
     } else if (job.kind === "art") {
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       setMode("art");
@@ -494,7 +500,7 @@ export default function NameLabels({ variant = "names" }) {
       <p style={{ fontSize: 11, color: "var(--t3)" }}>
         Nome maior que {opts.maxWidth} mm vai para 2 linhas; use <b>-</b> para escolher onde quebrar (ex.: <b>Maria - Clara</b>).
         {PENCIL_FONTS[opts.nameFont]?.upper && " Arial Negrito sai sempre em MAIÚSCULAS."}
-        {" "}Cor "Padrão" segue a Cor da letra abaixo.
+        {pencilMode === "rows" && " Cor \"Padrão\" segue a Cor da letra abaixo."}
       </p>
       {pencilMode === "list" ? <>
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--t2)", flexWrap: "wrap" }}>
@@ -504,13 +510,13 @@ export default function NameLabels({ variant = "names" }) {
           ))}
           <input type="number" min={1} value={listQty} onChange={e => setListQty(Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ ...field, width: 70 }} title="Personalizado" />
         </div>
-        <textarea value={listText} onChange={e => setListText(e.target.value)} rows={12} placeholder={"Ana Clara\nBia; 100\nCaio; rosa\nDudu; 150; azul marinho/preta"}
+        <textarea value={listText} onChange={e => setListText(e.target.value)} rows={12} placeholder={"Ana Clara\nBia; 100\nCaio\nDudu; 150"}
           style={{ width: "100%", padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "inherit", resize: "vertical" }} />
         <p style={{ fontSize: 11, color: "var(--t3)" }}>
-          Um nome por linha. Depois de <b>;</b> podem vir a <b>quantidade</b> e a <b>cor</b>; <b>cor1/cor2</b> = metade de cada.
-          Cores: {PENCIL_COLORS.map(c => c.label.toLowerCase()).join(", ")}.
+          Um nome por linha. Para mudar a quantidade de um nome, coloque <b>;</b> e o número (ex.: <b>Bia; 100</b>).
+          A lista inteira sai na <b>Cor da letra</b> abaixo.
         </p>
-        {parsedList.errors.map(e => <p key={e} style={{ fontSize: 12, color: "#fbbf24" }}>{e} — vai na cor padrão.</p>)}
+        {parsedList.errors.map(e => <p key={e} style={{ fontSize: 12, color: "#fbbf24" }}>{e} — fica com a quantidade de cada.</p>)}
       </> : pencil.map((p, i) => (
         <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6, padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10 }}>
           <input value={p.name} onChange={e => upPencil(i, "name", e.target.value)} placeholder={`Nome ${i + 1}`}
