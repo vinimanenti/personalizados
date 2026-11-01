@@ -15,7 +15,8 @@ export const DEFAULT_OPTS = {
   roleClear: 1,     // folga mínima entre a perna das letras (J, g, p…) e a função (mm)
   roleUpper: true,
   overprint: true,  // "Impressão sobreposta do preenchimento" no PDF
-  letter: "black",  // "black" = CMYK 100/100/100/100 + Branco + Verniz; "white" = Branco + Verniz
+  letter: "black",  // "black" = CMYK 100/100/100/100 + Branco + Verniz; "white" = Branco + Verniz; "color" = CMYK `cmyk` + Branco + Verniz
+  cmyk: [0, 100, 100, 0], // cor da letra quando letter = "color" (C, M, Y, K em %)
   whiteLayer: true,
   varnishLayer: true,
   whiteSpot: "TOYO 0024pc*",
@@ -169,10 +170,17 @@ export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000" } = {}) {
 }
 
 // Camadas do RIP, na ordem em que são impressas: CMYK > Branco > Verniz.
-// `cs` é o nome do recurso de espaço de cor da página (null = preto CMYK).
+// `cs` é o nome do recurso de espaço de cor da página (null = processo CMYK com `cmyk`, 0–1).
+export function letterCmyk(o) {
+  if (o.letter === "white") return null;
+  if (o.letter === "color") return (o.cmyk || DEFAULT_OPTS.cmyk).map(v => Math.min(100, Math.max(0, +v || 0)) / 100);
+  return [1, 1, 1, 1];
+}
+
 export function pdfLayers(o) {
   const out = [];
-  if (o.letter !== "white") out.push({ key: "cmyk", label: "CMYK 100/100/100/100", cs: null });
+  const cmyk = letterCmyk(o);
+  if (cmyk) out.push({ key: "cmyk", label: `CMYK ${cmyk.map(v => Math.round(v * 100)).join("/")}`, cs: null, cmyk });
   if (o.whiteLayer) out.push({ key: "white", label: o.whiteSpot, cs: "CSWhite", spot: o.whiteSpot, alt: [0, 0, 0, 0.15] });
   if (o.varnishLayer) out.push({ key: "varnish", label: o.varnishSpot, cs: "CSVarnish", spot: o.varnishSpot, alt: [0, 0, 0.3, 0] });
   return out;
@@ -203,8 +211,33 @@ export function svgPathToPdf(d, tx, ty, pageH) {
 // Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
 // O código do pedido sai só em CMYK 100/100/100/100, sem sobreposição, mesmo com letra branca.
-export function sheetContent(sheet, layers, pageH, gs) {
-  const code = sheet.code ? `q\n1 1 1 1 k\n${svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y, pageH)}f\nQ\n` : "";
-  const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y, pageH) + "f\n").join("");
-  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("") + code;
+// `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
+export function sheetContent(sheet, layers, pageH, gs, oy = 0) {
+  const code = sheet.code ? `q\n1 1 1 1 k\n${svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH)}f\nQ\n` : "";
+  const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
+  const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
+  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("") + code;
+}
+
+// Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.
+// Abre página nova quando passa de `maxPageH` mm (o Acrobat não abre página com mais de ~5 m).
+export function stackSheets(sheets, { gap = DEFAULT_OPTS.gap, maxPageH = 5000 } = {}) {
+  const pages = [];
+  let page = null;
+  for (const sheet of sheets) {
+    if (!page || page.h + gap + sheet.h > maxPageH) {
+      page = { w: 0, h: 0, items: [] };
+      pages.push(page);
+    } else page.h += gap;
+    page.items.push({ sheet, oy: page.h });
+    page.h += sheet.h;
+    page.w = Math.max(page.w, sheet.w);
+  }
+  return pages;
+}
+
+// Cor aproximada para a tela (o RIP usa os valores CMYK de verdade).
+export function cmykToHex([c, m, y, k]) {
+  const ch = v => Math.round(255 * (1 - v) * (1 - k)).toString(16).padStart(2, "0");
+  return `#${ch(c)}${ch(m)}${ch(y)}`;
 }

@@ -68,3 +68,21 @@ test('order code sits top-left of every sheet and pushes labels down by gap', ()
   const c = sheetContent(sheets[0], [{ key: 'white', cs: 'CSWhite', spot: 'W' }], 100, 'GS0');
   assert.match(c, /Q\nq\n1 1 1 1 k\n[\s\S]*f\nQ\n$/); // código em CMYK, sem gs, mesmo só com branco
 });
+
+import { stackSheets, letterCmyk } from '../src/lib/name-labels.mjs';
+
+test('custom letter color goes into the CMYK layer', () => {
+  const o = { letter: 'color', cmyk: [0, 100, 100, 0], whiteLayer: true, varnishLayer: false, whiteSpot: 'W' };
+  assert.deepEqual(letterCmyk(o), [0, 1, 1, 0]);
+  const layers = pdfLayers(o);
+  assert.equal(layers[0].label, 'CMYK 0/100/100/0');
+  const c = sheetContent({ placed: [{ x: 0, y: 0, box: { d: 'M0 0Z' } }] }, layers, 100, 'GS0');
+  assert.match(c, /^q\n0 1 1 0 k\n/);
+});
+
+test('stacks sheets of several orders one below the other', () => {
+  const s = h => ({ w: 290, h, placed: [] });
+  const pages = stackSheets([s(40), s(30), s(50)], { gap: 6, maxPageH: 100 });
+  assert.deepEqual(pages.map(p => p.items.map(i => i.oy)), [[0, 46], [0]]);
+  assert.deepEqual(pages.map(p => p.h), [76, 50]);
+});
