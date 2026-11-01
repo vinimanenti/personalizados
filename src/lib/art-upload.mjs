@@ -46,6 +46,40 @@ export function alphaToStencil(rgba, w, h, threshold = 128) {
 }
 
 // Caixas das cópias no formato do packLabels (origem no canto inferior esquerdo da arte).
-export function artBoxes(qty, w, h, extra = {}) {
-  return Array.from({ length: Math.max(0, qty | 0) }, () => ({ art: true, d: "", emojis: [], w, h, minX: 0, maxX: w, minY: -h, maxY: 0, ...extra }));
+// `rot` = cópia girada 90° (anti-horário): na folha ocupa h × w; `ow`/`oh` guardam a medida da arte.
+export function artBoxes(qty, w, h, extra = {}, rot = false) {
+  const [bw, bh] = rot ? [h, w] : [w, h];
+  return Array.from({ length: Math.max(0, qty | 0) }, () => ({ art: true, d: "", emojis: [], w: bw, h: bh, ow: w, oh: h, rot, minX: 0, maxX: bw, minY: -bh, maxY: 0, ...extra }));
+}
+
+// Melhor encaixe na largura `W` (mm) com `gap` entre cópias: as linhas podem ser "altas" (a arte
+// com o lado menor na horizontal, cabe mais por linha) ou "baixas" (lado maior na horizontal,
+// linha mais baixa). Testa todas as combinações e fica com a de menor altura total; no empate,
+// a que gira menos cópias. Devolve { tall, short, tallRot, height } — quantas cópias em cada tipo.
+export function planRotation(qty, w, h, W, gap) {
+  const lo = Math.min(w, h), hi = Math.max(w, h);
+  const per = size => (size <= W + 1e-6 ? Math.floor((W + gap + 1e-6) / (size + gap)) : 0);
+  const kT = per(lo), kS = per(hi);
+  const tallRot = w > h; // na linha alta a largura é o lado menor: gira se a arte é mais larga que alta
+  let best = null;
+  const maxTallRows = kT ? Math.ceil(qty / kT) : 0;
+  for (let a = 0; a <= maxTallRows; a++) {
+    const tall = Math.min(qty, a * kT), rest = qty - tall;
+    if (rest > 0 && !kS) continue;
+    const b = rest > 0 ? Math.ceil(rest / kS) : 0;
+    const rows = a + b;
+    const height = a * hi + b * lo + Math.max(0, rows - 1) * gap;
+    const rotated = tallRot ? tall : qty - tall;
+    if (!best || height < best.height - 1e-6 || (Math.abs(height - best.height) < 1e-6 && rotated < best.rotated)) {
+      best = { tall, short: rest, tallRot, height, rotated };
+    }
+  }
+  return best || { tall: 0, short: qty, tallRot, height: Infinity, rotated: 0 }; // não cabe de nenhum jeito
+}
+
+// Cópias já com a rotação escolhida: primeiro as linhas altas, depois as baixas.
+export function fitArtBoxes(qty, w, h, { W, gap, autoRotate = true }, extra = {}) {
+  if (!autoRotate || w === h) return artBoxes(qty, w, h, extra);
+  const p = planRotation(qty, w, h, W, gap);
+  return [...artBoxes(p.tall, w, h, extra, p.tallRot), ...artBoxes(p.short, w, h, extra, !p.tallRot)];
 }

@@ -45,3 +45,30 @@ test('art: colors after CMYK, then mask (stencil or rectangle) in white and varn
   assert.match(c, /q\n2 0 0 2 89\.008 28 cm\n\/F2 Do/);  // PDF/SVG: escala = tamanho / tamanho da página
   assert.doesNotMatch(c, /^q\n\nQ/m);                     // sem path vazio das artes no texto
 });
+
+import { planRotation, fitArtBoxes } from '../src/lib/art-upload.mjs';
+
+test('rotation plan: picks orientation that uses the width best', () => {
+  // 100 x 60 em 290 mm: deitada cabem 2 por linha (alt. 60); em pé cabem 4 (alt. 100)
+  // 8 cópias: em pé = 2 linhas de 100 + 6 = 206; deitada = 4 linhas de 60 + 18 = 258
+  const p = planRotation(8, 100, 60, 290, 6);
+  assert.deepEqual([p.tall, p.short, p.tallRot, p.height], [8, 0, true, 206]);
+  // 5 cópias: 1 linha em pé (4) + 1 deitada (1) = 100 + 6 + 60 = 166 < 2 linhas em pé (206)
+  const q = planRotation(5, 100, 60, 290, 6);
+  assert.deepEqual([q.tall, q.short, q.height], [4, 1, 166]);
+  // 2 cópias: deitadas lado a lado (60) ganham de em pé (100)
+  assert.deepEqual([planRotation(2, 100, 60, 290, 6).short, planRotation(2, 100, 60, 290, 6).height], [2, 60]);
+});
+
+test('rotation plan: art wider than the sheet only fits rotated', () => {
+  const p = planRotation(3, 300, 50, 290, 6);
+  assert.deepEqual([p.tall, p.tallRot], [3, true]);
+});
+
+test('fitArtBoxes marks rotated copies with swapped size', () => {
+  const boxes = fitArtBoxes(5, 100, 60, { W: 290, gap: 6 });
+  assert.deepEqual(boxes.map(b => [b.w, b.h, b.rot]), [[60, 100, true], [60, 100, true], [60, 100, true], [60, 100, true], [100, 60, false]]);
+  assert.ok(fitArtBoxes(5, 100, 60, { W: 290, gap: 6, autoRotate: false }).every(b => !b.rot));
+  const [sheet] = packLabels(boxes, { sheetW: 290, gap: 6 });
+  assert.equal(sheet.h, 166);
+});

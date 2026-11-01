@@ -225,8 +225,9 @@ export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000", art = null
     return shapes ? `<g transform="translate(${fmt(e.x)} ${fmt(e.y)}) scale(${fmt(e.s)})">${shapes.map(s => `<path fill="${s.fill}" d="${s.d}"/>`).join("")}</g>` : "";
   }).join("");
   // Artes enviadas (art-upload.mjs): a prévia da arte no lugar de cada cópia.
-  const arts = sheet.placed.filter(p => p.box.art && p.box.preview).map(p =>
-    `<image x="${fmt(p.x)}" y="${fmt(p.y - p.box.h)}" width="${fmt(p.box.w)}" height="${fmt(p.box.h)}" preserveAspectRatio="none" href="${p.box.preview}"/>`).join("");
+  const arts = sheet.placed.filter(p => p.box.art && p.box.preview).map(({ x, y, box: b }) => b.rot
+    ? `<image transform="translate(${fmt(x)} ${fmt(y)}) rotate(-90)" width="${fmt(b.ow)}" height="${fmt(b.oh)}" preserveAspectRatio="none" href="${b.preview}"/>`
+    : `<image x="${fmt(x)}" y="${fmt(y - b.h)}" width="${fmt(b.w)}" height="${fmt(b.h)}" preserveAspectRatio="none" href="${b.preview}"/>`).join("");
   const texts = sheet.placed.filter(p => !p.box.art).map(svgPath).join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${texts}</g>${emojis}${arts}</svg>`;
 }
@@ -286,12 +287,16 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
   const code = codePath && `q\n1 1 1 1 k\n${codePath}Q\n`;
   const paths = sheet.placed.filter(p => !p.box.art).map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
   const arts = sheet.placed.filter(p => p.box.art && artRes?.get(p.box.artId)).map(p => {
-    const MM = 72 / 25.4, r = artRes.get(p.box.artId);
-    const x = fmt(p.x * MM), y = fmt(pageH - (p.y + oy) * MM), w = p.box.w * MM, h = p.box.h * MM;
-    const cm = (sx, sy) => `${fmt(sx)} 0 0 ${fmt(sy)} ${x} ${y} cm`;
+    const MM = 72 / 25.4, r = artRes.get(p.box.artId), b = p.box;
+    const x = p.x * MM, y = pageH - (p.y + oy) * MM, w = b.w * MM, h = b.h * MM; // lugar na folha
+    // Leva o quadrado da arte (sx × sy unidades) para o lugar; girada = 90° anti-horário
+    // (o topo da arte fica do lado esquerdo).
+    const cm = (sx, sy) => (b.rot
+      ? [0, h / sx, -w / sy, 0, x + w, y]
+      : [w / sx, 0, 0, h / sy, x, y]).map(fmt).join(" ") + " cm";
     return {
-      color: `q\n${r.form ? cm(w / r.form.w, h / r.form.h) : cm(w, h)}\n/${r.color} Do\nQ\n`,
-      mask: r.mask ? `q\n${cm(w, h)}\n/${r.mask} Do\nQ\n` : `${x} ${y} ${fmt(w)} ${fmt(h)} re\nf\n`,
+      color: `q\n${r.form ? cm(r.form.w, r.form.h) : cm(1, 1)}\n/${r.color} Do\nQ\n`,
+      mask: r.mask ? `q\n${cm(1, 1)}\n/${r.mask} Do\nQ\n` : `${fmt(x)} ${fmt(y)} ${fmt(w)} ${fmt(h)} re\nf\n`,
     };
   });
   const artColor = arts.map(a => a.color).join(""), artMask = arts.map(a => a.mask).join("");

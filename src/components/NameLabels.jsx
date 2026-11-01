@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
-import { ART_KINDS, artBoxes } from "../lib/art-upload.mjs";
+import { ART_KINDS, fitArtBoxes } from "../lib/art-upload.mjs";
 import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
 
 const MM = 72 / 25.4; // mm → pt
@@ -56,8 +56,10 @@ function layoutJob(text, opts, loaded) {
 }
 
 // Arte enviada: `qty` cópias de w × h mm, com o código do pedido no canto, como as etiquetas.
+// Com autoRotate, parte das cópias pode ser girada 90° para gastar menos altura de rolo.
 function layoutArtJob(job, loaded, prepared) {
-  const boxes = artBoxes(job.qty, job.w, job.h, { artId: job.id, preview: prepared?.preview });
+  const o = { ...DEFAULT_OPTS, ...job.opts };
+  const boxes = fitArtBoxes(job.qty, job.w, job.h, { W: o.sheetW - 2 * o.margin, gap: o.gap, autoRotate: job.autoRotate !== false }, { artId: job.id, preview: prepared?.preview });
   return packLabels(boxes, job.opts, buildCode({ role: loaded.role }, job.opts));
 }
 
@@ -167,7 +169,7 @@ export default function NameLabels() {
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       const maxW = opts.sheetW - 2 * opts.margin;
       const k = p.w > maxW ? maxW / p.w : 1;
-      setCur({ fileId: id, w: +(p.w * k).toFixed(1), h: +(p.h * k).toFixed(1), qty: 1, mask: p.stencil ? "shape" : "rect", lock: true });
+      setCur({ fileId: id, w: +(p.w * k).toFixed(1), h: +(p.h * k).toFixed(1), qty: 1, mask: p.stencil ? "shape" : "rect", lock: true, autoRotate: true });
     } catch (e) { setErr(`Não foi possível ler ${file.name}: ${e.message}`); }
     setLoadingArt(false);
   };
@@ -179,7 +181,7 @@ export default function NameLabels() {
     }
     return n;
   });
-  const curArtJob = cur && curArt ? { id: "current", kind: "art", artId: cur.fileId, name: curArt.name, fileType: curArt.kind, w: cur.w, h: cur.h, qty: cur.qty, mask: cur.mask, opts, count: cur.qty } : null;
+  const curArtJob = cur && curArt ? { id: "current", kind: "art", artId: cur.fileId, name: curArt.name, fileType: curArt.kind, w: cur.w, h: cur.h, qty: cur.qty, mask: cur.mask, autoRotate: cur.autoRotate !== false, opts, count: cur.qty } : null;
 
   const [art, setArt] = useState(() => new Map()); // emoji → formas coloridas (null = sem desenho)
   const [lastEmoji, setLastEmoji] = useState("💖");
@@ -224,6 +226,7 @@ export default function NameLabels() {
   const nameSheets = useMemo(() => fonts ? layoutJob(text, opts, fonts) : [], [fonts, text, opts]);
   const artSheets = fonts && curArtJob ? layoutArtJob(curArtJob, fonts, curArt) : [];
   const sheets = mode === "art" ? artSheets : nameSheets;
+  const rotatedCount = artSheets.reduce((n, s) => n + s.placed.filter(p => p.box.rot).length, 0);
   const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : layoutJob(j.text, j.opts, fonts) })) : [], [fonts, queue, arts]);
   const queueH = queueJobs.flatMap(j => j.sheets).reduce((h, s, i) => h + s.h + (i ? opts.gap : 0), 0);
   const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin));
@@ -264,7 +267,7 @@ export default function NameLabels() {
     if (job.kind === "art") {
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       setMode("art");
-      setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true });
+      setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true, autoRotate: job.autoRotate !== false });
     } else {
       setMode("names");
       setText(job.text);
@@ -345,6 +348,9 @@ export default function NameLabels() {
           <input type="checkbox" checked={cur.lock} onChange={e => setCur(c => ({ ...c, lock: e.target.checked }))} /> Manter proporção
         </label>
         <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+          <input type="checkbox" checked={cur.autoRotate !== false} onChange={e => setCur(c => ({ ...c, autoRotate: e.target.checked }))} /> Girar automaticamente para economizar material
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
           <span style={{ width: 60 }}>Quantidade</span>
           <input type="number" min={1} value={cur.qty} onChange={e => setCur(c => ({ ...c, qty: Math.max(1, parseInt(e.target.value, 10) || 1) }))} style={field} />
         </label>
@@ -360,7 +366,8 @@ export default function NameLabels() {
         {curArt.hasText && warn("O SVG tem textos que não foram convertidos em curvas; eles podem sair com outra fonte. Converta em curvas no Corel antes de exportar.")}
         {curArt.pages > 1 && warn(`O PDF tem ${curArt.pages} páginas; só a primeira é usada.`)}
         {dpi && dpi < 200 && warn(`Resolução baixa para esse tamanho: ${dpi} dpi (o ideal é 300).`)}
-        {(cur.w > opts.sheetW - 2 * opts.margin) && warn("A arte é mais larga que a folha.")}
+        {Math.min(cur.w, cur.h) > opts.sheetW - 2 * opts.margin ? warn("A arte não cabe na largura da folha nem girada.")
+          : cur.w > opts.sheetW - 2 * opts.margin && cur.autoRotate === false ? warn("A arte é mais larga que a folha — ative o giro automático ou diminua a medida.") : null}
       </>}
     </div>
     <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
@@ -491,7 +498,7 @@ export default function NameLabels() {
         <div style={{ ...card, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
             <h3 style={{ fontSize: 15, flex: 1 }}>
-              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
+              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} girada${rotatedCount === 1 ? "" : "s"})` : ""}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
               {sheets.length > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · {sheets.map(s => `${(s.w / 10).toFixed(1)} × ${(s.h / 10).toFixed(1)} cm`).join(" + ")}</span>}
             </h3>
             {mode === "names" && <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>}
