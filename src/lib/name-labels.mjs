@@ -154,6 +154,55 @@ export function buildLabel(entry, fonts, opts) {
 
 // ─── Lápis DTF UV: um nome por etiqueta, até 2 linhas, largura máxima ───
 
+// Cores prontas (CMYK em %), usadas na "Cor da letra" e na cor de cada nome.
+export const COLOR_PRESETS = [
+  ["Vermelho", [0, 100, 100, 0]],
+  ["Azul marinho", [100, 80, 0, 30]],
+  ["Dourado", [0, 25, 70, 20]],
+  ["Rosé", [0, 40, 30, 5]],
+  ["Verde", [80, 0, 100, 20]],
+  ["Rosa", [0, 60, 0, 0]],
+];
+const slug = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, "");
+// Cores que cada nome pode ter; `ink` vai em box.ink (ver letterCmyk). Sem cor = a "Cor da letra" do pedido.
+export const PENCIL_COLORS = [
+  { key: "preta", label: "Preta", ink: { letter: "black" } },
+  { key: "branca", label: "Branca", ink: { letter: "white" } },
+  ...COLOR_PRESETS.map(([label, cmyk]) => ({ key: slug(label), label, ink: { letter: "color", cmyk } })),
+];
+export const pencilInk = key => PENCIL_COLORS.find(c => c.key === key)?.ink || null;
+
+// Nome com "Metade em" outra cor: a quantidade se divide (a 1ª cor fica com a sobra, se for ímpar).
+export function expandPencilRows(rows) {
+  return rows.filter(r => r.name?.trim()).flatMap(r => {
+    const qty = Math.max(0, r.qty | 0);
+    if (!r.color2) return [{ name: r.name.trim(), qty, color: r.color || "" }];
+    return [{ name: r.name.trim(), qty: Math.ceil(qty / 2), color: r.color || "" }, { name: r.name.trim(), qty: Math.floor(qty / 2), color: r.color2 }];
+  }).filter(r => r.qty > 0);
+}
+
+// Lista: um nome por linha; depois de ";" (ou tab ou "|") podem vir a quantidade e a cor, em qualquer
+// ordem: "Ana Clara; 100; rosa" ou "Bia | rosa/azul" (metade de cada). Sem quantidade, usa `defQty`.
+// Devolve { rows, errors } — errors lista as cores que não existem.
+export function parsePencilList(text, defQty) {
+  const rows = [], errors = [];
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const [name, ...rest] = raw.split(/\s*[;|\t]\s*/).map(s => s.trim());
+    if (!name) continue;
+    const row = { name, qty: defQty, color: "", color2: "" };
+    for (const part of rest.filter(Boolean)) {
+      const n = part.match(/^x?\s*(\d+)$/i);
+      if (n) { row.qty = parseInt(n[1], 10); continue; }
+      const [c1, c2] = part.split("/").map(slug);
+      for (const c of [c1, c2].filter(Boolean)) if (!pencilInk(c)) errors.push(`${name}: cor "${c}" não existe`);
+      row.color = pencilInk(c1) ? c1 : "";
+      row.color2 = c2 && pencilInk(c2) ? c2 : "";
+    }
+    rows.push(row);
+  }
+  return { rows, errors };
+}
+
 // Divide o nome em até 2 linhas: "-" força a quebra ("Maria - Clara"); sem "-", só quebra se passar de
 // `maxW`, no espaço que deixa as duas linhas mais parecidas. `measure(texto)` devolve a largura em mm.
 export function pencilLines(text, measure, maxW) {
@@ -298,7 +347,12 @@ export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000", art = null
   const arts = sheet.placed.filter(p => p.box.art && p.box.preview).map(({ x, y, box: b }) => b.rot
     ? `<image transform="translate(${fmt(x)} ${fmt(y)}) rotate(-90)" width="${fmt(b.ow)}" height="${fmt(b.oh)}" preserveAspectRatio="none" href="${b.preview}"/>`
     : `<image x="${fmt(x)}" y="${fmt(y - b.h)}" width="${fmt(b.w)}" height="${fmt(b.h)}" preserveAspectRatio="none" href="${b.preview}"/>`).join("");
-  const texts = sheet.placed.filter(p => !p.box.art).map(svgPath).join("");
+  // Etiqueta com cor própria (`box.ink`, ver letterCmyk) leva o seu fill; as outras herdam `fill`.
+  const texts = sheet.placed.filter(p => !p.box.art).map(p => {
+    if (!p.box.ink) return svgPath(p);
+    const c = letterCmyk(p.box.ink);
+    return svgPath(p).replace("<path ", `<path fill="${c ? cmykToHex(c) : "#fff"}" `);
+  }).join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${texts}</g>${emojis}${arts}</svg>`;
 }
 
@@ -376,8 +430,18 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
   const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
   const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks + artMask : "") + (l.key === "white" ? codePath : "") + "Q\n";
-  const cmyk = layers.filter(l => !l.spot), spots = layers.filter(l => l.spot);
-  return cmyk.map(layer).join("") + color + artColor + code + spots.map(layer).join("");
+  const spots = layers.filter(l => l.spot);
+  // Camada CMYK: cada etiqueta na cor dela (`box.ink`) ou na do pedido; letra branca não tem CMYK.
+  const def = layers.find(l => !l.spot)?.cmyk || null;
+  const byInk = new Map();
+  for (const p of sheet.placed.filter(p => !p.box.art)) {
+    const c = p.box.ink ? letterCmyk(p.box.ink) : def;
+    if (!c) continue;
+    const k = c.map(fmt).join(" ");
+    byInk.set(k, (byInk.get(k) || "") + svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n");
+  }
+  const cmyk = [...byInk].map(([k, ps]) => `q\n${k} k\n${ps}Q\n`).join("");
+  return cmyk + color + artColor + code + spots.map(layer).join("");
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.

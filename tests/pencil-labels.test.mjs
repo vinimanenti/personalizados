@@ -47,3 +47,30 @@ test('upright labels pack many more per row', () => {
   const [a] = packLabels(Array(18).fill(up), { sheetW: 290, gap: 6 });
   assert.equal(a.placed.filter(p => p.y === a.placed[0].y).length, 18);
 });
+
+import { parsePencilList, expandPencilRows, pencilInk, sheetContent, pdfLayers } from '../src/lib/name-labels.mjs';
+
+test('list: name, then quantity and color in any order', () => {
+  const { rows, errors } = parsePencilList('Ana Clara; 100; rosa\nBia | Rosé/Azul Marinho\nCaio\tx30\nDudu; roxo\n\n', 50);
+  assert.deepEqual(rows, [
+    { name: 'Ana Clara', qty: 100, color: 'rosa', color2: '' },
+    { name: 'Bia', qty: 50, color: 'rose', color2: 'azulmarinho' },
+    { name: 'Caio', qty: 30, color: '', color2: '' },
+    { name: 'Dudu', qty: 50, color: '', color2: '' },
+  ]);
+  assert.deepEqual(errors, ['Dudu: cor "roxo" não existe']);
+});
+
+test('half/half splits the quantity between two colors', () => {
+  assert.deepEqual(expandPencilRows([{ name: 'Ana', qty: 51, color: 'rosa', color2: 'preta' }, { name: '  ', qty: 50 }]), [
+    { name: 'Ana', qty: 26, color: 'rosa' }, { name: 'Ana', qty: 25, color: 'preta' },
+  ]);
+});
+
+test('each label is drawn in its own color; white names have no CMYK', () => {
+  const box = c => ({ d: 'M0 0L1 0L1 1Z', ink: pencilInk(c) });
+  const sheet = { placed: [{ x: 0, y: 0, box: box('rosa') }, { x: 5, y: 0, box: box('branca') }, { x: 9, y: 0, box: { d: 'M0 0L1 0L1 1Z' } }] };
+  const c = sheetContent(sheet, pdfLayers({ letter: 'black', whiteLayer: true, varnishLayer: false, whiteSpot: 'W' }), 100, 'GS0');
+  assert.deepEqual(c.match(/[\d.]+ [\d.]+ [\d.]+ [\d.]+ k/g), ['0 0.6 0 0 k', '1 1 1 1 k']);
+  assert.equal(c.split('/CSWhite cs 1 scn')[1].split('f\n').length - 1, 3); // o branco vai em todas
+});
