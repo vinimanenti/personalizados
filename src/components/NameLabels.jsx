@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, packLabels, sheetToSvg, pdfLayers, sheetContent } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent } from "../lib/name-labels.mjs";
 
 const MM = 72 / 25.4; // mm → pt
 const STORE_KEY = "name_labels_v1";
@@ -43,7 +43,7 @@ export default function NameLabels() {
   const sheets = useMemo(() => {
     if (!fonts) return [];
     const labels = entries.map(e => buildLabel(e, fonts, opts)).filter(Boolean);
-    return packLabels(labels, opts);
+    return packLabels(labels, opts, buildCode(fonts, opts));
   }, [fonts, entries, opts]);
   const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin));
 
@@ -100,6 +100,11 @@ export default function NameLabels() {
     <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 380px) 1fr", gap: 20, animation: "fadeIn .3s" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={card}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginBottom: 14 }}>
+            <span style={{ width: 120, fontWeight: 600 }}>Código do pedido</span>
+            <input value={opts.orderCode} onChange={e => up("orderCode", e.target.value)} placeholder="ex.: 251101ABC123"
+              style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "monospace" }} />
+          </label>
           <h3 style={{ fontSize: 15, marginBottom: 6 }}>Nomes</h3>
           <p style={{ fontSize: 11, color: "var(--t3)", marginBottom: 10 }}>Um por linha: <b>Nome - Função</b>. Use <b>x3</b> no fim para repetir.</p>
           <textarea value={text} onChange={e => setText(e.target.value)} rows={12}
@@ -121,6 +126,7 @@ export default function NameLabels() {
           {num("Nome → função", "roleGap", "mm", 0.5)}
           {num("Folga das pernas", "roleClear", "mm", 0.5)}
           {num("Cópias de cada", "copies", "×")}
+          {num("Código do pedido", "codeSize", "pt", 0.5)}
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
             <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
           </label>
@@ -142,7 +148,7 @@ export default function NameLabels() {
                 style={{ flex: 1, padding: "6px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, fontFamily: "monospace" }} />
             </label>
           ))}
-          <button className="bs" style={{ marginTop: 6, padding: "6px 10px", fontSize: 12 }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, letter: opts.letter, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
+          <button className="bs" style={{ marginTop: 6, padding: "6px 10px", fontSize: 12 }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
         </div>
       </div>
 
@@ -161,7 +167,7 @@ export default function NameLabels() {
         <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
           {sheets.map((s, i) => (
             <div key={i} style={{ background: opts.letter === "white" ? "#3a3d45" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
-              dangerouslySetInnerHTML={{ __html: sheetToSvg(s).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"').replace('fill="#000"', `fill="${opts.letter === "white" ? "#fff" : "#000"}"`) }} />
+              dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: opts.letter === "white" ? "#fff" : "#000", codeFill: opts.letter === "white" ? "#b8bcc6" : "#000" }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
           ))}
         </div>
       </div>

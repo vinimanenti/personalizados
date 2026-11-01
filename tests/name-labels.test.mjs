@@ -55,3 +55,16 @@ test('page content draws each layer with its color; only spot layers overprint',
   assert.deepEqual(fills, ['1 1 1 1 k', '/CSWhite cs 1 scn', '/CSVarnish cs 1 scn']);
   assert.deepEqual(c.match(/\/GS0 gs|1 1 1 1 k|\/CS\w+ cs/g), ['1 1 1 1 k', '/GS0 gs', '/CSWhite cs', '/GS0 gs', '/CSVarnish cs']);
 });
+
+test('order code sits top-left of every sheet and pushes labels down by gap', () => {
+  const box = { d: 'M0 0Z', minX: 0, maxX: 200, minY: -10, maxY: 10 };
+  const code = { d: 'M0 0Z', minX: 0.2, maxX: 20, minY: -3, maxY: 0.5 };
+  const sheets = packLabels([box, box, box], { sheetW: 290, gap: 6, maxSheetH: 60, margin: 0 }, code);
+  assert.equal(sheets.length, 2);
+  for (const s of sheets) {
+    assert.deepEqual([s.code.x + code.minX, s.code.y + code.minY], [0, 0]);
+    assert.equal(s.placed[0].y + box.minY, 3.5 + 6); // altura do código + espaço
+  }
+  const c = sheetContent(sheets[0], [{ key: 'white', cs: 'CSWhite', spot: 'W' }], 100, 'GS0');
+  assert.match(c, /Q\nq\n1 1 1 1 k\n[\s\S]*f\nQ\n$/); // código em CMYK, sem gs, mesmo só com branco
+});

@@ -22,6 +22,8 @@ export const DEFAULT_OPTS = {
   varnishSpot: "TOYO 0044pc*",
   defaultRole: "",
   copies: 1,
+  orderCode: "",    // código do pedido, no canto superior esquerdo de cada folha
+  codeSize: 10,     // pt (Times)
 };
 
 // "Ana Paula - Madrinha", "Ana Paula; Madrinha", "Ana Paula | Madrinha", tab.
@@ -99,11 +101,19 @@ export function buildLabel(entry, fonts, opts) {
   };
 }
 
+// Código do pedido: caixa no mesmo formato de uma etiqueta (origem na linha de base).
+export function buildCode(fonts, opts) {
+  const o = { ...DEFAULT_OPTS, ...opts };
+  const code = String(o.orderCode || "").trim();
+  return code ? textShape(fonts.role, code, o.codeSize, 0) : null;
+}
+
 // Encaixe em prateleiras: da esquerda para a direita, linhas alinhadas pela linha de base
 // do nome. `gap` é a distância mínima entre a tinta de duas etiquetas vizinhas.
 // Recebe caixas { minX, maxX, minY, maxY } (relativas à origem da etiqueta) e devolve
-// folhas com { x, y } = posição da origem de cada etiqueta.
-export function packLabels(boxes, opts) {
+// folhas com { x, y } = posição da origem de cada etiqueta. Com `code`, cada folha
+// leva o código no canto superior esquerdo e as etiquetas começam `gap` abaixo dele.
+export function packLabels(boxes, opts, code = null) {
   const o = { ...DEFAULT_OPTS, ...opts };
   const usable = o.sheetW - 2 * o.margin;
   const rows = [];
@@ -122,14 +132,16 @@ export function packLabels(boxes, opts) {
   }
 
   const limit = o.maxSheetH > 0 ? o.maxSheetH - 2 * o.margin : Infinity;
+  const top = code ? code.maxY - code.minY + o.gap : 0;
   const sheets = [];
   let sheet = null, y = 0;
   for (const r of rows) {
     const h = r.up + r.down;
     if (!sheet || (sheet.placed.length && y + o.gap + h > limit + 1e-6)) {
       sheet = { placed: [], contentH: 0 };
+      if (code) sheet.code = { box: code, x: o.margin - code.minX, y: o.margin - code.minY };
       sheets.push(sheet);
-      y = 0;
+      y = top;
     } else if (sheet.placed.length) {
       y += o.gap;
     }
@@ -149,9 +161,11 @@ export function packLabels(boxes, opts) {
 
 const fmt = n => +n.toFixed(3);
 
-export function sheetToSvg(sheet) {
-  const paths = sheet.placed.map(p => `<path transform="translate(${fmt(p.x)} ${fmt(p.y)})" d="${p.box.d}"/>`).join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}"><g fill="#000">${paths}</g></svg>`;
+const svgPath = p => `<path transform="translate(${fmt(p.x)} ${fmt(p.y)})" d="${p.box.d}"/>`;
+
+export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000" } = {}) {
+  const code = sheet.code ? `<g fill="${codeFill}">${svgPath(sheet.code)}</g>` : "";
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${sheet.placed.map(svgPath).join("")}</g></svg>`;
 }
 
 // Camadas do RIP, na ordem em que são impressas: CMYK > Branco > Verniz.
@@ -188,7 +202,9 @@ export function svgPathToPdf(d, tx, ty, pageH) {
 
 // Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
+// O código do pedido sai só em CMYK 100/100/100/100, sem sobreposição, mesmo com letra branca.
 export function sheetContent(sheet, layers, pageH, gs) {
+  const code = sheet.code ? `q\n1 1 1 1 k\n${svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y, pageH)}f\nQ\n` : "";
   const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y, pageH) + "f\n").join("");
-  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("");
+  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("") + code;
 }
