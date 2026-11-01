@@ -58,11 +58,15 @@ export default function NameLabels() {
   const exportPdf = async () => {
     setBusy(true); setErr("");
     try {
-      const [{ PDFDocument, rgb }] = await loadLibs();
+      const [{ PDFDocument, rgb, pushGraphicsState, setGraphicsState, popGraphicsState }] = await loadLibs();
       const doc = await PDFDocument.create();
       for (const s of sheets) {
         const pg = doc.addPage([s.w * MM, s.h * MM]);
+        // Sobreposição do preenchimento: /op (preenchimento) e /OP (traço) + OPM 1
+        // (o drawSvgPath do pdf-lib 1.17 ignora a opção graphicsState, então o gs vai direto no conteúdo)
+        if (opts.overprint) pg.pushOperators(pushGraphicsState(), setGraphicsState(pg.node.newExtGState("GS", doc.context.obj({ Type: "ExtGState", op: true, OP: true, OPM: 1 }))));
         for (const p of s.placed) pg.drawSvgPath(p.box.d, { x: p.x * MM, y: pg.getHeight() - p.y * MM, scale: MM, color: rgb(0, 0, 0), borderWidth: 0 });
+        if (opts.overprint) pg.pushOperators(popGraphicsState());
       }
       download(new Blob([await doc.save()], { type: "application/pdf" }), `etiquetas-nome-${stamp()}.pdf`);
     } catch (e) { setErr(`Erro ao gerar PDF: ${e.message}`); }
@@ -107,6 +111,9 @@ export default function NameLabels() {
           {num("Cópias de cada", "copies", "×")}
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
             <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+            <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (PDF)
           </label>
           <button className="bs" style={{ marginTop: 6, padding: "6px 10px", fontSize: 12 }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole })}>Restaurar padrão</button>
         </div>

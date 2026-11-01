@@ -14,6 +14,7 @@ export const DEFAULT_OPTS = {
   roleGap: 4,       // linha de base do nome → topo da função (mm)
   roleClear: 1,     // folga mínima entre a perna das letras (J, g, p…) e a função (mm)
   roleUpper: true,
+  overprint: true,  // "Impressão sobreposta do preenchimento" no PDF
   defaultRole: "",
   copies: 1,
 };
