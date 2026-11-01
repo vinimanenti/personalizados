@@ -103,6 +103,7 @@ export default function NameLabels() {
           {num("Nome (Great Vibes)", "nameSize", "pt", 0.5)}
           {num("Função (Times)", "roleSize", "pt", 0.5)}
           {num("Nome → função", "roleGap", "mm", 0.5)}
+          {num("Folga das pernas", "roleClear", "mm", 0.5)}
           {num("Cópias de cada", "copies", "×")}
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
             <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS

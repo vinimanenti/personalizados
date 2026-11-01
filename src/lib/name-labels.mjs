@@ -12,6 +12,7 @@ export const DEFAULT_OPTS = {
   nameSize: 32,     // pt
   roleSize: 11,     // pt
   roleGap: 4,       // linha de base do nome → topo da função (mm)
+  roleClear: 1,     // folga mínima entre a perna das letras (J, g, p…) e a função (mm)
   roleUpper: true,
   defaultRole: "",
   copies: 1,
@@ -50,18 +51,20 @@ function textShape(font, text, sizePt, baseY) {
     return at;
   });
   const shift = -(pen * k) / 2;
+  const boxes = [];
   let d = "", minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const { g, x, y } of placed) {
     const b = g.bbox;
     if (!g.path.commands.length || b.minX === Infinity) continue;
     d += g.path.translate(x, y).scale(k, -k).translate(shift, baseY).toSVG();
+    boxes.push({ minX: shift + (x + b.minX) * k, maxX: shift + (x + b.maxX) * k, maxY: baseY - (y + b.minY) * k });
     minX = Math.min(minX, shift + (x + b.minX) * k);
     maxX = Math.max(maxX, shift + (x + b.maxX) * k);
     minY = Math.min(minY, baseY - (y + b.maxY) * k);
     maxY = Math.max(maxY, baseY - (y + b.minY) * k);
   }
   if (!d) return null;
-  return { d, minX, maxX, minY, maxY };
+  return { d, minX, maxX, minY, maxY, boxes };
 }
 
 // Uma etiqueta: nome com linha de base em y = 0 e função centralizada abaixo.
@@ -69,7 +72,15 @@ export function buildLabel(entry, fonts, opts) {
   const o = { ...DEFAULT_OPTS, ...opts };
   const name = textShape(fonts.name, entry.name, o.nameSize, 0);
   const capH = ((fonts.role["OS/2"]?.capHeight || fonts.role.capHeight || fonts.role.unitsPerEm * 0.66) / fonts.role.unitsPerEm) * o.roleSize * PT_TO_MM;
-  const role = textShape(fonts.role, entry.role, o.roleSize, o.roleGap + capH);
+  // Se uma letra do nome desce sobre a área da função (ex.: o J de "Jane"), a função desce junto.
+  let roleTop = o.roleGap;
+  const probe = name && textShape(fonts.role, entry.role, o.roleSize, 0);
+  if (probe) {
+    for (const g of name.boxes) {
+      if (g.maxX > probe.minX - o.roleClear && g.minX < probe.maxX + o.roleClear) roleTop = Math.max(roleTop, g.maxY + o.roleClear);
+    }
+  }
+  const role = textShape(fonts.role, entry.role, o.roleSize, roleTop + capH);
   const parts = [name, role].filter(Boolean);
   if (!parts.length) return null;
   return {
