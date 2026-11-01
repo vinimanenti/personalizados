@@ -5,7 +5,12 @@ import { loadEmojiArt } from "../lib/emoji-art.mjs";
 const MM = 72 / 25.4; // mm → pt
 const STORE_KEY = "name_labels_v1";
 const QUEUE_KEY = "name_labels_queue_v1";
-const FONT_FILES = { name: "greatvibes.ttf", role: "times.ttf" };
+const FONT_FILES = { role: "times.ttf" };
+// Fontes do nome (arquivos em public/fonts). Para adicionar outra, é só incluir aqui.
+const NAME_FONTS = {
+  greatvibes: { label: "Great Vibes", file: "greatvibes.ttf" },
+  lobster: { label: "Lobster", file: "lobster.ttf" },
+};
 const EXAMPLE = "Ana Paula - Madrinha\nCarlos Eduardo - Padrinho\nMaria Clara - Dama de Honra";
 const COLOR_PRESETS = [
   ["Vermelho", [0, 100, 100, 0]],
@@ -33,15 +38,17 @@ let _fonts = null;
 const loadFonts = () => _fonts ||= loadLibs().then(async ([, fontkit]) => {
   const base = import.meta.env.BASE_URL || "/";
   const get = async f => { const r = await fetch(`${base}fonts/${f}`); if (!r.ok) throw new Error(`Fonte ${f} não encontrada`); return new Uint8Array(await r.arrayBuffer()); };
-  const [name, role] = await Promise.all([get(FONT_FILES.name), get(FONT_FILES.role)]);
-  return { name: fontkit.create(name), role: fontkit.create(role) };
+  const keys = Object.keys(NAME_FONTS);
+  const [role, ...names] = await Promise.all([get(FONT_FILES.role), ...keys.map(k => get(NAME_FONTS[k].file))]);
+  return { role: fontkit.create(role), names: Object.fromEntries(keys.map((k, i) => [k, fontkit.create(names[i])])) };
 }).catch(e => { _fonts = null; throw e; });
 
 // Emojis coloridos em vetor (Twemoji); o desenho de cada um é baixado na primeira vez que aparece.
 const EMOJI_PALETTE = ["💖", "❤️", "💕", "💗", "💜", "💙", "🤍", "✨", "⭐", "🌸", "🌹", "🌷", "🦋", "👑", "💍", "🎀", "🎉", "🥂", "🙏", "😍", "🥰", "😘", "👶", "🍼", "🐶", "🐱", "☀️", "🌈", "⚽", "🎂"];
 const readJson = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
 
-function layoutJob(text, opts, fonts) {
+function layoutJob(text, opts, loaded) {
+  const fonts = { role: loaded.role, name: loaded.names[opts.nameFont] || loaded.names[DEFAULT_OPTS.nameFont] };
   const labels = parseEntries(text, opts).map(e => buildLabel(e, fonts, opts)).filter(Boolean);
   return packLabels(labels, opts, buildCode(fonts, opts));
 }
@@ -247,11 +254,19 @@ export default function NameLabels() {
 
           <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
             <h3 style={{ fontSize: 15, marginBottom: 4 }}>Folha e texto</h3>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+              <span style={{ width: 120 }}>Fonte do nome</span>
+              <div style={{ display: "flex", gap: 6, flex: 1 }}>
+                {Object.entries(NAME_FONTS).map(([k, f]) => (
+                  <button key={k} className={opts.nameFont === k ? "bp" : "bs"} style={{ flex: 1, padding: "6px 10px", fontSize: 12 }} onClick={() => up("nameFont", k)}>{f.label}</button>
+                ))}
+              </div>
+            </label>
             {num("Largura da folha", "sheetW", "mm")}
             {num("Altura máx.", "maxSheetH", "mm (0 = rolo)")}
             {num("Margem", "margin", "mm", 0.5)}
             {num("Espaço entre", "gap", "mm", 0.5)}
-            {num("Nome (Great Vibes)", "nameSize", "pt", 0.5)}
+            {num("Nome", "nameSize", "pt", 0.5)}
             {num("Função (Times)", "roleSize", "pt", 0.5)}
             {num("Nome → função", "roleGap", "mm", 0.5)}
             {num("Folga das pernas", "roleClear", "mm", 0.5)}
@@ -261,7 +276,7 @@ export default function NameLabels() {
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
               <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
             </label>
-            <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, cmyk: opts.cmyk, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
+            <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, cmyk: opts.cmyk, nameFont: opts.nameFont, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
           </div>
         </div>
 
@@ -307,7 +322,7 @@ export default function NameLabels() {
                 {swatch(letterFill(job.opts), 18)}
                 <span style={{ fontFamily: "monospace", fontSize: 13, minWidth: 140 }}>{job.opts.orderCode || "sem código"}</span>
                 <span style={{ fontSize: 12, color: "var(--t2)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {job.count} etiqueta{job.count === 1 ? "" : "s"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.text.split(/\r?\n/).filter(Boolean).slice(0, 3).join(", ")}{job.text.split(/\r?\n/).filter(Boolean).length > 3 ? "…" : ""}
+                  {job.count} etiqueta{job.count === 1 ? "" : "s"} · {NAME_FONTS[job.opts.nameFont]?.label || "Great Vibes"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.text.split(/\r?\n/).filter(Boolean).slice(0, 3).join(", ")}{job.text.split(/\r?\n/).filter(Boolean).length > 3 ? "…" : ""}
                 </span>
                 <button className="bs" style={small} disabled={i === 0} onClick={() => moveJob(i, -1)} title="Subir">↑</button>
                 <button className="bs" style={small} disabled={i === queue.length - 1} onClick={() => moveJob(i, 1)} title="Descer">↓</button>

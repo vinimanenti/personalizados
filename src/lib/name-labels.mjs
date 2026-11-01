@@ -11,6 +11,7 @@ export const DEFAULT_OPTS = {
   maxSheetH: 0,     // altura máxima por folha (mm); 0 = rolo contínuo
   margin: 0,        // margem da folha (mm)
   gap: 6,           // espaço entre etiquetas (mm), medido na tinta
+  nameFont: "greatvibes", // fonte do nome (ver NAME_FONTS em NameLabels.jsx)
   nameSize: 32,     // pt
   roleSize: 11,     // pt
   roleGap: 4,       // linha de base do nome → topo da função (mm)
