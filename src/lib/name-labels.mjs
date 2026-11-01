@@ -2,6 +2,8 @@
 // Tudo em milímetros, eixo Y para baixo. O texto vira curvas (paths), então o
 // PDF/SVG não depende da fonte instalada e a medida é exatamente a tinta impressa.
 
+import { hexToRgb } from "./emoji-art.mjs";
+
 export const PT_TO_MM = 25.4 / 72;
 
 export const DEFAULT_OPTS = {
@@ -25,6 +27,7 @@ export const DEFAULT_OPTS = {
   copies: 1,
   orderCode: "",    // código do pedido, no canto superior esquerdo de cada folha
   codeSize: 10,     // pt (Times)
+  emojiScale: 0.6,  // tamanho do emoji em relação ao texto
 };
 
 // "Ana Paula - Madrinha", "Ana Paula; Madrinha", "Ana Paula | Madrinha", tab.
@@ -47,54 +50,76 @@ export function parseEntries(text, { defaultRole = "", copies = 1, roleUpper = t
   return out;
 }
 
+// Emojis (com tom de pele, ZWJ 👨‍👩‍👧 e bandeiras) viram trechos separados: no lugar deles fica um
+// quadrado reservado, preenchido depois com o desenho colorido (ver emoji-art.mjs).
+const EMOJI_RE = /(\p{Extended_Pictographic}(?:\uFE0F|\uFE0E|\p{Emoji_Modifier}|\u200D\p{Extended_Pictographic}\uFE0F?)*|[\u{1F1E6}-\u{1F1FF}]{2})/u;
+export const hasEmoji = text => EMOJI_RE.test(String(text || ""));
+export function splitEmoji(text) {
+  return String(text).split(EMOJI_RE).map((t, i) => ({ text: t, emoji: i % 2 === 1 })).filter(s => s.text);
+}
+export const emojisIn = text => splitEmoji(text).filter(s => s.emoji).map(s => s.text);
+
 // Converte uma linha de texto em path SVG (mm) centralizado em x = 0, linha de base em y = baseY.
-function textShape(font, text, sizePt, baseY) {
+// Cada emoji ocupa um quadrado de lado `emojiScale` × tamanho do texto, apoiado um pouco abaixo da
+// linha de base; vai em `emojis` como { seq, x, y (topo), s } para ser desenhado em cores.
+function textShape(font, text, sizePt, baseY, emojiScale = 1) {
   if (!text) return null;
-  const run = font.layout(text);
+  const placed = [], emojis = [];
   const k = (sizePt * PT_TO_MM) / font.unitsPerEm;
-  let pen = 0;
-  const placed = run.glyphs.map((g, i) => {
-    const p = run.positions[i];
-    const at = { g, x: pen + p.xOffset, y: p.yOffset };
-    pen += p.xAdvance;
-    return at;
-  });
-  const shift = -(pen * k) / 2;
+  let pen = 0; // mm
+  for (const seg of splitEmoji(text)) {
+    if (seg.emoji) {
+      const s = sizePt * emojiScale * PT_TO_MM;
+      emojis.push({ seq: seg.text, x: pen + s * 0.08, y: -s * 0.85, s });
+      pen += s * 1.16;
+      continue;
+    }
+    const run = font.layout(seg.text);
+    run.glyphs.forEach((g, i) => {
+      const p = run.positions[i];
+      if (g.id !== 0) placed.push({ g, x: pen + p.xOffset * k, y: p.yOffset * k }); // id 0 = sem desenho na fonte (o "quadradinho")
+      pen += p.xAdvance * k;
+    });
+  }
+  const shift = -pen / 2;
   const boxes = [];
-  let d = "", minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  let d = "";
   for (const { g, x, y } of placed) {
     const b = g.bbox;
     if (!g.path.commands.length || b.minX === Infinity) continue;
-    d += g.path.translate(x, y).scale(k, -k).translate(shift, baseY).toSVG();
-    boxes.push({ minX: shift + (x + b.minX) * k, maxX: shift + (x + b.maxX) * k, maxY: baseY - (y + b.minY) * k });
-    minX = Math.min(minX, shift + (x + b.minX) * k);
-    maxX = Math.max(maxX, shift + (x + b.maxX) * k);
-    minY = Math.min(minY, baseY - (y + b.maxY) * k);
-    maxY = Math.max(maxY, baseY - (y + b.minY) * k);
+    d += g.path.scale(k, -k).translate(shift + x, baseY - y).toSVG();
+    boxes.push({ minX: shift + x + b.minX * k, maxX: shift + x + b.maxX * k, minY: baseY - y - b.maxY * k, maxY: baseY - y - b.minY * k });
   }
-  if (!d) return null;
-  return { d, minX, maxX, minY, maxY, boxes };
+  const em = emojis.map(e => ({ ...e, x: shift + e.x, y: baseY + e.y }));
+  for (const e of em) boxes.push({ minX: e.x, maxX: e.x + e.s, minY: e.y, maxY: e.y + e.s });
+  if (!boxes.length) return null;
+  return {
+    d, emojis: em, boxes,
+    minX: Math.min(...boxes.map(b => b.minX)), maxX: Math.max(...boxes.map(b => b.maxX)),
+    minY: Math.min(...boxes.map(b => b.minY)), maxY: Math.max(...boxes.map(b => b.maxY)),
+  };
 }
 
 // Uma etiqueta: nome com linha de base em y = 0 e função centralizada abaixo.
 export function buildLabel(entry, fonts, opts) {
   const o = { ...DEFAULT_OPTS, ...opts };
-  const name = textShape(fonts.name, entry.name, o.nameSize, 0);
+  const name = textShape(fonts.name, entry.name, o.nameSize, 0, o.emojiScale);
   const capH = ((fonts.role["OS/2"]?.capHeight || fonts.role.capHeight || fonts.role.unitsPerEm * 0.66) / fonts.role.unitsPerEm) * o.roleSize * PT_TO_MM;
   // Se uma letra do nome desce sobre a área da função (ex.: o J de "Jane"), a função desce junto.
   let roleTop = o.roleGap;
-  const probe = name && textShape(fonts.role, entry.role, o.roleSize, 0);
+  const probe = name && textShape(fonts.role, entry.role, o.roleSize, 0, o.emojiScale);
   if (probe) {
     for (const g of name.boxes) {
       if (g.maxX > probe.minX - o.roleClear && g.minX < probe.maxX + o.roleClear) roleTop = Math.max(roleTop, g.maxY + o.roleClear);
     }
   }
-  const role = textShape(fonts.role, entry.role, o.roleSize, roleTop + capH);
+  const role = textShape(fonts.role, entry.role, o.roleSize, roleTop + capH, o.emojiScale);
   const parts = [name, role].filter(Boolean);
   if (!parts.length) return null;
   return {
     entry,
     d: parts.map(p => p.d).join(""),
+    emojis: parts.flatMap(p => p.emojis),
     minX: Math.min(...parts.map(p => p.minX)),
     maxX: Math.max(...parts.map(p => p.maxX)),
     minY: Math.min(...parts.map(p => p.minY)),
@@ -164,9 +189,17 @@ const fmt = n => +n.toFixed(3);
 
 const svgPath = p => `<path transform="translate(${fmt(p.x)} ${fmt(p.y)})" d="${p.box.d}"/>`;
 
-export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000" } = {}) {
+// Emojis de todas as etiquetas da folha, já na posição da folha (mm).
+export const sheetEmojis = sheet => sheet.placed.flatMap(p => (p.box.emojis || []).map(e => ({ ...e, x: p.x + e.x, y: p.y + e.y })));
+
+// `art`: Map emoji → [{ d, fill }] (coordenadas 0–1), de emoji-art.mjs. Emoji ainda não carregado não aparece.
+export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000", art = null } = {}) {
   const code = sheet.code ? `<g fill="${codeFill}">${svgPath(sheet.code)}</g>` : "";
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${sheet.placed.map(svgPath).join("")}</g></svg>`;
+  const emojis = sheetEmojis(sheet).map(e => {
+    const shapes = art?.get(e.seq);
+    return shapes ? `<g transform="translate(${fmt(e.x)} ${fmt(e.y)}) scale(${fmt(e.s)})">${shapes.map(s => `<path fill="${s.fill}" d="${s.d}"/>`).join("")}</g>` : "";
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${sheet.w}mm" height="${sheet.h}mm" viewBox="0 0 ${sheet.w} ${sheet.h}">${code}<g fill="${fill}">${sheet.placed.map(svgPath).join("")}</g>${emojis}</svg>`;
 }
 
 // Camadas do RIP, na ordem em que são impressas: CMYK > Branco > Verniz.
@@ -187,10 +220,11 @@ export function pdfLayers(o) {
 }
 
 // Path SVG absoluto (M/L/Q/C/Z, como o fontkit gera) → operadores de caminho do PDF.
-// (tx, ty) e o path em mm com Y para baixo; a saída em pt com Y para cima, numa página de altura pageH pt.
-export function svgPathToPdf(d, tx, ty, pageH) {
+// (tx, ty) e o path em mm com Y para baixo (path multiplicado por `scale`); a saída em pt com Y para
+// cima, numa página de altura pageH pt.
+export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
   const MM = 72 / 25.4;
-  const X = x => fmt((tx + x) * MM), Y = y => fmt(pageH - (ty + y) * MM);
+  const X = x => fmt((tx + x * scale) * MM), Y = y => fmt(pageH - (ty + y * scale) * MM);
   const t = d.match(/[MLQCZ]|-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/gi) || [];
   let i = 0, cx = 0, cy = 0;
   const out = [];
@@ -212,11 +246,19 @@ export function svgPathToPdf(d, tx, ty, pageH) {
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
 // O código do pedido sai só em CMYK 100/100/100/100, sem sobreposição, mesmo com letra branca.
 // `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
-export function sheetContent(sheet, layers, pageH, gs, oy = 0) {
+// Emojis (`art`, ver sheetToSvg) saem nas cores originais logo depois da camada CMYK, sem sobreposição;
+// nas camadas Branco e Verniz entra a silhueta deles, como máscara.
+export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null) {
   const code = sheet.code ? `q\n1 1 1 1 k\n${svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH)}f\nQ\n` : "";
   const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
+  const emojis = sheetEmojis(sheet).map(e => ({ e, shapes: art?.get(e.seq) })).filter(x => x.shapes);
+  const emojiPath = (e, s) => svgPathToPdf(s.d, e.x, e.y + oy, pageH, e.s) + "f\n";
+  const masks = emojis.map(({ e, shapes }) => shapes.map(s => emojiPath(e, s)).join("")).join("");
+  const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
-  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("") + code;
+  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks : "") + "Q\n";
+  const cmyk = layers.filter(l => !l.spot), spots = layers.filter(l => l.spot);
+  return cmyk.map(layer).join("") + color + spots.map(layer).join("") + code;
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.

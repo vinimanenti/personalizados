@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex } from "../lib/name-labels.mjs";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn } from "../lib/name-labels.mjs";
+import { loadEmojiArt } from "../lib/emoji-art.mjs";
 
 const MM = 72 / 25.4; // mm → pt
 const STORE_KEY = "name_labels_v1";
@@ -36,6 +37,8 @@ const loadFonts = () => _fonts ||= loadLibs().then(async ([, fontkit]) => {
   return { name: fontkit.create(name), role: fontkit.create(role) };
 }).catch(e => { _fonts = null; throw e; });
 
+// Emojis coloridos em vetor (Twemoji); o desenho de cada um é baixado na primeira vez que aparece.
+const EMOJI_PALETTE = ["💖", "❤️", "💕", "💗", "💜", "💙", "🤍", "✨", "⭐", "🌸", "🌹", "🌷", "🦋", "👑", "💍", "🎀", "🎉", "🥂", "🙏", "😍", "🥰", "😘", "👶", "🍼", "🐶", "🐱", "☀️", "🌈", "⚽", "🎂"];
 const readJson = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
 
 function layoutJob(text, opts, fonts) {
@@ -44,7 +47,7 @@ function layoutJob(text, opts, fonts) {
 }
 
 // Gera um PDF com as folhas empilhadas uma embaixo da outra. Cada folha leva as camadas do seu pedido.
-async function buildPdf(jobs, gap) {
+async function buildPdf(jobs, gap, art) {
   const [{ PDFDocument, PDFName }] = await loadLibs();
   const doc = await PDFDocument.create();
   const ctx = doc.context;
@@ -71,7 +74,7 @@ async function buildPdf(jobs, gap) {
     const res = pg.node.normalizedEntries().Resources;
     if (spotKeys.size) res.set(PDFName.of("ColorSpace"), ctx.obj(colorSpaces));
     res.set(PDFName.of("ExtGState"), ctx.obj({ GSOver: gsRef }));
-    const content = page.items.map(({ sheet, oy }) => sheetContent(sheet, sheet.layers, pg.getHeight(), sheet.overprint && "GSOver", oy)).join("");
+    const content = page.items.map(({ sheet, oy }) => sheetContent(sheet, sheet.layers, pg.getHeight(), sheet.overprint && "GSOver", oy, art)).join("");
     pg.node.addContentStream(ctx.register(ctx.flateStream(content)));
   }
   doc.setTitle(`Etiquetas nome — ${jobs.map(j => j.opts.orderCode).filter(Boolean).join(", ") || "sem código"}`);
@@ -90,7 +93,38 @@ export default function NameLabels() {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const [art, setArt] = useState(() => new Map()); // emoji → formas coloridas (null = sem desenho)
+  const [lastEmoji, setLastEmoji] = useState("💖");
+  const textRef = useRef(null);
   useEffect(() => { loadFonts().then(setFonts, e => setErr(e.message)); }, []);
+  const neededEmojis = useMemo(() => [...new Set([text, ...queue.map(j => j.text)].flatMap(emojisIn))], [text, queue]);
+  const loadArt = async seqs => {
+    const got = await Promise.all(seqs.map(async q => [q, await loadEmojiArt(q)]));
+    const next = new Map([...art, ...got]);
+    setArt(next);
+    return next;
+  };
+  useEffect(() => {
+    const missing = neededEmojis.filter(q => !art.has(q));
+    if (missing.length) loadArt(missing);
+  }, [neededEmojis]); // eslint-disable-line react-hooks/exhaustive-deps
+  const noArt = neededEmojis.filter(q => art.has(q) && !art.get(q));
+
+  const insertEmoji = e => {
+    setLastEmoji(e);
+    const el = textRef.current;
+    const a = el?.selectionStart ?? text.length, b = el?.selectionEnd ?? text.length;
+    const before = text.slice(0, a), ins = (before && !/\s$/.test(before) ? " " : "") + e;
+    setText(before + ins + text.slice(b));
+    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(a + ins.length, a + ins.length); });
+  };
+  // Coloca o emoji depois do nome em toda linha que ainda não tem emoji no nome.
+  const emojiOnAll = e => setText(t => t.split(/\r?\n/).map(line => {
+    if (!line.trim()) return line;
+    const m = line.match(/^(.*?)(\s+[-–—]\s+.*|\s*[;|\t].*)?(\s+x\s*\d+)?$/i);
+    const [name, rest = "", qty = ""] = [m[1], m[2], m[3]];
+    return emojisIn(name).length ? line : `${name.trimEnd()} ${e}${rest || ""}${qty || ""}`;
+  }).join("\n"));
   useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts })); } catch { /* sem storage */ } }, [text, opts]);
   useEffect(() => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch { /* sem storage */ } }, [queue]);
 
@@ -110,11 +144,15 @@ export default function NameLabels() {
 
   const exportPdf = async (jobs, name) => {
     setBusy(true); setErr("");
-    try { download(new Blob([await buildPdf(jobs, opts.gap)], { type: "application/pdf" }), name); }
+    try {
+      const seqs = [...new Set(jobs.flatMap(j => j.sheets.flatMap(s => s.placed.flatMap(p => (p.box.emojis || []).map(e => e.seq)))))];
+      const full = seqs.every(q => art.has(q)) ? art : await loadArt(seqs);
+      download(new Blob([await buildPdf(jobs, opts.gap, full)], { type: "application/pdf" }), name);
+    }
     catch (e) { setErr(`Erro ao gerar PDF: ${e.message}`); }
     setBusy(false);
   };
-  const exportSvg = () => sheets.forEach((s, i) => download(new Blob([sheetToSvg(s, { fill: letterFill(opts) })], { type: "image/svg+xml" }), `etiquetas-nome-${stamp()}${sheets.length > 1 ? `-${i + 1}` : ""}.svg`));
+  const exportSvg = () => sheets.forEach((s, i) => download(new Blob([sheetToSvg(s, { fill: letterFill(opts), art })], { type: "image/svg+xml" }), `etiquetas-nome-${stamp()}${sheets.length > 1 ? `-${i + 1}` : ""}.svg`));
 
   const addToQueue = () => {
     setQueue(q => [...q, { id: Date.now(), text, opts, count: entries.length }]);
@@ -150,7 +188,14 @@ export default function NameLabels() {
             </label>
             <h3 style={{ fontSize: 15, marginBottom: 6 }}>Nomes</h3>
             <p style={{ fontSize: 11, color: "var(--t3)", marginBottom: 10 }}>Um por linha: <b>Nome - Função</b>. Use <b>x3</b> no fim para repetir.</p>
-            <textarea value={text} onChange={e => setText(e.target.value)} rows={12}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginBottom: 6 }}>
+              {EMOJI_PALETTE.map(e => (
+                <button key={e} title="Inserir no cursor" onClick={() => insertEmoji(e)}
+                  style={{ fontSize: 17, lineHeight: 1, padding: 4, background: lastEmoji === e ? "var(--inp)" : "none", border: `1px solid ${lastEmoji === e ? "var(--brd)" : "transparent"}`, borderRadius: 6, cursor: "pointer" }}>{e}</button>
+              ))}
+            </div>
+            <button className="bs" style={{ padding: "5px 9px", fontSize: 12, marginBottom: 8 }} onClick={() => emojiOnAll(lastEmoji)}>Colocar {lastEmoji} em todos os nomes</button>
+            <textarea ref={textRef} value={text} onChange={e => setText(e.target.value)} rows={12}
               style={{ width: "100%", padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "inherit", resize: "vertical" }} />
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginTop: 10 }}>
               <span style={{ width: 120 }}>Função padrão</span>
@@ -212,6 +257,7 @@ export default function NameLabels() {
             {num("Folga das pernas", "roleClear", "mm", 0.5)}
             {num("Cópias de cada", "copies", "×")}
             {num("Código do pedido", "codeSize", "pt", 0.5)}
+            {num("Emoji (× texto)", "emojiScale", "×", 0.05)}
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
               <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
             </label>
@@ -230,12 +276,13 @@ export default function NameLabels() {
             <button className="bp" disabled={!sheets.length} onClick={addToQueue}>+ Adicionar à fila</button>
           </div>
           {err && <p style={{ color: "#f87171", fontSize: 13, marginBottom: 10 }}>{err}</p>}
+          {noArt.length > 0 && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Sem desenho para: {noArt.join(" ")} — esse emoji não vai sair.</p>}
           {tooWide && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Algum nome é mais largo que a folha — diminua o tamanho da fonte.</p>}
           {!fonts && !err && <p style={{ color: "var(--t2)", fontSize: 13 }}>Carregando fontes…</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
             {sheets.map((s, i) => (
               <div key={i} style={{ background: opts.letter === "white" ? "#3a3d45" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
-                dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: letterFill(opts), codeFill: opts.letter === "white" ? "#b8bcc6" : "#000" }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
+                dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: letterFill(opts), codeFill: opts.letter === "white" ? "#b8bcc6" : "#000", art }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
             ))}
           </div>
         </div>
