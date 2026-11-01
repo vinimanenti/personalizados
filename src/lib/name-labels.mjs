@@ -269,21 +269,23 @@ export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
 
 // Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
-// O código do pedido sai só em CMYK 100/100/100/100, sem sobreposição, mesmo com letra branca.
+// O código do pedido sai em CMYK 100/100/100/100 (sem sobreposição, mesmo com letra branca) e
+// também na camada Branco; não leva verniz.
 // `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
 // Emojis (`art`, ver sheetToSvg) saem nas cores originais logo depois da camada CMYK, sem sobreposição;
 // nas camadas Branco e Verniz entra a silhueta deles, como máscara.
 export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null) {
-  const code = sheet.code ? `q\n1 1 1 1 k\n${svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH)}f\nQ\n` : "";
+  const codePath = sheet.code ? svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH) + "f\n" : "";
+  const code = codePath && `q\n1 1 1 1 k\n${codePath}Q\n`;
   const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
   const emojis = sheetEmojis(sheet).map(e => ({ e, shapes: art?.get(e.seq) })).filter(x => x.shapes);
   const emojiPath = (e, s) => svgPathToPdf(s.d, e.x, e.y + oy, pageH, e.s) + "f\n";
   const masks = emojis.map(({ e, shapes }) => shapes.map(s => emojiPath(e, s)).join("")).join("");
   const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
-  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks : "") + "Q\n";
+  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks : "") + (l.key === "white" ? codePath : "") + "Q\n";
   const cmyk = layers.filter(l => !l.spot), spots = layers.filter(l => l.spot);
-  return cmyk.map(layer).join("") + color + spots.map(layer).join("") + code;
+  return cmyk.map(layer).join("") + color + code + spots.map(layer).join("");
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.
