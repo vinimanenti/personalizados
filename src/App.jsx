@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import * as db from "./lib/db";
 const PrintLab = lazy(() => import("./PrintLab"));
+const NameLabels = lazy(() => import("./components/NameLabels"));
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).href;
 
@@ -1513,6 +1514,7 @@ export default function App() {
           <Tab active={tab === "print"} onClick={() => setTab("print")} icon="printer" label={`Impressão${printQueue.length ? ` (${printQueue.length})` : ""}`} />
           <Tab active={tab === "pedidos"} onClick={() => setTab("pedidos")} icon="clipboard" label={`Pedidos${pedidos.length ? ` (${pedidos.length})` : ""}`} />
           <Tab active={tab === "cartela"} onClick={() => setTab("cartela")} icon="target" label="Cartelas" />
+          <Tab active={tab === "nomes"} onClick={() => setTab("nomes")} icon="list" label="Etiquetas Nome" />
           <Tab active={tab === "lapis"} onClick={() => setTab("lapis")} icon="list" label="Lapis" />
           <Tab active={tab === "help"} onClick={() => setTab("help")} icon="help" label="Ajuda" />
         </div>
@@ -3068,6 +3070,7 @@ export default function App() {
         })()}
 
         {/* LAPIS / PRINTLAB */}
+        {tab === "nomes" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><NameLabels /></Suspense>}
         {tab === "lapis" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando PrintLab...</div>}><PrintLab /></Suspense>}
 
         {/* HELP / MANUAL */}
