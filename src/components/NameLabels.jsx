@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
 import { ART_KINDS, fitArtBoxes } from "../lib/art-upload.mjs";
 import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
@@ -12,6 +12,19 @@ const FONT_FILES = { role: "times.ttf" };
 const NAME_FONTS = {
   greatvibes: { label: "Great Vibes", file: "greatvibes.ttf" },
   lobster: { label: "Lobster", file: "lobster.ttf" },
+};
+// Fontes do Lápis DTF UV; `upper` = sempre em maiúsculas.
+const PENCIL_FONTS = {
+  cookie: { label: "Cookie", file: "cookie.ttf" },
+  arialbd: { label: "Arial Negrito", file: "arialbd.ttf", upper: true },
+};
+const PENCIL_QTYS = [50, 100, 150];
+const emptyPencil = () => [{ name: "", qty: 150 }, { name: "", qty: 150 }, { name: "", qty: 150 }];
+
+// Cada aba tem a sua configuração, rascunho e fila (o Lápis DTF UV é outro material).
+const VARIANTS = {
+  names: { storeKey: STORE_KEY, queueKey: QUEUE_KEY, fonts: NAME_FONTS, defaults: {}, file: "fila-etiquetas-nome" },
+  dtf: { storeKey: "pencil_dtf_v1", queueKey: "pencil_dtf_queue_v1", fonts: PENCIL_FONTS, defaults: { nameFont: "cookie", nameSize: 24, maxWidth: 50 }, file: "fila-lapis-dtf-uv" },
 };
 const EXAMPLE = "Ana Paula - Madrinha\nCarlos Eduardo - Padrinho\nMaria Clara - Dama de Honra";
 const COLOR_PRESETS = [
@@ -36,14 +49,21 @@ const loadLibs = () => _libs ||= Promise.all([
   loadScript(["https://unpkg.com/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js", "https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js"], "fontkit"),
 ]).catch(e => { _libs = null; throw e; });
 
-let _fonts = null;
-const loadFonts = () => _fonts ||= loadLibs().then(async ([, fontkit]) => {
-  const base = import.meta.env.BASE_URL || "/";
-  const get = async f => { const r = await fetch(`${base}fonts/${f}`); if (!r.ok) throw new Error(`Fonte ${f} não encontrada`); return new Uint8Array(await r.arrayBuffer()); };
-  const keys = Object.keys(NAME_FONTS);
-  const [role, ...names] = await Promise.all([get(FONT_FILES.role), ...keys.map(k => get(NAME_FONTS[k].file))]);
-  return { role: fontkit.create(role), names: Object.fromEntries(keys.map((k, i) => [k, fontkit.create(names[i])])) };
-}).catch(e => { _fonts = null; throw e; });
+// Carrega a Times (função e código do pedido) e as fontes de nome da aba (`fontMap`).
+const _fonts = new Map();
+const loadFonts = fontMap => {
+  const key = Object.keys(fontMap).join(",");
+  if (!_fonts.has(key)) {
+    _fonts.set(key, loadLibs().then(async ([, fontkit]) => {
+      const base = import.meta.env.BASE_URL || "/";
+      const get = async f => { const r = await fetch(`${base}fonts/${f}`); if (!r.ok) throw new Error(`Fonte ${f} não encontrada`); return new Uint8Array(await r.arrayBuffer()); };
+      const keys = Object.keys(fontMap);
+      const [role, ...names] = await Promise.all([get(FONT_FILES.role), ...keys.map(k => get(fontMap[k].file))]);
+      return { role: fontkit.create(role), names: Object.fromEntries(keys.map((k, i) => [k, fontkit.create(names[i])])) };
+    }).catch(e => { _fonts.delete(key); throw e; }));
+  }
+  return _fonts.get(key);
+};
 
 // Emojis coloridos em vetor (Twemoji); o desenho de cada um é baixado na primeira vez que aparece.
 const EMOJI_PALETTE = ["💖", "❤️", "💕", "💗", "💜", "💙", "🤍", "✨", "⭐", "🌸", "🌹", "🌷", "🦋", "👑", "💍", "🎀", "🎉", "🥂", "🙏", "😍", "🥰", "😘", "👶", "🍼", "🐶", "🐱", "☀️", "🌈", "⚽", "🎂"];
@@ -53,6 +73,17 @@ function layoutJob(text, opts, loaded) {
   const fonts = { role: loaded.role, name: loaded.names[opts.nameFont] || loaded.names[DEFAULT_OPTS.nameFont] };
   const labels = parseEntries(text, opts).map(e => buildLabel(e, fonts, opts)).filter(Boolean);
   return packLabels(labels, opts, buildCode(fonts, opts));
+}
+
+// Lápis DTF UV: cada nome vira `qty` etiquetas iguais (até 2 linhas, no máximo `maxWidth` mm).
+function layoutPencilJob(names, opts, loaded) {
+  const f = PENCIL_FONTS[opts.nameFont] || PENCIL_FONTS.cookie;
+  const font = loaded.names[opts.nameFont] || Object.values(loaded.names)[0];
+  const labels = names.filter(n => n.name.trim()).flatMap(n => {
+    const box = buildPencilLabel(n.name, font, { ...opts, upper: !!f.upper });
+    return box ? Array(Math.max(0, n.qty | 0)).fill(box) : [];
+  });
+  return packLabels(labels, opts, buildCode({ role: loaded.role }, opts));
 }
 
 // Arte enviada: `qty` cópias de w × h mm, com o código do pedido no canto, como as etiquetas.
@@ -130,16 +161,23 @@ async function buildPdf(jobs, gap, art, arts = new Map()) {
 const letterFill = o => o.letter === "white" ? "#fff" : cmykToHex(letterCmyk(o));
 const letterName = o => o.letter === "white" ? "Branca" : o.letter === "color" ? `Cor ${(o.cmyk || []).join("/")}` : "Preta";
 
-export default function NameLabels() {
-  const [text, setText] = useState(() => readJson(STORE_KEY, {}).text ?? EXAMPLE);
-  const [opts, setOpts] = useState(() => ({ ...DEFAULT_OPTS, ...readJson(STORE_KEY, {}).opts }));
+// variant "names" = aba Etiquetas Nome (nomes + upload de arte); "dtf" = aba Lápis DTF UV.
+export default function NameLabels({ variant = "names" }) {
+  const V = VARIANTS[variant];
+  const STORE_KEY = V.storeKey, QUEUE_KEY = V.queueKey; // eslint-disable-line no-shadow
+  const isDtf = variant === "dtf";
+  const [text, setText] = useState(() => readJson(STORE_KEY, {}).text ?? (isDtf ? "" : EXAMPLE));
+  const [opts, setOpts] = useState(() => ({ ...DEFAULT_OPTS, ...V.defaults, ...readJson(STORE_KEY, {}).opts }));
   const [queue, setQueue] = useState(() => readJson(QUEUE_KEY, []));
   const [fonts, setFonts] = useState(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // Lápis DTF UV: até 3 nomes, cada um com a sua quantidade.
+  const [pencil, setPencil] = useState(() => readJson(STORE_KEY, {}).pencil ?? emptyPencil());
+  const upPencil = (i, k, v) => setPencil(ps => ps.map((p, j) => (j === i ? { ...p, [k]: v } : p)));
 
   // ─── Modo Arquivo: arte enviada (PNG/JPG/SVG/PDF) com Branco e Verniz ───
-  const [mode, setMode] = useState(() => readJson(STORE_KEY, {}).mode || "names");
+  const [mode, setMode] = useState(() => (isDtf ? "dtf" : readJson(STORE_KEY, {}).mode || "names"));
   const [arts, setArts] = useState(() => new Map()); // id do arquivo → arte preparada (art-prepare.js)
   const [cur, setCur] = useState(null);              // { fileId, w, h, qty, mask, lock } da arte no editor
   const [loadingArt, setLoadingArt] = useState(false);
@@ -186,8 +224,8 @@ export default function NameLabels() {
   const [art, setArt] = useState(() => new Map()); // emoji → formas coloridas (null = sem desenho)
   const [lastEmoji, setLastEmoji] = useState("💖");
   const textRef = useRef(null);
-  useEffect(() => { loadFonts().then(setFonts, e => setErr(e.message)); }, []);
-  const neededEmojis = useMemo(() => [...new Set([text, ...queue.map(j => j.text)].flatMap(emojisIn))], [text, queue]);
+  useEffect(() => { loadFonts(V.fonts).then(setFonts, e => setErr(e.message)); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const neededEmojis = useMemo(() => [...new Set([text, ...pencil.map(p => p.name), ...queue.flatMap(j => j.names ? j.names.map(n => n.name) : [j.text || ""])].flatMap(emojisIn))], [text, pencil, queue]);
   const loadArt = async seqs => {
     const got = await Promise.all(seqs.map(async q => [q, await loadEmojiArt(q)]));
     const next = new Map([...art, ...got]);
@@ -219,15 +257,19 @@ export default function NameLabels() {
     pieces[i] = `${pieces[i].trimEnd()} ${e}`;
     return pieces.join("") + (q ? q[0] : "");
   }).join("\n"));
-  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts, mode })); } catch { /* sem storage */ } }, [text, opts, mode]);
-  useEffect(() => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch { /* sem storage */ } }, [queue]);
+  useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts, mode, pencil })); } catch { /* sem storage */ } }, [text, opts, mode, pencil]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch { /* sem storage */ } }, [queue]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const entries = useMemo(() => parseEntries(text, opts), [text, opts]);
-  const nameSheets = useMemo(() => fonts ? layoutJob(text, opts, fonts) : [], [fonts, text, opts]);
+  const pencilNames = pencil.filter(p => p.name.trim());
+  const pencilCount = pencilNames.reduce((n, p) => n + (p.qty | 0), 0);
+  const nameSheets = useMemo(() => fonts && !isDtf ? layoutJob(text, opts, fonts) : [], [fonts, text, opts, isDtf]);
+  const pencilSheets = useMemo(() => fonts && isDtf ? layoutPencilJob(pencil, opts, fonts) : [], [fonts, pencil, opts, isDtf]);
   const artSheets = fonts && curArtJob ? layoutArtJob(curArtJob, fonts, curArt) : [];
-  const sheets = mode === "art" ? artSheets : nameSheets;
+  const sheets = mode === "art" ? artSheets : isDtf ? pencilSheets : nameSheets;
   const rotatedCount = artSheets.reduce((n, s) => n + s.placed.filter(p => p.box.rot).length, 0);
-  const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : layoutJob(j.text, j.opts, fonts) })) : [], [fonts, queue, arts]);
+  const layoutQueued = j => j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : j.kind === "dtf" ? layoutPencilJob(j.names, j.opts, fonts) : layoutJob(j.text, j.opts, fonts);
+  const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: layoutQueued(j) })) : [], [fonts, queue, arts]); // eslint-disable-line react-hooks/exhaustive-deps
   const queueH = queueJobs.flatMap(j => j.sheets).reduce((h, s, i) => h + s.h + (i ? opts.gap : 0), 0);
   const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin));
 
@@ -249,10 +291,13 @@ export default function NameLabels() {
     catch (e) { setErr(`Erro ao gerar PDF: ${e.message}`); }
     setBusy(false);
   };
-  const exportSvg = () => sheets.forEach((s, i) => download(new Blob([sheetToSvg(s, { fill: letterFill(opts), art })], { type: "image/svg+xml" }), `etiquetas-nome-${stamp()}${sheets.length > 1 ? `-${i + 1}` : ""}.svg`));
+  const exportSvg = () => sheets.forEach((s, i) => download(new Blob([sheetToSvg(s, { fill: letterFill(opts), art })], { type: "image/svg+xml" }), `${isDtf ? "lapis-dtf-uv" : "etiquetas-nome"}-${stamp()}${sheets.length > 1 ? `-${i + 1}` : ""}.svg`));
 
   const addToQueue = () => {
-    if (mode === "art") {
+    if (isDtf) {
+      setQueue(q => [...q, { id: Date.now(), kind: "dtf", names: pencilNames, opts, count: pencilCount }]);
+      setPencil(emptyPencil());
+    } else if (mode === "art") {
       const { opts: o, ...job } = curArtJob;
       setQueue(q => [...q, { ...job, id: Date.now(), opts: o }]);
       setCur(null);
@@ -263,8 +308,10 @@ export default function NameLabels() {
     up("orderCode", "");
   };
   const editJob = job => {
-    setOpts({ ...DEFAULT_OPTS, ...job.opts });
-    if (job.kind === "art") {
+    setOpts({ ...DEFAULT_OPTS, ...V.defaults, ...job.opts });
+    if (job.kind === "dtf") {
+      setPencil([...job.names, ...emptyPencil()].slice(0, 3));
+    } else if (job.kind === "art") {
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       setMode("art");
       setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true, autoRotate: job.autoRotate !== false });
@@ -384,16 +431,95 @@ export default function NameLabels() {
     </div>
   </>;
 
+  const colorCard = (
+  <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
+    <h3 style={{ fontSize: 15, marginBottom: 4 }}>Cor da letra</h3>
+    <div style={{ display: "flex", gap: 6 }}>
+      {[["black", "Preta"], ["white", "Branca"], ["color", "Colorida"]].map(([v, l]) => (
+        <button key={v} className={opts.letter === v ? "bp" : "bs"} style={{ flex: 1, padding: "7px 10px", fontSize: 12 }} onClick={() => up("letter", v)}>{l}</button>
+      ))}
+    </div>
+    {opts.letter === "color" && <>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {swatch(letterFill(opts), 30)}
+        {["C", "M", "Y", "K"].map((ch, i) => (
+          <label key={ch} style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 12, color: "var(--t2)" }}>
+            {ch}
+            <input type="number" min={0} max={100} value={opts.cmyk[i]}
+              onChange={e => up("cmyk", opts.cmyk.map((v, j) => j === i ? Math.min(100, Math.max(0, parseFloat(e.target.value) || 0)) : v))}
+              style={{ width: 52, padding: "6px 4px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, textAlign: "center" }} />
+          </label>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {COLOR_PRESETS.map(([name, c]) => (
+          <button key={name} className="bs" style={{ ...small, display: "flex", alignItems: "center", gap: 6 }} onClick={() => up("cmyk", c)}>
+            {swatch(cmykToHex(c.map(v => v / 100)))}{name}
+          </button>
+        ))}
+      </div>
+    </>}
+    {layerControls}
+  </div>
+  );
+
+  const pencilEditor = <>
+    <div style={{ ...card, display: "flex", flexDirection: "column", gap: 10 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+        <span style={{ width: 120, fontWeight: 600 }}>Código do pedido</span>
+        <input value={opts.orderCode} onChange={e => up("orderCode", e.target.value)} placeholder="ex.: 251101ABC123"
+          style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "monospace" }} />
+      </label>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <h3 style={{ fontSize: 15, flex: 1 }}>Nomes</h3>
+        {Object.entries(PENCIL_FONTS).map(([k, f]) => (
+          <button key={k} className={opts.nameFont === k ? "bp" : "bs"} style={{ padding: "5px 10px", fontSize: 12 }} onClick={() => up("nameFont", k)}>{f.label}</button>
+        ))}
+      </div>
+      <p style={{ fontSize: 11, color: "var(--t3)" }}>
+        Até 3 nomes. Nome maior que {opts.maxWidth} mm vai para 2 linhas; use <b>-</b> para escolher onde quebrar (ex.: <b>Maria - Clara</b>).
+        {PENCIL_FONTS[opts.nameFont]?.upper && " Arial Negrito sai sempre em MAIÚSCULAS."}
+      </p>
+      {pencil.map((p, i) => (
+        <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6, padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10 }}>
+          <input value={p.name} onChange={e => upPencil(i, "name", e.target.value)} placeholder={`Nome ${i + 1}`}
+            style={{ padding: "7px 9px", background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 14 }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--t2)" }}>
+            {PENCIL_QTYS.map(q => (
+              <button key={q} className={p.qty === q && !p.custom ? "bp" : "bs"} style={{ padding: "5px 10px", fontSize: 12 }} onClick={() => setPencil(ps => ps.map((x, j) => (j === i ? { ...x, qty: q, custom: false } : x)))}>{q}</button>
+            ))}
+            <button className={p.custom ? "bp" : "bs"} style={{ padding: "5px 10px", fontSize: 12 }} onClick={() => upPencil(i, "custom", true)}>Personalizado</button>
+            {p.custom && <input type="number" min={1} value={p.qty} onChange={e => upPencil(i, "qty", Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ ...field, width: 70 }} />}
+          </div>
+        </div>
+      ))}
+    </div>
+    {colorCard}
+    <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
+      <h3 style={{ fontSize: 15, marginBottom: 4 }}>Folha e texto</h3>
+      {num("Largura da folha", "sheetW", "mm")}
+      {num("Altura máx.", "maxSheetH", "mm (0 = rolo)")}
+      {num("Margem", "margin", "mm", 0.5)}
+      {num("Espaço entre", "gap", "mm", 0.5)}
+      {num("Tamanho da fonte", "nameSize", "pt", 0.5)}
+      {num("Largura máx. do nome", "maxWidth", "mm", 1)}
+      {num("Código do pedido", "codeSize", "pt", 0.5)}
+      {num("Emoji (× texto)", "emojiScale", "×", 0.05)}
+      <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, ...V.defaults, orderCode: opts.orderCode, nameFont: opts.nameFont, letter: opts.letter, cmyk: opts.cmyk, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
+    </div>
+  </>;
+
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20, animation: "fadeIn .3s" }}>
-      <div style={{ display: "flex", gap: 6 }}>
+      {!isDtf && <div style={{ display: "flex", gap: 6 }}>
         {[["names", "Etiquetas de nome"], ["art", "Arquivo (upload)"]].map(([m, l]) => (
           <button key={m} className={mode === m ? "bp" : "bs"} style={{ padding: "8px 16px", fontSize: 13 }} onClick={() => setMode(m)}>{l}</button>
         ))}
-      </div>
+      </div>}
       <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 380px) 1fr", gap: 20 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          {mode === "art" ? artEditor : <>
+          {mode === "art" ? artEditor : isDtf ? pencilEditor : <>
           <div style={card}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginBottom: 14 }}>
               <span style={{ width: 120, fontWeight: 600 }}>Código do pedido</span>
@@ -434,35 +560,7 @@ export default function NameLabels() {
             </label>
           </div>
 
-          <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
-            <h3 style={{ fontSize: 15, marginBottom: 4 }}>Cor da letra</h3>
-            <div style={{ display: "flex", gap: 6 }}>
-              {[["black", "Preta"], ["white", "Branca"], ["color", "Colorida"]].map(([v, l]) => (
-                <button key={v} className={opts.letter === v ? "bp" : "bs"} style={{ flex: 1, padding: "7px 10px", fontSize: 12 }} onClick={() => up("letter", v)}>{l}</button>
-              ))}
-            </div>
-            {opts.letter === "color" && <>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                {swatch(letterFill(opts), 30)}
-                {["C", "M", "Y", "K"].map((ch, i) => (
-                  <label key={ch} style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 12, color: "var(--t2)" }}>
-                    {ch}
-                    <input type="number" min={0} max={100} value={opts.cmyk[i]}
-                      onChange={e => up("cmyk", opts.cmyk.map((v, j) => j === i ? Math.min(100, Math.max(0, parseFloat(e.target.value) || 0)) : v))}
-                      style={{ width: 52, padding: "6px 4px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 12, textAlign: "center" }} />
-                  </label>
-                ))}
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {COLOR_PRESETS.map(([name, c]) => (
-                  <button key={name} className="bs" style={{ ...small, display: "flex", alignItems: "center", gap: 6 }} onClick={() => up("cmyk", c)}>
-                    {swatch(cmykToHex(c.map(v => v / 100)))}{name}
-                  </button>
-                ))}
-              </div>
-            </>}
-            {layerControls}
-          </div>
+          {colorCard}
 
           <div style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
             <h3 style={{ fontSize: 15, marginBottom: 4 }}>Folha e texto</h3>
@@ -498,11 +596,11 @@ export default function NameLabels() {
         <div style={{ ...card, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
             <h3 style={{ fontSize: 15, flex: 1 }}>
-              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} girada${rotatedCount === 1 ? "" : "s"})` : ""}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
+              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} girada${rotatedCount === 1 ? "" : "s"})` : ""}` : isDtf ? `${pencilCount} etiqueta${pencilCount === 1 ? "" : "s"}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
               {sheets.length > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · {sheets.map(s => `${(s.w / 10).toFixed(1)} × ${(s.h / 10).toFixed(1)} cm`).join(" + ")}</span>}
             </h3>
-            {mode === "names" && <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>}
-            <button className="bs" disabled={!sheets.length || busy} onClick={() => exportPdf([mode === "art" ? { ...curArtJob, sheets } : { sheets, opts }], `${mode === "art" ? "arte" : "etiquetas-nome"}-${opts.orderCode || stamp()}.pdf`)}>Baixar PDF</button>
+            {mode !== "art" && <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>}
+            <button className="bs" disabled={!sheets.length || busy} onClick={() => exportPdf([mode === "art" ? { ...curArtJob, sheets } : { sheets, opts }], `${mode === "art" ? "arte" : isDtf ? "lapis-dtf-uv" : "etiquetas-nome"}-${opts.orderCode || stamp()}.pdf`)}>Baixar PDF</button>
             <button className="bp" disabled={!sheets.length} onClick={addToQueue}>+ Adicionar à fila</button>
           </div>
           {err && <p style={{ color: "#f87171", fontSize: 13, marginBottom: 10 }}>{err}</p>}
@@ -526,7 +624,7 @@ export default function NameLabels() {
             {queueH > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · PDF único com {(opts.sheetW / 10).toFixed(1)} × {(queueH / 10).toFixed(1)} cm</span>}
           </h3>
           {queue.length > 0 && <button className="bs" onClick={() => { if (confirm("Limpar a fila de impressão?")) clearQueue(); }}>Limpar fila</button>}
-          <button className="bp" disabled={!queueJobs.length || busy} onClick={() => exportPdf(queueJobs, `fila-etiquetas-nome-${stamp()}.pdf`)}>{busy ? "Gerando…" : "Gerar PDF único"}</button>
+          <button className="bp" disabled={!queueJobs.length || busy} onClick={() => exportPdf(queueJobs, `${V.file}-${stamp()}.pdf`)}>{busy ? "Gerando…" : "Gerar PDF único"}</button>
         </div>
         {!queue.length && <p style={{ fontSize: 13, color: "var(--t3)", marginTop: 8 }}>Monte um pedido ou envie um arquivo acima e clique em "Adicionar à fila". No fim, "Gerar PDF único" junta todos, um embaixo do outro.</p>}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -542,6 +640,8 @@ export default function NameLabels() {
                 <span style={{ fontSize: 12, color: "var(--t2)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {job.kind === "art"
                     ? <>{job.qty} cópia{job.qty === 1 ? "" : "s"} · {job.name} · {job.w} × {job.h} mm · branco/verniz: {job.mask === "shape" ? "contorno" : "retângulo"} · {(h / 10).toFixed(1)} cm</>
+                    : job.kind === "dtf"
+                    ? <>{job.count} etiquetas · {PENCIL_FONTS[job.opts.nameFont]?.label || "Cookie"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.names.map(n => `${n.name} ×${n.qty}`).join(", ")}</>
                     : <>{job.count} etiqueta{job.count === 1 ? "" : "s"} · {NAME_FONTS[job.opts.nameFont]?.label || "Great Vibes"} · letra {letterName(job.opts)} · {(h / 10).toFixed(1)} cm · {job.text.split(/\r?\n/).filter(Boolean).slice(0, 3).join(", ")}{job.text.split(/\r?\n/).filter(Boolean).length > 3 ? "…" : ""}</>}
                 </span>
                 <button className="bs" style={small} disabled={i === 0} onClick={() => moveJob(i, -1)} title="Subir">↑</button>

@@ -152,6 +152,50 @@ export function buildLabel(entry, fonts, opts) {
   };
 }
 
+// ─── Lápis DTF UV: um nome por etiqueta, até 2 linhas, largura máxima ───
+
+// Divide o nome em até 2 linhas: "-" força a quebra ("Maria - Clara"); sem "-", só quebra se passar de
+// `maxW`, no espaço que deixa as duas linhas mais parecidas. `measure(texto)` devolve a largura em mm.
+export function pencilLines(text, measure, maxW) {
+  const t = String(text || "").trim().replace(/\s+/g, " ");
+  if (!t) return [];
+  const dash = t.split(/\s*[-–—]\s*/).filter(Boolean);
+  if (dash.length > 1) return [dash[0], dash.slice(1).join(" ")];
+  if (!maxW || measure(t) <= maxW) return [t];
+  const words = t.split(" ");
+  if (words.length < 2) return [t];
+  let best = null;
+  for (let i = 1; i < words.length; i++) {
+    const a = words.slice(0, i).join(" "), b = words.slice(i).join(" ");
+    const w = Math.max(measure(a), measure(b));
+    if (!best || w < best.w) best = { w, lines: [a, b] };
+  }
+  return best.lines;
+}
+
+// Etiqueta do lápis: linhas centralizadas, a 1ª com linha de base em y = 0. Se ainda passar de
+// `maxWidth` (ou um nome sem espaço for comprido), a fonte diminui até caber (mínimo `minSize`).
+export function buildPencilLabel(text, font, opts) {
+  const o = { nameSize: 24, maxWidth: 50, lineGap: 1.1, minSize: 8, emojiScale: DEFAULT_OPTS.emojiScale, upper: false, ...opts };
+  const src = o.upper ? String(text).toLocaleUpperCase("pt-BR") : String(text);
+  const shape = (t, size, base = 0) => textShape(font, t, size, base, o.emojiScale);
+  const width = (t, size) => { const s = shape(t, size); return s ? s.maxX - s.minX : 0; };
+  let size = o.nameSize;
+  const lines = pencilLines(src, t => width(t, size), o.maxWidth);
+  if (!lines.length) return null;
+  while (size > o.minSize && o.maxWidth > 0 && Math.max(...lines.map(l => width(l, size))) > o.maxWidth) size -= 0.5;
+  const step = size * PT_TO_MM * o.lineGap;
+  const parts = lines.map((l, i) => shape(l, size, i * step)).filter(Boolean);
+  if (!parts.length) return null;
+  return {
+    entry: { name: text }, size, lines,
+    d: parts.map(p => p.d).join(""),
+    emojis: parts.flatMap(p => p.emojis),
+    minX: Math.min(...parts.map(p => p.minX)), maxX: Math.max(...parts.map(p => p.maxX)),
+    minY: Math.min(...parts.map(p => p.minY)), maxY: Math.max(...parts.map(p => p.maxY)),
+  };
+}
+
 // Código do pedido: caixa no mesmo formato de uma etiqueta (origem na linha de base).
 export function buildCode(fonts, opts) {
   const o = { ...DEFAULT_OPTS, ...opts };

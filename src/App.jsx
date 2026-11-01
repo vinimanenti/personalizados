@@ -1515,6 +1515,7 @@ export default function App() {
           <Tab active={tab === "pedidos"} onClick={() => setTab("pedidos")} icon="clipboard" label={`Pedidos${pedidos.length ? ` (${pedidos.length})` : ""}`} />
           <Tab active={tab === "cartela"} onClick={() => setTab("cartela")} icon="target" label="Cartelas" />
           <Tab active={tab === "nomes"} onClick={() => setTab("nomes")} icon="list" label="Etiquetas Nome" />
+          <Tab active={tab === "lapisdtf"} onClick={() => setTab("lapisdtf")} icon="list" label="Lápis DTF UV" />
           <Tab active={tab === "lapis"} onClick={() => setTab("lapis")} icon="list" label="Lapis" />
           <Tab active={tab === "help"} onClick={() => setTab("help")} icon="help" label="Ajuda" />
         </div>
@@ -3071,6 +3072,7 @@ export default function App() {
 
         {/* LAPIS / PRINTLAB */}
         {tab === "nomes" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><NameLabels /></Suspense>}
+        {tab === "lapisdtf" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><NameLabels key="dtf" variant="dtf" /></Suspense>}
         {tab === "lapis" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando PrintLab...</div>}><PrintLab /></Suspense>}
 
         {/* HELP / MANUAL */}
