@@ -125,7 +125,7 @@ export default function NameLabels() {
             <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
-            <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (PDF)
+            <input type="checkbox" checked={opts.overprint} onChange={e => up("overprint", e.target.checked)} /> Impressão sobreposta do preenchimento (só Branco e Verniz)
           </label>
           <h3 style={{ fontSize: 15, margin: "10px 0 4px" }}>Camadas do RIP</h3>
           <div style={{ display: "flex", gap: 6 }}>

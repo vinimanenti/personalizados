@@ -186,9 +186,9 @@ export function svgPathToPdf(d, tx, ty, pageH) {
   return out.map(l => l + "\n").join("");
 }
 
-// Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior, com
-// sobreposição (gs) para o RIP não "vazar" a camada de baixo.
+// Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
+// Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
 export function sheetContent(sheet, layers, pageH, gs) {
   const paths = sheet.placed.map(p => svgPathToPdf(p.box.d, p.x, p.y, pageH) + "f\n").join("");
-  return layers.map(l => ["q", gs && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("");
+  return layers.map(l => ["q", gs && l.spot && `/${gs} gs`, l.cs ? `/${l.cs} cs 1 scn` : "1 1 1 1 k"].filter(Boolean).join("\n") + "\n" + paths + "Q\n").join("");
 }

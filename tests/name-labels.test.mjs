@@ -47,11 +47,11 @@ test('converts svg path (mm, y down) to pdf operators (pt, y up)', () => {
   assert.match(ops, /0 28 c\nh\n$/);
 });
 
-test('page content draws each layer with overprint state and its color', () => {
+test('page content draws each layer with its color; only spot layers overprint', () => {
   const sheet = { placed: [{ x: 0, y: 0, box: { d: 'M0 0L1 0L1 1Z' } }] };
   const layers = pdfLayers({ letter: 'black', whiteLayer: true, varnishLayer: true, whiteSpot: 'W', varnishSpot: 'V' });
   const c = sheetContent(sheet, layers, 100, 'GS0');
   const fills = c.match(/1 1 1 1 k|\/CS\w+ cs 1 scn/g);
   assert.deepEqual(fills, ['1 1 1 1 k', '/CSWhite cs 1 scn', '/CSVarnish cs 1 scn']);
-  assert.equal(c.match(/\/GS0 gs/g).length, 3);
+  assert.deepEqual(c.match(/\/GS0 gs|1 1 1 1 k|\/CS\w+ cs/g), ['1 1 1 1 k', '/GS0 gs', '/CSWhite cs', '/GS0 gs', '/CSVarnish cs']);
 });
