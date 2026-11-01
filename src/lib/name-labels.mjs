@@ -25,28 +25,42 @@ export const DEFAULT_OPTS = {
   whiteSpot: "TOYO 0024pc*",
   varnishSpot: "TOYO 0044pc*",
   defaultRole: "",
+  lines: 2,         // 2 = nome / função; 3 = linha de cima (Times) / nome / linha de baixo (Times)
+  defaultTop: "",   // linha de cima quando a linha da lista não traz uma
+  topSize: 11,      // pt (Times)
+  topGap: 3,        // linha de base da linha de cima → topo das letras do nome logo abaixo (mm)
   copies: 1,
   orderCode: "",    // código do pedido, no canto superior esquerdo de cada folha
   codeSize: 10,     // pt (Times)
   emojiScale: 0.6,  // tamanho do emoji em relação ao texto
 };
 
-// "Ana Paula - Madrinha", "Ana Paula; Madrinha", "Ana Paula | Madrinha", tab.
-// Sufixo " x3" repete a etiqueta.
-export function parseEntries(text, { defaultRole = "", copies = 1, roleUpper = true } = {}) {
+// Separadores entre as partes de uma linha: " - ", ";", "|" ou tab.
+export const PART_SEP = /\s+[-–—]\s+|\s*[;|\t]\s*/;
+
+// Qual parte da linha é o nome: com 3 linhas e 3 partes ("Cima - Nome - Baixo") é a do meio.
+export const nameIndex = (parts, lines) => (lines === 3 && parts.length >= 3 ? 1 : 0);
+
+// 2 linhas: "Ana Paula - Madrinha", "Ana Paula; Madrinha", "Ana Paula | Madrinha", tab.
+// 3 linhas: "Cima - Nome - Baixo"; com 2 partes é "Nome - Baixo" e com 1 só o nome (o resto vem
+// dos padrões). Sufixo " x3" repete a etiqueta.
+export function parseEntries(text, { defaultRole = "", defaultTop = "", lines = 2, copies = 1, roleUpper = true } = {}) {
   const out = [];
+  const up = s => (roleUpper ? s.toLocaleUpperCase("pt-BR") : s);
   for (const raw of String(text || "").split(/\r?\n/)) {
     let line = raw.trim();
     if (!line) continue;
     let qty = 1;
     const q = line.match(/\s+x\s*(\d+)$/i);
     if (q) { qty = Math.max(1, parseInt(q[1], 10)); line = line.slice(0, q.index).trim(); }
-    const parts = line.split(/\s+[-–—]\s+|\s*[;|\t]\s*/);
-    const name = parts[0].trim();
-    let role = (parts.length > 1 ? parts.slice(1).join(" ") : defaultRole).trim();
-    if (roleUpper) role = role.toLocaleUpperCase("pt-BR");
+    const parts = line.split(PART_SEP).map(s => s.trim());
+    const ni = nameIndex(parts, lines);
+    const name = parts[ni];
     if (!name) continue;
-    for (let i = 0; i < qty * Math.max(1, copies | 0); i++) out.push({ name, role });
+    const rest = parts.slice(ni + 1).join(" ");
+    const entry = { name, role: up(rest || defaultRole.trim()) };
+    if (lines === 3) entry.top = up(ni ? parts[0] : defaultTop.trim());
+    for (let i = 0; i < qty * Math.max(1, copies | 0); i++) out.push({ ...entry });
   }
   return out;
 }
@@ -101,7 +115,8 @@ function textShape(font, text, sizePt, baseY, emojiScale = 1) {
   };
 }
 
-// Uma etiqueta: nome com linha de base em y = 0 e função centralizada abaixo.
+// Uma etiqueta: nome com linha de base em y = 0, função centralizada abaixo e, com 3 linhas,
+// a linha de cima centralizada acima.
 export function buildLabel(entry, fonts, opts) {
   const o = { ...DEFAULT_OPTS, ...opts };
   const name = textShape(fonts.name, entry.name, o.nameSize, 0, o.emojiScale);
@@ -115,7 +130,16 @@ export function buildLabel(entry, fonts, opts) {
     }
   }
   const role = textShape(fonts.role, entry.role, o.roleSize, roleTop + capH, o.emojiScale);
-  const parts = [name, role].filter(Boolean);
+  // Linha de cima (3 linhas): fica `topGap` acima da letra mais alta do nome que está embaixo dela
+  // (ex.: o "P" de "Paula"), descontando o que ela própria desce abaixo da linha de base.
+  let top = null;
+  const topProbe = entry.top && textShape(fonts.role, entry.top, o.topSize, 0, o.emojiScale);
+  if (topProbe) {
+    const under = name ? name.boxes.filter(g => g.maxX > topProbe.minX && g.minX < topProbe.maxX) : [];
+    const nameTop = under.length ? Math.min(...under.map(g => g.minY)) : name ? name.minY : 0;
+    top = textShape(fonts.role, entry.top, o.topSize, nameTop - o.topGap - Math.max(0, topProbe.maxY), o.emojiScale);
+  }
+  const parts = [top, name, role].filter(Boolean);
   if (!parts.length) return null;
   return {
     entry,

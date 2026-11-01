@@ -86,3 +86,14 @@ test('stacks sheets of several orders one below the other', () => {
   assert.deepEqual(pages.map(p => p.items.map(i => i.oy)), [[0, 46], [0]]);
   assert.deepEqual(pages.map(p => p.h), [76, 50]);
 });
+
+test('3-line mode: "Cima - Nome - Baixo", defaults fill the missing lines', () => {
+  const o = { lines: 3, defaultTop: 'Casamento', defaultRole: 'Madrinha' };
+  assert.deepEqual(parseEntries('Padrinhos - Ana Paula - 12.11.2026\nJoão - Pajem\nMaria', o), [
+    { top: 'PADRINHOS', name: 'Ana Paula', role: '12.11.2026' },
+    { top: 'CASAMENTO', name: 'João', role: 'PAJEM' },
+    { top: 'CASAMENTO', name: 'Maria', role: 'MADRINHA' },
+  ]);
+  // com 2 linhas nada muda: a primeira parte é o nome
+  assert.deepEqual(parseEntries('Ana - Madrinha - x'), [{ name: 'Ana', role: 'MADRINHA X' }]);
+});

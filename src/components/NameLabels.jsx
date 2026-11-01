@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
 
 const MM = 72 / 25.4; // mm → pt
@@ -128,9 +128,13 @@ export default function NameLabels() {
   // Coloca o emoji depois do nome em toda linha que ainda não tem emoji no nome.
   const emojiOnAll = e => setText(t => t.split(/\r?\n/).map(line => {
     if (!line.trim()) return line;
-    const m = line.match(/^(.*?)(\s+[-–—]\s+.*|\s*[;|\t].*)?(\s+x\s*\d+)?$/i);
-    const [name, rest = "", qty = ""] = [m[1], m[2], m[3]];
-    return emojisIn(name).length ? line : `${name.trimEnd()} ${e}${rest || ""}${qty || ""}`;
+    const q = line.match(/\s+x\s*\d+\s*$/i);
+    const body = q ? line.slice(0, q.index) : line;
+    const pieces = body.split(new RegExp(`(${PART_SEP.source})`)); // [parte, separador, parte, …]
+    const i = 2 * nameIndex(pieces.filter((_, j) => j % 2 === 0), opts.lines);
+    if (emojisIn(pieces[i]).length) return line;
+    pieces[i] = `${pieces[i].trimEnd()} ${e}`;
+    return pieces.join("") + (q ? q[0] : "");
   }).join("\n"));
   useEffect(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify({ text, opts })); } catch { /* sem storage */ } }, [text, opts]);
   useEffect(() => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); } catch { /* sem storage */ } }, [queue]);
@@ -193,8 +197,17 @@ export default function NameLabels() {
               <input value={opts.orderCode} onChange={e => up("orderCode", e.target.value)} placeholder="ex.: 251101ABC123"
                 style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "monospace" }} />
             </label>
-            <h3 style={{ fontSize: 15, marginBottom: 6 }}>Nomes</h3>
-            <p style={{ fontSize: 11, color: "var(--t3)", marginBottom: 10 }}>Um por linha: <b>Nome - Função</b>. Use <b>x3</b> no fim para repetir.</p>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <h3 style={{ fontSize: 15, flex: 1 }}>Nomes</h3>
+              {[[2, "2 linhas"], [3, "3 linhas"]].map(([n, l]) => (
+                <button key={n} className={opts.lines === n ? "bp" : "bs"} style={{ padding: "5px 10px", fontSize: 12 }} onClick={() => up("lines", n)}>{l}</button>
+              ))}
+            </div>
+            <p style={{ fontSize: 11, color: "var(--t3)", marginBottom: 10 }}>
+              {opts.lines === 3
+                ? <>Um por linha: <b>Cima - Nome - Baixo</b> (Times / {NAME_FONTS[opts.nameFont]?.label} / Times). Com só <b>Nome - Baixo</b> ou só o <b>Nome</b>, o resto vem dos padrões abaixo.</>
+                : <>Um por linha: <b>Nome - Função</b>.</>} Use <b>x3</b> no fim para repetir.
+            </p>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginBottom: 6 }}>
               {EMOJI_PALETTE.map(e => (
                 <button key={e} title="Inserir no cursor" onClick={() => insertEmoji(e)}
@@ -204,8 +217,15 @@ export default function NameLabels() {
             <button className="bs" style={{ padding: "5px 9px", fontSize: 12, marginBottom: 8 }} onClick={() => emojiOnAll(lastEmoji)}>Colocar {lastEmoji} em todos os nomes</button>
             <textarea ref={textRef} value={text} onChange={e => setText(e.target.value)} rows={12}
               style={{ width: "100%", padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "inherit", resize: "vertical" }} />
+            {opts.lines === 3 && (
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginTop: 10 }}>
+                <span style={{ width: 120 }}>Cima padrão</span>
+                <input value={opts.defaultTop} onChange={e => up("defaultTop", e.target.value)} placeholder="ex.: Padrinhos"
+                  style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13 }} />
+              </label>
+            )}
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)", marginTop: 10 }}>
-              <span style={{ width: 120 }}>Função padrão</span>
+              <span style={{ width: 120 }}>{opts.lines === 3 ? "Baixo padrão" : "Função padrão"}</span>
               <input value={opts.defaultRole} onChange={e => up("defaultRole", e.target.value)} placeholder="ex.: Madrinha"
                 style={{ flex: 1, padding: "7px 9px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13 }} />
             </label>
@@ -267,16 +287,18 @@ export default function NameLabels() {
             {num("Margem", "margin", "mm", 0.5)}
             {num("Espaço entre", "gap", "mm", 0.5)}
             {num("Nome", "nameSize", "pt", 0.5)}
-            {num("Função (Times)", "roleSize", "pt", 0.5)}
-            {num("Nome → função", "roleGap", "mm", 0.5)}
+            {opts.lines === 3 && num("Cima (Times)", "topSize", "pt", 0.5)}
+            {opts.lines === 3 && num("Cima → nome", "topGap", "mm", 0.5)}
+            {num(opts.lines === 3 ? "Baixo (Times)" : "Função (Times)", "roleSize", "pt", 0.5)}
+            {num(opts.lines === 3 ? "Nome → baixo" : "Nome → função", "roleGap", "mm", 0.5)}
             {num("Folga das pernas", "roleClear", "mm", 0.5)}
             {num("Cópias de cada", "copies", "×")}
             {num("Código do pedido", "codeSize", "pt", 0.5)}
             {num("Emoji (× texto)", "emojiScale", "×", 0.05)}
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
-              <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Função em MAIÚSCULAS
+              <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Linhas em Times em MAIÚSCULAS
             </label>
-            <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, cmyk: opts.cmyk, nameFont: opts.nameFont, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
+            <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, defaultRole: opts.defaultRole, orderCode: opts.orderCode, letter: opts.letter, cmyk: opts.cmyk, nameFont: opts.nameFont, lines: opts.lines, defaultTop: opts.defaultTop, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
           </div>
         </div>
 
