@@ -261,12 +261,38 @@ const svgPath = p => `<path transform="translate(${fmt(p.x)} ${fmt(p.y)})" d="${
 // Emojis de todas as etiquetas da folha, já na posição da folha (mm).
 export const sheetEmojis = sheet => sheet.placed.flatMap(p => (p.box.emojis || []).map(e => ({ ...e, x: p.x + e.x, y: p.y + e.y })));
 
+// Aplica `f(x, y) → [x, y]` a todos os pontos de um path absoluto M/L/Q/C/Z (fontkit, emoji-art).
+export function mapPath(d, f) {
+  const t = d.match(/[MLQCZ]|-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/gi) || [];
+  let out = "", i = 0;
+  while (i < t.length) {
+    const c = t[i++].toUpperCase();
+    const n = { M: 1, L: 1, Q: 2, C: 3, Z: 0 }[c] ?? 0;
+    const pts = [];
+    for (let k = 0; k < n; k++) { const [x, y] = f(parseFloat(t[i++]), parseFloat(t[i++])); pts.push(`${fmt(x)} ${fmt(y)}`); }
+    out += c + pts.join(" ");
+  }
+  return out;
+}
+
+// Etiqueta girada 90° anti-horário (o texto fica de pé, lido de baixo para cima): (x, y) → (y, −x).
+// Os emojis giram junto (`rot` faz o desenho girar dentro do quadrado deles).
+export function rotateBox(box) {
+  return {
+    ...box, rot: true,
+    d: mapPath(box.d, (x, y) => [y, -x]),
+    emojis: (box.emojis || []).map(e => ({ ...e, x: e.y, y: -e.x - e.s, rot: true })),
+    minX: box.minY, maxX: box.maxY, minY: -box.maxX, maxY: -box.minX,
+  };
+}
+const emojiShapeD = (e, s) => (e.rot ? mapPath(s.d, (u, v) => [v, 1 - u]) : s.d);
+
 // `art`: Map emoji → [{ d, fill }] (coordenadas 0–1), de emoji-art.mjs. Emoji ainda não carregado não aparece.
 export function sheetToSvg(sheet, { fill = "#000", codeFill = "#000", art = null } = {}) {
   const code = sheet.code ? `<g fill="${codeFill}">${svgPath(sheet.code)}</g>` : "";
   const emojis = sheetEmojis(sheet).map(e => {
     const shapes = art?.get(e.seq);
-    return shapes ? `<g transform="translate(${fmt(e.x)} ${fmt(e.y)}) scale(${fmt(e.s)})">${shapes.map(s => `<path fill="${s.fill}" d="${s.d}"/>`).join("")}</g>` : "";
+    return shapes ? `<g transform="translate(${fmt(e.x)} ${fmt(e.y)}) scale(${fmt(e.s)})">${shapes.map(s => `<path fill="${s.fill}" d="${emojiShapeD(e, s)}"/>`).join("")}</g>` : "";
   }).join("");
   // Artes enviadas (art-upload.mjs): a prévia da arte no lugar de cada cópia.
   const arts = sheet.placed.filter(p => p.box.art && p.box.preview).map(({ x, y, box: b }) => b.rot
@@ -345,7 +371,7 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
   });
   const artColor = arts.map(a => a.color).join(""), artMask = arts.map(a => a.mask).join("");
   const emojis = sheetEmojis(sheet).map(e => ({ e, shapes: art?.get(e.seq) })).filter(x => x.shapes);
-  const emojiPath = (e, s) => svgPathToPdf(s.d, e.x, e.y + oy, pageH, e.s) + "f\n";
+  const emojiPath = (e, s) => svgPathToPdf(emojiShapeD(e, s), e.x, e.y + oy, pageH, e.s) + "f\n";
   const masks = emojis.map(({ e, shapes }) => shapes.map(s => emojiPath(e, s)).join("")).join("");
   const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;

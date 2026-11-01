@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, rotateBox, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
-import { ART_KINDS, fitArtBoxes } from "../lib/art-upload.mjs";
+import { ART_KINDS, fitArtBoxes, planRotation } from "../lib/art-upload.mjs";
 import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
 
 const MM = 72 / 25.4; // mm → pt
@@ -24,7 +24,7 @@ const emptyPencil = () => [{ name: "", qty: 150 }, { name: "", qty: 150 }, { nam
 // Cada aba tem a sua configuração, rascunho e fila (o Lápis DTF UV é outro material).
 const VARIANTS = {
   names: { storeKey: STORE_KEY, queueKey: QUEUE_KEY, fonts: NAME_FONTS, defaults: {}, file: "fila-etiquetas-nome" },
-  dtf: { storeKey: "pencil_dtf_v1", queueKey: "pencil_dtf_queue_v1", fonts: PENCIL_FONTS, defaults: { nameFont: "cookie", nameSize: 24, maxWidth: 50 }, file: "fila-lapis-dtf-uv" },
+  dtf: { storeKey: "pencil_dtf_v1", queueKey: "pencil_dtf_queue_v1", fonts: PENCIL_FONTS, defaults: { nameFont: "cookie", nameSize: 24, maxWidth: 50, autoRotate: true }, file: "fila-lapis-dtf-uv" },
 };
 const EXAMPLE = "Ana Paula - Madrinha\nCarlos Eduardo - Padrinho\nMaria Clara - Dama de Honra";
 const COLOR_PRESETS = [
@@ -76,14 +76,25 @@ function layoutJob(text, opts, loaded) {
 }
 
 // Lápis DTF UV: cada nome vira `qty` etiquetas iguais (até 2 linhas, no máximo `maxWidth` mm).
+// Com autoRotate, cada nome escolhe quantas etiquetas vão deitadas e quantas em pé (giradas 90°)
+// para gastar menos altura de rolo; as em pé vêm primeiro, para não misturar alturas na mesma linha.
 function layoutPencilJob(names, opts, loaded) {
   const f = PENCIL_FONTS[opts.nameFont] || PENCIL_FONTS.cookie;
   const font = loaded.names[opts.nameFont] || Object.values(loaded.names)[0];
-  const labels = names.filter(n => n.name.trim()).flatMap(n => {
+  const W = opts.sheetW - 2 * opts.margin;
+  const upright = [], flat = [];
+  for (const n of names.filter(n => n.name.trim())) {
     const box = buildPencilLabel(n.name, font, { ...opts, upper: !!f.upper });
-    return box ? Array(Math.max(0, n.qty | 0)).fill(box) : [];
-  });
-  return packLabels(labels, opts, buildCode({ role: loaded.role }, opts));
+    const qty = Math.max(0, n.qty | 0);
+    if (!box || !qty) continue;
+    const w = box.maxX - box.minX, h = box.maxY - box.minY;
+    if (opts.autoRotate === false || w === h) { flat.push(...Array(qty).fill(box)); continue; }
+    const p = planRotation(qty, w, h, W, opts.gap);
+    const [tallBox, shortBox] = p.tallRot ? [rotateBox(box), box] : [box, rotateBox(box)];
+    upright.push(...Array(p.tall).fill(tallBox));
+    flat.push(...Array(p.short).fill(shortBox));
+  }
+  return packLabels([...upright, ...flat], opts, buildCode({ role: loaded.role }, opts));
 }
 
 // Arte enviada: `qty` cópias de w × h mm, com o código do pedido no canto, como as etiquetas.
@@ -267,7 +278,7 @@ export default function NameLabels({ variant = "names" }) {
   const pencilSheets = useMemo(() => fonts && isDtf ? layoutPencilJob(pencil, opts, fonts) : [], [fonts, pencil, opts, isDtf]);
   const artSheets = fonts && curArtJob ? layoutArtJob(curArtJob, fonts, curArt) : [];
   const sheets = mode === "art" ? artSheets : isDtf ? pencilSheets : nameSheets;
-  const rotatedCount = artSheets.reduce((n, s) => n + s.placed.filter(p => p.box.rot).length, 0);
+  const rotatedCount = sheets.reduce((n, s) => n + s.placed.filter(p => p.box.rot).length, 0);
   const layoutQueued = j => j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : j.kind === "dtf" ? layoutPencilJob(j.names, j.opts, fonts) : layoutJob(j.text, j.opts, fonts);
   const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: layoutQueued(j) })) : [], [fonts, queue, arts]); // eslint-disable-line react-hooks/exhaustive-deps
   const queueH = queueJobs.flatMap(j => j.sheets).reduce((h, s, i) => h + s.h + (i ? opts.gap : 0), 0);
@@ -503,6 +514,9 @@ export default function NameLabels({ variant = "names" }) {
       {num("Espaço entre", "gap", "mm", 0.5)}
       {num("Tamanho da fonte", "nameSize", "pt", 0.5)}
       {num("Largura máx. do nome", "maxWidth", "mm", 1)}
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
+        <input type="checkbox" checked={opts.autoRotate !== false} onChange={e => up("autoRotate", e.target.checked)} /> Girar nomes (em pé) para economizar material
+      </label>
       {num("Código do pedido", "codeSize", "pt", 0.5)}
       {num("Emoji (× texto)", "emojiScale", "×", 0.05)}
       <button className="bs" style={{ marginTop: 6, ...small }} onClick={() => setOpts({ ...DEFAULT_OPTS, ...V.defaults, orderCode: opts.orderCode, nameFont: opts.nameFont, letter: opts.letter, cmyk: opts.cmyk, whiteSpot: opts.whiteSpot, varnishSpot: opts.varnishSpot })}>Restaurar padrão</button>
@@ -596,7 +610,7 @@ export default function NameLabels({ variant = "names" }) {
         <div style={{ ...card, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
             <h3 style={{ fontSize: 15, flex: 1 }}>
-              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} girada${rotatedCount === 1 ? "" : "s"})` : ""}` : isDtf ? `${pencilCount} etiqueta${pencilCount === 1 ? "" : "s"}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
+              {mode === "art" ? `${cur && curArt ? cur.qty : 0} cópia${cur?.qty === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} girada${rotatedCount === 1 ? "" : "s"})` : ""}` : isDtf ? `${pencilCount} etiqueta${pencilCount === 1 ? "" : "s"}${rotatedCount ? ` (${rotatedCount} em pé)` : ""}` : `${entries.length} etiqueta${entries.length === 1 ? "" : "s"}`}
               {sheets.length > 0 && <span style={{ fontSize: 12, color: "var(--t2)", fontWeight: 400 }}> · {sheets.map(s => `${(s.w / 10).toFixed(1)} × ${(s.h / 10).toFixed(1)} cm`).join(" + ")}</span>}
             </h3>
             {mode !== "art" && <button className="bs" disabled={!sheets.length} onClick={exportSvg}>Baixar SVG</button>}
