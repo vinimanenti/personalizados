@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, rotateBox, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, PART_SEP, nameIndex, COLOR_PRESETS, PENCIL_COLORS, pencilInk, expandPencilRows, parsePencilList } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, rotateBox, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, stripIcons, setIcon, mapListNames, PART_SEP, nameIndex, COLOR_PRESETS, PENCIL_COLORS, pencilInk, expandPencilRows, parsePencilList } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
 import { ART_KINDS, fitArtBoxes, planRotation } from "../lib/art-upload.mjs";
 import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
@@ -184,6 +184,23 @@ export default function NameLabels({ variant = "names" }) {
   const parsedList = useMemo(() => parsePencilList(listText, listQty), [listText, listQty]);
   const pencilEntries = useMemo(() => expandPencilRows(pencilMode === "list" ? parsedList.rows : pencil), [pencilMode, parsedList, pencil]);
   const upPencil = (i, k, v) => setPencil(ps => ps.map((p, j) => (j === i ? { ...p, [k]: v } : p)));
+  // Ícones do lápis: clicar insere no último campo usado (no cursor); os botões aplicam em todos os nomes.
+  const pencilRefs = useRef([]), listRef = useRef(null), lastField = useRef(0); // número da linha ou "list"
+  const [pencilIcon, setPencilIcon] = useState("⭐");
+  const insertPencilIcon = icon => {
+    setPencilIcon(icon);
+    const f = lastField.current, el = f === "list" ? listRef.current : pencilRefs.current[f];
+    const val = f === "list" ? listText : pencil[f]?.name ?? "";
+    const a = el?.selectionStart ?? val.length, b = el?.selectionEnd ?? val.length;
+    const before = val.slice(0, a), ins = (before && !/\s$/.test(before) ? " " : "") + icon;
+    const next = before + ins + val.slice(b);
+    if (f === "list") setListText(next); else upPencil(f, "name", next);
+    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(a + ins.length, a + ins.length); });
+  };
+  const iconOnAll = fn => {
+    if (pencilMode === "list") setListText(t => mapListNames(t, fn));
+    else setPencil(ps => ps.map(p => (p.name.trim() ? { ...p, name: fn(p.name) } : p)));
+  };
 
   // ─── Modo Arquivo: arte enviada (PNG/JPG/SVG/PDF) com Branco e Verniz ───
   const [mode, setMode] = useState(() => (isDtf ? "dtf" : readJson(STORE_KEY, {}).mode || "names"));
@@ -502,6 +519,17 @@ export default function NameLabels({ variant = "names" }) {
         {PENCIL_FONTS[opts.nameFont]?.upper && " Arial Negrito sai sempre em MAIÚSCULAS."}
         {pencilMode === "rows" && " Cor \"Padrão\" segue a Cor da letra abaixo."}
       </p>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 2 }}>
+        {EMOJI_PALETTE.map(e => (
+          <button key={e} title="Inserir no cursor" onMouseDown={ev => ev.preventDefault()} onClick={() => insertPencilIcon(e)}
+            style={{ fontSize: 17, lineHeight: 1, padding: 4, background: pencilIcon === e ? "var(--inp)" : "none", border: `1px solid ${pencilIcon === e ? "var(--brd)" : "transparent"}`, borderRadius: 6, cursor: "pointer" }}>{e}</button>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button className="bs" style={small} onClick={() => iconOnAll(n => setIcon(n, pencilIcon, "before"))}>{pencilIcon} antes de todos</button>
+        <button className="bs" style={small} onClick={() => iconOnAll(n => setIcon(n, pencilIcon, "after"))}>{pencilIcon} depois de todos</button>
+        <button className="bs" style={small} onClick={() => iconOnAll(stripIcons)}>Tirar ícones</button>
+      </div>
       {pencilMode === "list" ? <>
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--t2)", flexWrap: "wrap" }}>
           <span>Quantidade de cada:</span>
@@ -510,7 +538,7 @@ export default function NameLabels({ variant = "names" }) {
           ))}
           <input type="number" min={1} value={listQty} onChange={e => setListQty(Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ ...field, width: 70 }} title="Personalizado" />
         </div>
-        <textarea value={listText} onChange={e => setListText(e.target.value)} rows={12} placeholder={"Ana Clara\nBia; 100\nCaio\nDudu; 150"}
+        <textarea ref={listRef} onFocus={() => { lastField.current = "list"; }} value={listText} onChange={e => setListText(e.target.value)} rows={12} placeholder={"Ana Clara\nBia; 100\nCaio\nDudu; 150"}
           style={{ width: "100%", padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 13, fontFamily: "inherit", resize: "vertical" }} />
         <p style={{ fontSize: 11, color: "var(--t3)" }}>
           Um nome por linha. Para mudar a quantidade de um nome, coloque <b>;</b> e o número (ex.: <b>Bia; 100</b>).
@@ -519,7 +547,7 @@ export default function NameLabels({ variant = "names" }) {
         {parsedList.errors.map(e => <p key={e} style={{ fontSize: 12, color: "#fbbf24" }}>{e} — fica com a quantidade de cada.</p>)}
       </> : pencil.map((p, i) => (
         <div key={i} style={{ display: "flex", flexDirection: "column", gap: 6, padding: 10, background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10 }}>
-          <input value={p.name} onChange={e => upPencil(i, "name", e.target.value)} placeholder={`Nome ${i + 1}`}
+          <input ref={el => { pencilRefs.current[i] = el; }} onFocus={() => { lastField.current = i; }} value={p.name} onChange={e => upPencil(i, "name", e.target.value)} placeholder={`Nome ${i + 1}`}
             style={{ padding: "7px 9px", background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 8, color: "var(--t1)", fontSize: 14 }} />
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--t2)" }}>
             {PENCIL_QTYS.map(q => (

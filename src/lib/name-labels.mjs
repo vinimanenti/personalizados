@@ -74,6 +74,21 @@ export function splitEmoji(text) {
 }
 export const emojisIn = text => splitEmoji(text).filter(s => s.emoji).map(s => s.text);
 
+// Ícones (emojis) no nome do lápis: tirar todos, ou pôr um antes/depois (trocando o que já houver).
+export const stripIcons = name => splitEmoji(name).filter(s => !s.emoji).map(s => s.text).join("").replace(/\s+/g, " ").trim();
+export function setIcon(name, icon, pos = "after") {
+  const base = stripIcons(name);
+  if (!base) return name;
+  return pos === "before" ? `${icon} ${base}` : `${base} ${icon}`;
+}
+// Aplica `fn` só ao nome de cada linha da lista, mantendo o "; quantidade".
+export function mapListNames(text, fn) {
+  return String(text).split(/\r?\n/).map(line => {
+    const m = line.match(/^(.*?)(\s*[;|\t].*)?$/);
+    return m[1].trim() ? fn(m[1]) + (m[2] || "") : line;
+  }).join("\n");
+}
+
 // Converte uma linha de texto em path SVG (mm) centralizado em x = 0, linha de base em y = baseY.
 // Cada emoji ocupa um quadrado de lado `emojiScale` × tamanho do texto, apoiado um pouco abaixo da
 // linha de base; vai em `emojis` como { seq, x, y (topo), s } para ser desenhado em cores.

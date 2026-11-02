@@ -76,3 +76,17 @@ test('each label is drawn in its own color; white names have no CMYK', () => {
   assert.deepEqual(c.match(/[\d.]+ [\d.]+ [\d.]+ [\d.]+ k/g), ['0 0.6 0 0 k', '1 1 1 1 k']);
   assert.equal(c.split('/CSWhite cs 1 scn')[1].split('f\n').length - 1, 3); // o branco vai em todas
 });
+
+import { stripIcons, setIcon, mapListNames } from '../src/lib/name-labels.mjs';
+
+test('icons: put before/after replacing existing ones, or strip them', () => {
+  assert.equal(setIcon('Ana Clara', '⭐'), 'Ana Clara ⭐');
+  assert.equal(setIcon('Ana Clara 💖', '⭐', 'before'), '⭐ Ana Clara');
+  assert.equal(stripIcons('🦋 Ana  Clara 💖'), 'Ana Clara');
+  assert.equal(setIcon('   ', '⭐'), '   ');
+});
+
+test('list: icon goes on the name, quantity stays', () => {
+  const NL = String.fromCharCode(10);
+  assert.equal(mapListNames(['Ana', 'Bia; 100', '', 'Caio | x30'].join(NL), n => setIcon(n, '⭐')), ['Ana ⭐', 'Bia ⭐; 100', '', 'Caio ⭐ | x30'].join(NL));
+});
