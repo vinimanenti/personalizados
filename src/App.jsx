@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import * as db from "./lib/db";
+import { getUsers, refreshUsers, updateUsers } from "./lib/users";
 const PrintLab = lazy(() => import("./PrintLab"));
 const NameLabels = lazy(() => import("./components/NameLabels"));
 import * as pdfjsLib from "pdfjs-dist";
@@ -551,21 +552,21 @@ const Calibration = ({ model, onUpdate }) => {
 
 /* ═══ App ═══ */
 /* ─── Login Screen ─── */
-const DEFAULT_USERS = { admin: { pass: "Vinishow434!", role: "admin" } };
-const getUsers = () => JSON.parse(localStorage.getItem("ss_users") || JSON.stringify(DEFAULT_USERS));
-const saveUsers = (u) => localStorage.setItem("ss_users", JSON.stringify(u));
+// Usuários: lista no Supabase com cópia local (src/lib/users.js).
 
 function LoginScreen({ onLogin }) {
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
   const [error, setError] = useState("");
+  useEffect(() => { refreshUsers(); }, []); // lista de usuários do Supabase
   const V = { "--bg": "#0f1117", "--card": "#181b24", "--inp": "#13151d", "--accent": "#e85d3a", "--t1": "#eaedf3", "--t2": "#7a8194", "--t3": "#4a5068", "--brd": "#262a38" };
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
     if (!user.trim() || !pass.trim()) { setError("Preencha todos os campos"); return; }
-    const users = getUsers();
-    const u = users[user.trim()];
+    let u = getUsers()[user.trim()];
+    // usuário criado há pouco em outro computador: busca a lista de novo antes de recusar
+    if (!u || u.pass !== pass) u = (await refreshUsers())[user.trim()];
     if (u && u.pass === pass) {
       localStorage.setItem("ss_session", JSON.stringify({ user: user.trim(), role: u.role, ts: Date.now() }));
       onLogin(user.trim());
@@ -611,6 +612,8 @@ export default function App() {
     return false;
   })();
   const [showUserMgmt, setShowUserMgmt] = useState(false);
+  const [, setUsersVersion] = useState(0);
+  useEffect(() => { if (showUserMgmt) refreshUsers().then(() => setUsersVersion(v => v + 1)); }, [showUserMgmt]);
   const [models, setModels] = useState(MODELS);
   const [selId, setSelId] = useState(null);
   const [tab, setTab] = useState("gallery");
@@ -1550,12 +1553,14 @@ export default function App() {
             const np = fd.get("newpass")?.trim();
             const nr = fd.get("newrole");
             if (!nu || !np) { alert("Preencha usuário e senha"); return; }
-            const users = getUsers();
-            if (users[nu]) { alert("Usuário já existe"); return; }
-            users[nu] = { pass: np, role: nr };
-            saveUsers(users);
-            e.target.reset();
-            setShowUserMgmt(false); setTimeout(() => setShowUserMgmt(true), 10);
+            const form = e.target;
+            updateUsers(users => {
+              if (users[nu]) throw new Error("Usuário já existe");
+              users[nu] = { pass: np, role: nr };
+            }).then(() => {
+              form.reset();
+              setShowUserMgmt(false); setTimeout(() => setShowUserMgmt(true), 10);
+            }).catch(err => alert(`Não foi possível criar o usuário: ${err.message}`));
           }} style={{ background: "var(--inp)", borderRadius: 12, padding: 16, marginBottom: 20, border: "1px solid var(--brd)" }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: "var(--t2)" }}>Criar novo usuário</div>
             <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
@@ -1588,17 +1593,16 @@ export default function App() {
                 <button onClick={() => {
                   const np = prompt(`Nova senha para "${name}":`);
                   if (!np?.trim()) return;
-                  const users = getUsers();
-                  users[name].pass = np.trim();
-                  saveUsers(users);
-                  alert("Senha alterada!");
+                  updateUsers(users => {
+                    if (!users[name]) throw new Error("usuário não existe mais");
+                    users[name].pass = np.trim();
+                  }).then(() => alert("Senha alterada!")).catch(err => alert(`Não foi possível alterar a senha: ${err.message}`));
                 }} style={{ background: "none", border: "1px solid var(--brd)", borderRadius: 6, padding: "4px 10px", color: "var(--t2)", cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Alterar senha</button>
                 {name !== "admin" && <button onClick={() => {
                   if (!confirm(`Remover usuário "${name}"?`)) return;
-                  const users = getUsers();
-                  delete users[name];
-                  saveUsers(users);
-                  setShowUserMgmt(false); setTimeout(() => setShowUserMgmt(true), 10);
+                  updateUsers(users => { delete users[name]; })
+                    .then(() => { setShowUserMgmt(false); setTimeout(() => setShowUserMgmt(true), 10); })
+                    .catch(err => alert(`Não foi possível remover o usuário: ${err.message}`));
                 }} style={{ background: "none", border: "1px solid rgba(248,113,113,.3)", borderRadius: 6, padding: "4px 10px", color: "#f87171", cursor: "pointer", fontSize: 11, fontFamily: "inherit" }}>Remover</button>}
               </div>
             </div>
