@@ -12,6 +12,7 @@ const FONT_FILES = { role: "times.ttf" };
 const NAME_FONTS = {
   greatvibes: { label: "Great Vibes", file: "greatvibes.ttf" },
   lobster: { label: "Lobster", file: "lobster.ttf" },
+  baguetscript: { label: "Baguet Script", file: "baguetscript.otf" },
 };
 // Fontes do Lápis DTF UV; `upper` = sempre em maiúsculas.
 const PENCIL_FONTS = {
