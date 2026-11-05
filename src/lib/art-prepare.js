@@ -1,13 +1,13 @@
 // Leitura das artes enviadas no navegador: tamanho natural, prévia, PDF vetorial (SVG/PDF) e a
 // máscara de Branco/Verniz pelo contorno (transparência da arte renderizada).
-import * as pdfjsLib from "pdfjs-dist";
+// Build "legacy" do pdfjs: a normal usa recursos de navegador muito novos (Promise.withResolvers,
+// URL.parse…) e falhava ao ler SVG/PDF em computadores com Chrome/Edge desatualizado.
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { jsPDF } from "jspdf";
 import "svg2pdf.js";
 import { artKind, svgSizeMM, alphaToStencil } from "./art-upload.mjs";
 
-if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).href;
-}
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.mjs", import.meta.url).href;
 
 const PT = 72 / 25.4;
 const MASK_PX = 2400; // lado maior da máscara (≈ 600 dpi numa arte de 10 cm)

@@ -230,7 +230,9 @@ export default function NameLabels({ variant = "names" }) {
       const id = `art-${Date.now()}`;
       const data = { name: file.name, type: file.type, bytes: new Uint8Array(await file.arrayBuffer()) };
       const p = await readArt(id, data);
-      await saveArtFile(id, data);
+      // Guardar no navegador só serve para a fila sobreviver a um recarregamento; se o navegador
+      // bloquear (janela anônima, dados de site bloqueados), a arte continua funcionando nesta sessão.
+      await saveArtFile(id, data).catch(e => setErr(`${file.name} foi carregado, mas o navegador não deixou guardá-lo (${e?.message || e}). Gere o PDF antes de recarregar a página.`));
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       const maxW = opts.sheetW - 2 * opts.margin;
       const k = p.w > maxW ? maxW / p.w : 1;
