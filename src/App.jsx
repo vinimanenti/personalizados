@@ -3,6 +3,9 @@ import * as db from "./lib/db";
 import { getUsers, refreshUsers, updateUsers } from "./lib/users";
 const PrintLab = lazy(() => import("./PrintLab"));
 const NameLabels = lazy(() => import("./components/NameLabels"));
+const Vectorize = lazy(() => import("./components/Vectorize"));
+const Upscale = lazy(() => import("./components/Upscale"));
+import { sendFiles } from "./lib/art-handoff";
 import * as pdfjsLib from "pdfjs-dist";
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).href;
 
@@ -27,38 +30,244 @@ const MODELS = [
   ...Array.from({ length: 31 }, (_, i) => defaultModel(`MOD${String(i + 1).padStart(3, "0")}`)),
 ];
 const STORES = ["TR Etiquetas", "Jd Adesivos", "Casa do Condi", "VM Adesivos", "IG Stickers"];
+const CONTOUR_MODELS = new Set(["MOD007", "MOD008", "MOD009"]); // models with text-contour die-cut
+const DARK_CONTOUR_MODELS = new Set(["MOD008"]); // contour models with black bg + white text
+const MULTI_VARIANT_MODELS = new Set(["MOD031"]); // models with 2 SVG variants + font selector
+// Font options for MULTI_VARIANT_MODELS (key = font file stem under public/fonts/, label = display name, family = CSS font-family)
+const FONT_OPTIONS = [
+  { key: "amatic", file: "amatic.ttf", family: "Amatic SC", label: "Amatic SC" },
+  { key: "creamcake", file: "creamcake.otf", family: "Cream Cake", label: "Cream Cake" },
+  { key: "farmhouse", file: "farmhouse.otf", family: "Farmhouse", label: "Farmhouse" },
+  { key: "fondyscript", file: "fondyscript.ttf", family: "FondyScript", label: "Fondy Script" },
+  { key: "greatvibes", file: "greatvibes.ttf", family: "Great Vibes", label: "Great Vibes" },
+  { key: "mtcorsiva", file: "mtcorsiva.ttf", family: "Monotype Corsiva", label: "Monotype Corsiva" },
+];
+// Preloaded base64 for @font-face embedding in generated SVGs
+const fontB64Map = {}; // { fontKey: base64String }
+let cookieFontB64 = null; // preloaded Cookie font base64 for SVG embedding
+let comfortaaFontB64 = null; // preloaded Comfortaa font base64 for SVG embedding
+let comfortaaBoldFontB64 = null; // preloaded Comfortaa Bold font base64
+// Cache for user-uploaded custom fonts (keyed by font-family name)
+// Populated on demand when a model with fontUrl is selected.
+const customFontB64Map = {}; // { fontUrl: { b64, format } } — keyed per-model via Supabase storage URL for isolation
 
 /* ─── SVG analysis ─── */
 const analyzeSvg = (svgText) => {
   const fieldMap = {};
-  const re = /<text\s[^>]*id="(campo_nome_\d+)"[^>]*x="([^"]*)"[^>]*y="([^"]*)"[^>]*>([^<]*)<\/text>/g;
-  let m;
-  while ((m = re.exec(svgText)) !== null) {
-    const [, name, x, y, content] = m;
-    if (!fieldMap[name]) fieldMap[name] = [];
-    fieldMap[name].push({ x: parseFloat(x), y: parseFloat(y), content: content.trim() });
+  let m; // shared cursor for regex exec loops throughout this function
+  // Parse via DOMParser so we can compose ancestor <g transform="..."> matrices —
+  // critical for CorelDraw exports like MOD016 where each <text> lives inside
+  // <g transform="matrix(1 0 0 1 TX TY)"> with local x="-5509.99" y="1279.91"
+  // identical across all 3 stickers. Without transforms the fields would all
+  // share the same local point and couldn't be matched to their sticker container.
+  const parseTransformLocal = (str) => {
+    let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+    if (!str) return M;
+    const compose = (A, B) => ({
+      a: A.a * B.a + A.c * B.b, b: A.b * B.a + A.d * B.b,
+      c: A.a * B.c + A.c * B.d, d: A.b * B.c + A.d * B.d,
+      e: A.a * B.e + A.c * B.f + A.e, f: A.b * B.e + A.d * B.f + A.f,
+    });
+    const opRe = /(matrix|translate|scale|rotate)\s*\(([^)]*)\)/gi;
+    let mm;
+    while ((mm = opRe.exec(str)) !== null) {
+      const op = mm[1].toLowerCase();
+      const n = mm[2].split(/[\s,]+/).filter(Boolean).map(Number);
+      let B = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+      if (op === "matrix" && n.length >= 6) B = { a: n[0], b: n[1], c: n[2], d: n[3], e: n[4], f: n[5] };
+      else if (op === "translate") B = { a: 1, b: 0, c: 0, d: 1, e: n[0] || 0, f: n[1] || 0 };
+      else if (op === "scale") { const sx = n[0] || 1; B = { a: sx, b: 0, c: 0, d: n[1] !== undefined ? n[1] : sx, e: 0, f: 0 }; }
+      else if (op === "rotate") { const r = (n[0] || 0) * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r); B = { a: cs, b: sn, c: -sn, d: cs, e: 0, f: 0 }; }
+      M = compose(M, B);
+    }
+    return M;
+  };
+  const ancestorMatrix = (el) => {
+    let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+    const compose = (A, B) => ({
+      a: A.a * B.a + A.c * B.b, b: A.b * B.a + A.d * B.b,
+      c: A.a * B.c + A.c * B.d, d: A.b * B.c + A.d * B.d,
+      e: A.a * B.e + A.c * B.f + A.e, f: A.b * B.e + A.d * B.f + A.f,
+    });
+    const chain = [];
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      const tr = cur.getAttribute && cur.getAttribute("transform");
+      if (tr) chain.unshift(parseTransformLocal(tr));
+      cur = cur.parentNode;
+    }
+    for (const t of chain) M = compose(M, t);
+    return M;
+  };
+  let _domDoc = null;
+  try { _domDoc = new DOMParser().parseFromString(svgText, "image/svg+xml"); } catch {}
+  const hasDom = _domDoc && _domDoc.getElementsByTagName("parsererror").length === 0;
+  if (hasDom) {
+    for (const el of Array.from(_domDoc.getElementsByTagName("text"))) {
+      const id = el.getAttribute("id") || "";
+      if (!/^campo_nome_\d+$/.test(id)) continue;
+      const lx = parseFloat(el.getAttribute("x"));
+      const ly = parseFloat(el.getAttribute("y"));
+      if (isNaN(lx) || isNaN(ly)) continue;
+      const M = ancestorMatrix(el);
+      // Store LOCAL coords (injectNames writes back into the same group, so it
+      // needs local coords). Tag each position with the ancestor matrix so the
+      // container-matching step below can project to world space when needed.
+      const content = (el.textContent || "").trim();
+      if (!fieldMap[id]) fieldMap[id] = [];
+      fieldMap[id].push({ x: lx, y: ly, content, _M: M });
+    }
+  } else {
+    // Regex fallback if DOMParser couldn't parse
+    const re = /<text\s[^>]*id="(campo_nome_\d+)"[^>]*x="([^"]*)"[^>]*y="([^"]*)"[^>]*>([^<]*)<\/text>/g;
+    while ((m = re.exec(svgText)) !== null) {
+      const [, name, x, y, content] = m;
+      if (!fieldMap[name]) fieldMap[name] = [];
+      fieldMap[name].push({ x: parseFloat(x), y: parseFloat(y), content: content.trim() });
+    }
+    const re2 = /<text\s[^>]*x="([^"]*)"[^>]*y="([^"]*)"[^>]*id="(campo_nome_\d+)"[^>]*>([^<]*)<\/text>/g;
+    while ((m = re2.exec(svgText)) !== null) {
+      const [, x, y, name, content] = m;
+      if (!fieldMap[name]) fieldMap[name] = [];
+      const px = parseFloat(x), py = parseFloat(y);
+      if (!fieldMap[name].some(e => e.x === px && e.y === py))
+        fieldMap[name].push({ x: px, y: py, content: content.trim() });
+    }
   }
-  const re2 = /<text\s[^>]*x="([^"]*)"[^>]*y="([^"]*)"[^>]*id="(campo_nome_\d+)"[^>]*>([^<]*)<\/text>/g;
-  while ((m = re2.exec(svgText)) !== null) {
-    const [, x, y, name, content] = m;
+
+  // Also detect paths with campo_nome id (CorelDraw sometimes exports text as path)
+  // Also handle grouped paths: <g id="campo_nome_X"><path d="..."/>...</g>
+  // Accept any id starting with campo_nome_ including CorelDraw duplicates like campo_nome_6_536
+  const pathRe = /<path\s[^>]*id="(campo_nome_[\w]+)"[^>]*\sd="([^"]+)"/g;
+  const pathRe2 = /<path\s[^>]*\sd="([^"]+)"[^>]*\sid="(campo_nome_[\w]+)"/g;
+  const groupRe = /<g\s[^>]*id="(campo_nome_[\w]+)"[^>]*>([\s\S]*?)<\/g>/g;
+  const computePathBBox = (d) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let curX = 0, curY = 0;
+    const numRe = /([MLCQSTAZHVmlcqstahvz])|(-?[0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)/gi;
+    let cmd = "M", tok;
+    const nums = [];
+    const flush = () => {
+      const updateXY = (x, y) => {
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      };
+      if (cmd === "M" || cmd === "L" || cmd === "T") {
+        for (let i = 0; i < nums.length - 1; i += 2) { curX = nums[i]; curY = nums[i + 1]; updateXY(curX, curY); }
+      } else if (cmd === "m" || cmd === "l" || cmd === "t") {
+        for (let i = 0; i < nums.length - 1; i += 2) { curX += nums[i]; curY += nums[i + 1]; updateXY(curX, curY); }
+      } else if (cmd === "C") {
+        for (let i = 0; i < nums.length - 5; i += 6) { curX = nums[i + 4]; curY = nums[i + 5]; updateXY(nums[i], nums[i + 1]); updateXY(nums[i + 2], nums[i + 3]); updateXY(curX, curY); }
+      } else if (cmd === "c") {
+        for (let i = 0; i < nums.length - 5; i += 6) { updateXY(curX + nums[i], curY + nums[i + 1]); updateXY(curX + nums[i + 2], curY + nums[i + 3]); curX += nums[i + 4]; curY += nums[i + 5]; updateXY(curX, curY); }
+      } else if (cmd === "Q" || cmd === "S") {
+        for (let i = 0; i < nums.length - 3; i += 4) { updateXY(nums[i], nums[i + 1]); curX = nums[i + 2]; curY = nums[i + 3]; updateXY(curX, curY); }
+      } else if (cmd === "q" || cmd === "s") {
+        for (let i = 0; i < nums.length - 3; i += 4) { updateXY(curX + nums[i], curY + nums[i + 1]); curX += nums[i + 2]; curY += nums[i + 3]; updateXY(curX, curY); }
+      } else if (cmd === "H") { for (const n of nums) { curX = n; updateXY(curX, curY); } }
+      else if (cmd === "h") { for (const n of nums) { curX += n; updateXY(curX, curY); } }
+      else if (cmd === "V") { for (const n of nums) { curY = n; updateXY(curX, curY); } }
+      else if (cmd === "v") { for (const n of nums) { curY += n; updateXY(curX, curY); } }
+      nums.length = 0;
+    };
+    while ((tok = numRe.exec(d)) !== null) {
+      if (tok[1]) { flush(); cmd = tok[1]; }
+      else nums.push(parseFloat(tok[2]));
+    }
+    flush();
+    return isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+  };
+  const addPathField = (name, d, content = "") => {
+    if (fieldMap[name]) return; // text version wins
+    const bb = computePathBBox(d);
+    if (!bb) return;
+    // y for <text> is the baseline. For typical Latin text, baseline is near bottom of glyphs.
+    // Use maxY (bottom of path) as approximation of baseline.
+    const x = bb.minX, y = bb.maxY;
     if (!fieldMap[name]) fieldMap[name] = [];
-    const px = parseFloat(x), py = parseFloat(y);
-    if (!fieldMap[name].some(e => e.x === px && e.y === py))
-      fieldMap[name].push({ x: px, y: py, content: content.trim() });
+    fieldMap[name].push({ x, y, content: content.trim(), _fromPath: true, _bbox: bb });
+  };
+  while ((m = pathRe.exec(svgText)) !== null) addPathField(m[1], m[2]);
+  while ((m = pathRe2.exec(svgText)) !== null) addPathField(m[2], m[1]);
+
+  // CorelDraw text-to-curves: each letter becomes a separate <path>. The first letter gets
+  // id="campo_nome_X", the rest get sequential ids like "_1", "_2", ..., "_10" or suffixed
+  // "_1_260". We scan sequentially and group these letter-paths with their parent campo_nome.
+  const fieldSiblings = {}; // { campo_nome_1: ["_1", "_2", ...], ... }
+  const allPathRe = /<path\s[^>]*id="([^"]+)"[^>]*\sd="([^"]+)"[^>]*\/>/g;
+  let curField = null;
+  let pm2;
+  while ((pm2 = allPathRe.exec(svgText)) !== null) {
+    const pid = pm2[1], pd = pm2[2];
+    if (/^campo_nome_/.test(pid)) {
+      curField = pid;
+      if (!fieldSiblings[curField]) fieldSiblings[curField] = [];
+    } else if (curField && /^_\d+(_\d+)?$/.test(pid)) {
+      fieldSiblings[curField].push(pid);
+      // Expand the parent's bbox to include this letter-path
+      const bb = computePathBBox(pd);
+      if (bb && fieldMap[curField] && fieldMap[curField][0]._bbox) {
+        const pbox = fieldMap[curField][0]._bbox;
+        pbox.minX = Math.min(pbox.minX, bb.minX);
+        pbox.minY = Math.min(pbox.minY, bb.minY);
+        pbox.maxX = Math.max(pbox.maxX, bb.maxX);
+        pbox.maxY = Math.max(pbox.maxY, bb.maxY);
+        fieldMap[curField][0].x = pbox.minX;
+        fieldMap[curField][0].y = pbox.maxY;
+      }
+    } else {
+      curField = null;
+    }
   }
-  const fields = Object.keys(fieldMap).sort((a, b) => parseInt(a.split("_")[2]) - parseInt(b.split("_")[2]))
-    .map(name => ({ name, occurrences: fieldMap[name].length, positions: fieldMap[name] }));
+  // Grouped paths: use combined bbox of all inner paths
+  while ((m = groupRe.exec(svgText)) !== null) {
+    const gName = m[1], gInner = m[2];
+    if (fieldMap[gName]) continue;
+    let gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity;
+    const innerPath = /<path\s[^>]*\sd="([^"]+)"/g;
+    let pm;
+    while ((pm = innerPath.exec(gInner)) !== null) {
+      const bb = computePathBBox(pm[1]);
+      if (bb) { gMinX = Math.min(gMinX, bb.minX); gMinY = Math.min(gMinY, bb.minY); gMaxX = Math.max(gMaxX, bb.maxX); gMaxY = Math.max(gMaxY, bb.maxY); }
+    }
+    if (isFinite(gMinX)) {
+      fieldMap[gName] = [{ x: gMinX, y: gMaxY, content: "", _fromPath: true, _bbox: { minX: gMinX, minY: gMinY, maxX: gMaxX, maxY: gMaxY } }];
+    }
+  }
+  // Sort fields: primarily by source order (y then x of first occurrence) — works for both
+  // well-numbered ids and CorelDraw-duplicated ids like campo_nome_6_536
+  const fields = Object.keys(fieldMap).sort((a, b) => {
+    const pa = fieldMap[a][0], pb = fieldMap[b][0];
+    const parts = s => s.split("_").slice(2).map(p => parseInt(p) || 0);
+    const na = parts(a), nb = parts(b);
+    for (let i = 0; i < Math.max(na.length, nb.length); i++) {
+      const da = na[i] || 0, db = nb[i] || 0;
+      if (da !== db) return da - db;
+    }
+    if (Math.abs(pa.y - pb.y) > 50) return pa.y - pb.y;
+    return pa.x - pb.x;
+  }).map(name => ({ name, occurrences: fieldMap[name].length, positions: fieldMap[name] }));
 
   // Detect fnt class PER FIELD for multi-type layouts
   const fieldFntMap = {}; // { campo_nome_1: "fnt1", campo_nome_2: "fnt0", ... }
+  // Find the FIRST fnt class that actually exists in CSS (fallback for path fields)
+  const cssClassRe = /\.(fnt\d+)\s*\{/g;
+  const availableFntClasses = [];
+  let ccm;
+  while ((ccm = cssClassRe.exec(svgText)) !== null) availableFntClasses.push(ccm[1]);
+  const defaultFnt = availableFntClasses[0] || "fnt0";
   for (const f of fields) {
-    // Try both attribute orders: id before class, and class before id
+    // Try both attribute orders: id before class, and class before id (for <text>)
     const re1 = new RegExp(`<text[^>]*id="${f.name}"[^>]*class="([^"]*)"`);
     const re2cls = new RegExp(`<text[^>]*class="([^"]*)"[^>]*id="${f.name}"`);
-    const pm = svgText.match(re1) || svgText.match(re2cls);
+    // Also check <path> and <g> elements (when text was exported as curves)
+    const re3 = new RegExp(`<path[^>]*id="${f.name}"[^>]*class="([^"]*)"`);
+    const re4 = new RegExp(`<path[^>]*class="([^"]*)"[^>]*id="${f.name}"`);
+    const re5 = new RegExp(`<g[^>]*id="${f.name}"[^>]*class="([^"]*)"`);
+    const pm = svgText.match(re1) || svgText.match(re2cls) || svgText.match(re3) || svgText.match(re4) || svgText.match(re5);
     const cls = pm ? pm[1] : "";
     const fntMatch = cls.match(/fnt(\d+)/);
-    fieldFntMap[f.name] = fntMatch ? `fnt${fntMatch[1]}` : "fnt0";
+    fieldFntMap[f.name] = fntMatch ? `fnt${fntMatch[1]}` : defaultFnt;
   }
 
   // Extract font-size per fnt class
@@ -86,6 +295,14 @@ const analyzeSvg = (svgText) => {
   // Determine group size (how many types per sticker)
   const groupSize = uniqueSizes.length > 1 ? uniqueSizes.length : 1;
 
+  // Default maxWidth scales with viewBox — CorelDraw exports use viewBox ~10000+,
+  // Illustrator exports often use ~300. A fixed default like 3600 was too small for
+  // the former and absurdly too big for the latter. Use ~25% of viewBox width as a
+  // sane starting point (the user calibrates from there).
+  const vbMatchW = svgText.match(/viewBox="[^"]*\s([0-9.]+)\s[0-9.]+"/);
+  const vbWidth = vbMatchW ? parseFloat(vbMatchW[1]) : 10000;
+  const defaultMaxW = Math.round(vbWidth * 0.25);
+
   // If multiple types exist, assign type by position within repeating group
   const fieldTypes = []; // Array of { label, fontSize, maxWidth, fontFamily, fieldNames[] }
   if (groupSize > 1) {
@@ -108,7 +325,7 @@ const analyzeSvg = (svgText) => {
         label: `Tipo ${t + 1}`,
         fontSize: sz,
         origFontSize: sz,
-        maxWidth: 3600,
+        maxWidth: defaultMaxW,
         fontFamily: fntFamilyMap[cls] || fontFamily,
         fieldNames: fNames,
       });
@@ -121,7 +338,7 @@ const analyzeSvg = (svgText) => {
       label: "Tipo 1",
       fontSize,
       origFontSize: fontSize,
-      maxWidth: 3600,
+      maxWidth: defaultMaxW,
       fontFamily,
       fieldNames: fields.map(f => f.name),
     });
@@ -156,19 +373,28 @@ const analyzeSvg = (svgText) => {
 
   // Detect sticker boundary shapes (rects and circles) to find true center of each sticker area
   const containers = []; // [{cx, cy, x, y, w, h, type}]
+  // Size thresholds scale with the viewBox — CorelDraw exports use viewBox ~10000+,
+  // Illustrator often ~300. Fixed thresholds of 100-200 would reject every shape on
+  // small templates or accept noise on big ones.
+  const vbSz = svgText.match(/viewBox="[^"]*\s([0-9.]+)\s([0-9.]+)"/);
+  const vbW = vbSz ? parseFloat(vbSz[1]) : 10000;
+  const vbH = vbSz ? parseFloat(vbSz[2]) : 10000;
+  const minShapeW = vbW * 0.05; // at least 5% of viewBox width
+  const minShapeH = vbH * 0.03;
+  const minCircleR = Math.min(vbW, vbH) * 0.05;
   // Rectangles
   const rectRe = /<rect[^>]*\bx="([^"]*)"[^>]*\by="([^"]*)"[^>]*\bwidth="([^"]*)"[^>]*\bheight="([^"]*)"/g;
   let rm;
   while ((rm = rectRe.exec(svgText)) !== null) {
     const rx = parseFloat(rm[1]), ry = parseFloat(rm[2]), rw = parseFloat(rm[3]), rh = parseFloat(rm[4]);
-    if (rw > 500 && rh > 500) containers.push({ x: rx, y: ry, w: rw, h: rh, cx: rx + rw / 2, cy: ry + rh / 2, type: "rect" });
+    if (rw > minShapeW && rh > minShapeH) containers.push({ x: rx, y: ry, w: rw, h: rh, cx: rx + rw / 2, cy: ry + rh / 2, type: "rect" });
   }
   // Circles — deduplicate by center (CorelDraw often doubles circles for stroke+fill)
   const circRe = /<circle[^>]*\bcx="([^"]*)"[^>]*\bcy="([^"]*)"[^>]*\br="([^"]*)"/g;
   const seenCircles = new Set();
   while ((rm = circRe.exec(svgText)) !== null) {
     const cx = parseFloat(rm[1]), cy = parseFloat(rm[2]), r = parseFloat(rm[3]);
-    if (r > 200) {
+    if (r > minCircleR) {
       const key = `${Math.round(cx)}_${Math.round(cy)}`;
       if (!seenCircles.has(key)) {
         seenCircles.add(key);
@@ -177,10 +403,60 @@ const analyzeSvg = (svgText) => {
     }
   }
 
-  // If we have one big rect + multiple circles, filter out the big rect (it's the page border)
+  // ClipPaths — extract bounding box from path data inside <clipPath> (organic sticker shapes)
+  // Reuse computePathBBox (which correctly handles cubic/quadratic Bezier per SVG spec)
+  if (containers.length < fields.length) {
+    const clipRe = /<clipPath[^>]*>[\s\S]*?<path\s[^>]*d="([^"]+)"[\s\S]*?<\/clipPath>/g;
+    let cm;
+    while ((cm = clipRe.exec(svgText)) !== null) {
+      const bb = computePathBBox(cm[1]);
+      if (!bb) continue;
+      const cw = bb.maxX - bb.minX, ch = bb.maxY - bb.minY;
+      if (cw > minShapeW && ch > minShapeH) {
+        const key = `${Math.round(bb.minX + cw / 2)}_${Math.round(bb.minY + ch / 2)}`;
+        if (!containers.some(c => `${Math.round(c.cx)}_${Math.round(c.cy)}` === key)) {
+          containers.push({ x: bb.minX, y: bb.minY, w: cw, h: ch, cx: bb.minX + cw / 2, cy: bb.minY + ch / 2, type: "clip" });
+        }
+      }
+    }
+  }
+
+  // Cut paths (<path class="...strN...">) — each sticker's cut outline is a
+  // dedicated vector path with the CutContour stroke class. Illustrator exports
+  // don't emit <rect>/<circle>/<clipPath> for sticker bounds, so these are our
+  // only reliable container source on those templates (e.g. new MOD017).
+  if (containers.length < fields.length) {
+    const strPathRe = /<path\s[^>]*class="[^"]*\bstr\d+\b[^"]*"[^>]*\bd="([^"]+)"/g;
+    const strPathRe2 = /<path\s[^>]*\bd="([^"]+)"[^>]*class="[^"]*\bstr\d+\b[^"]*"/g;
+    const seenCuts = new Set();
+    const addFromMatch = (d) => {
+      const bb = computePathBBox(d);
+      if (!bb) return;
+      const cw = bb.maxX - bb.minX, ch = bb.maxY - bb.minY;
+      if (cw <= minShapeW || ch <= minShapeH) return;
+      const key = `${Math.round(bb.minX + cw / 2)}_${Math.round(bb.minY + ch / 2)}`;
+      if (seenCuts.has(key)) return;
+      seenCuts.add(key);
+      if (!containers.some(c => `${Math.round(c.cx)}_${Math.round(c.cy)}` === key)) {
+        containers.push({ x: bb.minX, y: bb.minY, w: cw, h: ch, cx: bb.minX + cw / 2, cy: bb.minY + ch / 2, type: "cut" });
+      }
+    };
+    let mm;
+    while ((mm = strPathRe.exec(svgText)) !== null) addFromMatch(mm[1]);
+    while ((mm = strPathRe2.exec(svgText)) !== null) addFromMatch(mm[1]);
+  }
+
+  // Prefer the shape collection that matches the number of fields best.
+  // Cut-path containers are Illustrator's equivalent of CorelDraw clipPaths.
   const circles = containers.filter(c => c.type === "circle");
+  const clips = containers.filter(c => c.type === "clip");
+  const cuts = containers.filter(c => c.type === "cut");
   const rects = containers.filter(c => c.type === "rect");
-  const shapes = circles.length >= fields.length ? circles : (rects.length > 1 ? rects : containers);
+  const shapes =
+    circles.length >= fields.length ? circles :
+    clips.length   >= fields.length ? clips   :
+    cuts.length    >= fields.length ? cuts    :
+    (rects.length > 1 ? rects : containers);
 
   // Compute text centers: use containing shape center if found, else fallback to glyph measurement
   const measureW = (text, ff, fs) => {
@@ -192,19 +468,45 @@ const analyzeSvg = (svgText) => {
 
   const textCenters = {};
   for (const f of fields) {
-    const fx = f.positions[0].x;
-    const fy = f.positions[0].y;
-    // Find closest shape whose center is nearest to this field
-    let best = null, bestDist = Infinity;
+    const fx = f.positions[0].x; // LOCAL x (inside any ancestor <g transform>)
+    const fy = f.positions[0].y; // LOCAL y
+    const M = f.positions[0]._M; // ancestor matrix (undefined for root-level texts)
+    // Project local text point into world space for container matching.
+    const wx = M ? (M.a * fx + M.c * fy + M.e) : fx;
+    const wy = M ? (M.b * fx + M.d * fy + M.f) : fy;
+
+    // Find the SMALLEST container that contains the WORLD-space text point.
+    // This lets each sticker's text match its own cut-path/clipPath even when the
+    // text's local coords are identical across stickers (MOD016 pattern).
+    let best = null, bestArea = Infinity;
     for (const s of shapes) {
-      const dx = fx - s.cx, dy = fy - s.cy;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < bestDist) { bestDist = dist; best = s; }
+      const contains = wx >= s.x && wx <= s.x + s.w && wy >= s.y && wy <= s.y + s.h;
+      if (contains) {
+        const area = s.w * s.h;
+        if (area < bestArea) { bestArea = area; best = s; }
+      }
     }
-    if (best && bestDist < best.w) {
-      textCenters[f.name] = best.cx;
+    // Fallback: nearest center by Euclidean distance (still in world space)
+    if (!best) {
+      let bestDist = Infinity;
+      for (const s of shapes) {
+        const dx = wx - s.cx, dy = wy - s.cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestDist) { bestDist = dist; best = s; }
+      }
+    }
+    if (best) {
+      // textCenters must be in the SAME coord system injectNames writes into
+      // (i.e. local, inside the ancestor group). Invert the ancestor transform's
+      // x component: local_x = (world_cx - c*local_y - e) / a. For typical
+      // CorelDraw translate-only matrices (a=1, c=0), this reduces to cx - e.
+      if (M && Math.abs(M.a) > 1e-9) {
+        textCenters[f.name] = (best.cx - M.c * fy - M.e) / M.a;
+      } else {
+        textCenters[f.name] = best.cx;
+      }
     } else {
-      // Fallback: glyph-based center
+      // Fallback: glyph-based center (local coord)
       const fntCls = fieldFntMap[f.name];
       const ff = fntFamilyMap[fntCls] || fontFamily;
       const fs = fntSizeMap[fntCls] || fontSize;
@@ -213,7 +515,12 @@ const analyzeSvg = (svgText) => {
     }
   }
 
-  return { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps };
+  // Strip internal _M matrix annotation from positions before returning — it was
+  // only needed for container matching above and would bloat the serialized model.
+  for (const f of fields) {
+    f.positions = f.positions.map(({ _M, ...rest }) => rest);
+  }
+  return { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps, fieldFntMap, fieldSiblings };
 };
 
 /* ─── SVG font text width (uses embedded glyph advances — precise) ─── */
@@ -258,6 +565,7 @@ const injectNames = (svgText, namesList, model, fontOverrides = {}, posOverrides
   const ft = model.fieldTypes || [];
   const fpt = model.fieldPerType || {};
   const agm = model.allGlyphMaps || {};
+  const isContour = CONTOUR_MODELS.has(model.id);
 
   fieldNames.forEach((fieldName, idx) => {
     const name = idx < namesList.length ? namesList[idx] : "";
@@ -269,61 +577,233 @@ const injectNames = (svgText, namesList, model, fontOverrides = {}, posOverrides
     const typeFontFamily = typeConfig.fontFamily || model.fontFamily;
     const origFontSize = typeConfig.origFontSize || typeFontSize;
 
-    const fieldFontSize = fontOverrides[idx] !== undefined ? fontOverrides[idx] : typeFontSize;
+    let fieldFontSize = fontOverrides[idx] !== undefined ? fontOverrides[idx] : typeFontSize;
     const fieldMaxWidth = typeMaxWidth;
-    const lines = breakLines(name, typeFontFamily, fieldFontSize, fieldMaxWidth);
+    // Use fontOverride family for measurement so auto-fit/line-break matches rendered font
+    const measureFamily = model.fontOverride || typeFontFamily;
+    let lines = breakLines(name, measureFamily, fieldFontSize, fieldMaxWidth);
     const field = model.fields[idx];
     if (!field) return;
 
+    // Auto-fit: shrink font size until the text fits the available width of
+    // the sticker. Works regardless of font family (important for MOD031 where
+    // the user picks between fonts with wildly different character widths —
+    // Great Vibes/Cookie ≫ Comfortaa at the same nominal size). Mirrors the
+    // logic of the Lapis Python generator: start at base size, reduce in small
+    // steps until it fits, floor at a percentage of the original.
+    if (name.trim()) {
+      const cx = tc[fieldName];
+      if (cx) {
+        const allCenters = [...new Set(Object.values(tc))].sort((a, b) => a - b);
+        let halfW = 0;
+        if (allCenters.length > 1) {
+          const ci = allCenters.indexOf(cx);
+          const dLeft  = ci > 0                      ? cx - allCenters[ci - 1] : Infinity;
+          const dRight = ci < allCenters.length - 1  ? allCenters[ci + 1] - cx : Infinity;
+          halfW = Math.min(dLeft, dRight) * 0.48;
+        }
+        const vbMatch = svgText.match(/viewBox="[^"]*\s([0-9.]+)\s[0-9.]+"/);
+        const vbW = vbMatch ? parseFloat(vbMatch[1]) : 0;
+        if (allCenters.length <= 1 && vbW > 0) halfW = vbW * 0.42;
+        if (halfW > 0) {
+          const availW = halfW * 2;
+          // Use the tighter of fieldMaxWidth (user-calibrated) or the physical
+          // space between sticker centers, so fonts that blow up (Great Vibes)
+          // shrink based on real geometry, not just calibration number.
+          const targetW = fieldMaxWidth ? Math.min(fieldMaxWidth, availW) : availW;
+          const maxLineW = () => Math.max(...lines.map(l => measureText(l, measureFamily, fieldFontSize)));
+          // Floor: 25% of original, never below 10px. Enough headroom to fit
+          // even very expansive script fonts without becoming illegible.
+          const minSize = Math.max(10, origFontSize * 0.25);
+          // Step: 4% shrink per iteration. With 200 max iterations, can scale
+          // down to ~0.03× of original if needed (way beyond the 25% floor).
+          let tries = 0;
+          while (maxLineW() > targetW && fieldFontSize > minSize && tries < 200) {
+            fieldFontSize *= 0.96;
+            lines = breakLines(name, measureFamily, fieldFontSize, targetW);
+            tries++;
+          }
+          // If still overflowing at the minimum size, let it overflow slightly
+          // rather than shrinking into illegibility — the operator can bump the
+          // calibration width up if this happens often.
+        }
+      }
+    }
+
     const customSize = Math.abs(fieldFontSize - origFontSize) > 1;
-    const sizeStyle = customSize ? ` style="font-size:${fieldFontSize}px"` : "";
+    const fontOverride = model.fontOverride; // optional CSS family override (MOD031)
+    const styleParts = [];
+    if (customSize) styleParts.push(`font-size:${fieldFontSize}px`);
+    if (fontOverride) styleParts.push(`font-family:'${fontOverride}'`);
+    const sizeStyle = styleParts.length ? ` style="${styleParts.join(';')}"` : "";
 
     const removeRe = new RegExp(`<text\\s[^>]*id="${fieldName}"[^>]*>[^<]*<\\/text>`, "g");
-    const matches = [...svg.matchAll(removeRe)];
-    if (matches.length === 0) return;
+    let matches = [...svg.matchAll(removeRe)];
+    // Fallback: if the field was exported as <path> (CorelDraw sometimes does this for text)
+    // or as a <g id="..."> containing paths, match and remove those instead.
+    let isPathField = false;
+    let removeRegexes = [removeRe];
+    if (matches.length === 0) {
+      const pathRe = new RegExp(`<path\\s[^>]*id="${fieldName}"[^>]*\\/>`, "g");
+      const pathRe2 = new RegExp(`<path\\s[^>]*id="${fieldName}"[^>]*>[^<]*<\\/path>`, "g");
+      const groupRe = new RegExp(`<g\\s[^>]*id="${fieldName}"[^>]*>[\\s\\S]*?<\\/g>`, "g");
+      matches = [...svg.matchAll(pathRe), ...svg.matchAll(pathRe2), ...svg.matchAll(groupRe)];
+      if (matches.length === 0) return;
+      isPathField = true;
+      removeRegexes = [pathRe, pathRe2, groupRe];
+    }
 
     const firstPos = field.positions[0];
-    const baseY = firstPos.y;
+    // Vertical placement: when the SVG placeholder spans multiple <text> lines
+    // with the same id (e.g. MOD018 has "PERSONALIZE" + "AQUI" stacked), using
+    // only the first line's y leaves the replacement text visually above the
+    // sticker's vertical center. Average the y's so a single-line name lands on
+    // the visual midpoint of the original two-line block.
+    const baseY = field.positions.length > 1
+      ? field.positions.reduce((s, p) => s + p.y, 0) / field.positions.length
+      : firstPos.y;
     const classMatch = matches[0][0].match(/class="([^"]*)"/);
-    const cls = classMatch ? classMatch[1] : "fil4 fnt0";
+    // Build class: path fields need fnt class appended (path only has fil)
+    let cls = classMatch ? classMatch[1] : "fil4 fnt0";
+    if (isPathField && !/fnt\d+/.test(cls)) {
+      // Path has fil but no fnt - append the fnt class detected in analyzeSvg
+      const fntCls = model.fieldFntMap?.[fieldName] || "fnt0";
+      cls = `${cls} ${fntCls}`.trim();
+    }
     const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
     // Text area center for this field — from sticker rect center or template measurement
     const xOffset = posOverrides[idx] || 0;
     const centerX = (tc[fieldName] || (firstPos.x + 1500)) + xOffset;
 
-    // Use text-anchor="middle" for precise browser-native centering
+    // Helper to build a single text tag
+    const mkText = (x, y, id, extraStyle, content, dataAttr) => {
+      const idAttr = id ? ` id="${id}"` : "";
+      const da2 = dataAttr ? ` ${dataAttr}` : "";
+      const st = extraStyle ? ` style="${extraStyle}"` : sizeStyle;
+      return `<text x="${x.toFixed(2)}" y="${y}" ${idAttr} class="${cls}" text-anchor="middle"${st}${da2}>${esc(content)}</text>`;
+    };
+
+    // Build replacement — for contour models, add halo + cut layers behind text
     let replacement;
+    const buildLine = (x, y, id, text) => {
+      if (isContour && name.trim()) {
+        const isDark = DARK_CONTOUR_MODELS.has(model.id);
+        const haloW = fieldFontSize * 0.45;
+        const cutW = fieldFontSize * 0.02;
+        const cutOuterW = haloW + cutW * 2;
+        const haloColor = isDark ? "black" : "white";
+        const textColor = isDark ? "white" : null;
+        const cutStyle = `paint-order:stroke;stroke:#EC2A90;stroke-width:${cutOuterW.toFixed(1)}px;stroke-linejoin:round;stroke-linecap:round;fill:none${customSize ? ";font-size:" + fieldFontSize + "px" : ""}`;
+        const haloStyle = `paint-order:stroke;stroke:${haloColor};stroke-width:${haloW.toFixed(1)}px;stroke-linejoin:round;stroke-linecap:round;fill:${haloColor}${customSize ? ";font-size:" + fieldFontSize + "px" : ""}`;
+        const textStyle = (customSize || textColor) ? [customSize ? `font-size:${fieldFontSize}px` : "", textColor ? `fill:${textColor}` : ""].filter(Boolean).join(";") : null;
+        return [
+          mkText(x, y, null, cutStyle, text, 'data-contour="cut"'),
+          mkText(x, y, null, haloStyle, text, 'data-contour="halo"'),
+          mkText(x, y, id, textStyle, text, null),
+        ].join("\n  ");
+      }
+      return mkText(x, y, id, null, text, null);
+    };
+
     if (lines.length === 1) {
-      replacement = `<text x="${centerX.toFixed(2)}" y="${baseY}" id="${fieldName}" class="${cls}" text-anchor="middle"${sizeStyle}>${esc(lines[0])}</text>`;
+      replacement = buildLine(centerX, baseY, fieldName, lines[0]);
     } else {
       const lineSpacing = fieldFontSize * 0.95;
       const totalHeight = lineSpacing * (lines.length - 1);
       const startY = baseY - totalHeight / 2;
       replacement = lines.map((line, li) => {
-        return `<text x="${centerX.toFixed(2)}" y="${(startY + li * lineSpacing).toFixed(2)}" id="${fieldName}" class="${cls}" text-anchor="middle"${sizeStyle}>${esc(line)}</text>`;
+        const y = startY + li * lineSpacing;
+        return buildLine(centerX, y.toFixed(2), fieldName, line);
       }).join("\n  ");
     }
 
     let replaced = false;
-    svg = svg.replace(removeRe, (match) => {
-      if (!replaced) { replaced = true; return replacement; }
-      return "";
-    });
+    for (const re of removeRegexes) {
+      svg = svg.replace(re, (match) => {
+        if (!replaced) { replaced = true; return replacement; }
+        return "";
+      });
+    }
+    // CorelDraw text-to-curves: remove sibling letter-paths (e.g., _1, _2, ..., _10)
+    // that represent the remaining letters of the original word.
+    if (isPathField) {
+      const siblings = (model.fieldSiblings && model.fieldSiblings[fieldName]) || [];
+      for (const sid of siblings) {
+        const sre = new RegExp(`<path\\s[^>]*id="${sid.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}"[^>]*\\/>`, "g");
+        svg = svg.replace(sre, "");
+      }
+    }
   });
 
-  // Replace codigo_pedido field if present
+  // Replace codigo_pedido field if present. Fallback by inner text when
+  // CorelDraw exported the <text> without an id (e.g. MOD016).
   if (model.orderCode) {
-    const pedidoRe = /(<text\s[^>]*id="codigo_pedido"[^>]*>)[^<]*(<\/text>)/g;
     const escCode = model.orderCode.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    svg = svg.replace(pedidoRe, `$1${escCode}$2`);
+    const pedidoReId = /(<text\s[^>]*id="codigo_pedido"[^>]*>)[^<]*(<\/text>)/g;
+    let didReplace = false;
+    svg = svg.replace(pedidoReId, (_m, a, b) => { didReplace = true; return `${a}${escCode}${b}`; });
+    if (!didReplace) {
+      const pedidoReText = /(<text\b[^>]*>)codigo_pedido(<\/text>)/g;
+      svg = svg.replace(pedidoReText, `$1${escCode}$2`);
+    }
   }
 
-  // Replace campo_loja field if present
+  // Replace campo_loja / nome_loja field if present
   if (model.store) {
-    const lojaRe = /(<text\s[^>]*id="campo_loja"[^>]*>)[^<]*(<\/text>)/g;
     const escStore = model.store.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    svg = svg.replace(lojaRe, `$1${escStore}$2`);
+    const lojaReId = /(<text\s[^>]*id="(?:campo_loja|nome_loja)"[^>]*>)[^<]*(<\/text>)/g;
+    let didReplace = false;
+    svg = svg.replace(lojaReId, (_m, a, b) => { didReplace = true; return `${a}${escStore}${b}`; });
+    if (!didReplace) {
+      const lojaReText = /(<text\b[^>]*>)(?:campo_loja|nome_loja)(<\/text>)/g;
+      svg = svg.replace(lojaReText, `$1${escStore}$2`);
+    }
+  }
+
+  // For contour models, inject Cookie font as base64 @font-face for blob URL rendering
+  if (isContour && cookieFontB64) {
+    const ff = `@font-face{font-family:'Cookie';src:url('data:font/truetype;base64,${cookieFontB64}') format('truetype');}`;
+    if (svg.includes("<![CDATA[")) {
+      svg = svg.replace("<![CDATA[", "<![CDATA[\n" + ff + "\n");
+    } else {
+      svg = svg.replace(/<style[^>]*>/, (m) => m + "\n" + ff + "\n");
+    }
+  }
+  // Inject @font-face for FONT_OPTIONS that appear in the SVG (MOD031 selectable fonts)
+  for (const fo of FONT_OPTIONS) {
+    const b64 = fontB64Map[fo.key];
+    if (!b64) continue;
+    const famRe = new RegExp(`font-family:\\s*'?${fo.family.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}'?`, "i");
+    if (famRe.test(svg)) {
+      const fmt = fo.file.endsWith(".otf") ? "opentype" : "truetype";
+      const ff = `@font-face{font-family:'${fo.family}';src:url('data:font/${fmt};base64,${b64}') format('${fmt}');}`;
+      if (svg.includes("<![CDATA[")) svg = svg.replace("<![CDATA[", "<![CDATA[\n" + ff + "\n");
+      else svg = svg.replace(/<style[^>]*>/, (m) => m + "\n" + ff + "\n");
+    }
+  }
+  // Inject user-uploaded custom font (fontUrl) as @font-face so the rendered
+  // SVG is self-contained (browsers dropped SVG-font <font> support).
+  // Cache keyed by fontUrl (per-model) so each model embeds its own TTF.
+  if (model.fontFamily && model.fontUrl && customFontB64Map[model.fontUrl]) {
+    const { b64, format } = customFontB64Map[model.fontUrl];
+    const ff = `@font-face{font-family:'${model.fontFamily}';src:url('data:font/${format};base64,${b64}') format('${format}');}`;
+    if (svg.includes("<![CDATA[")) svg = svg.replace("<![CDATA[", "<![CDATA[\n" + ff + "\n");
+    else if (/<style[^>]*>/.test(svg)) svg = svg.replace(/<style[^>]*>/, (m) => m + "\n" + ff + "\n");
+    else svg = svg.replace(/<svg\b[^>]*>/, (m) => m + `<style>${ff}</style>`);
+  }
+  // Inject Comfortaa @font-face when SVG references it (e.g., MOD022)
+  if (/font-family:\s*'?Comfortaa'?/i.test(svg)) {
+    let ff = "";
+    if (comfortaaFontB64) ff += `@font-face{font-family:'Comfortaa';font-weight:normal;src:url('data:font/truetype;base64,${comfortaaFontB64}') format('truetype');}`;
+    if (comfortaaBoldFontB64) ff += `@font-face{font-family:'Comfortaa';font-weight:bold;src:url('data:font/truetype;base64,${comfortaaBoldFontB64}') format('truetype');}`;
+    if (ff) {
+      if (svg.includes("<![CDATA[")) {
+        svg = svg.replace("<![CDATA[", "<![CDATA[\n" + ff + "\n");
+      } else {
+        svg = svg.replace(/<style[^>]*>/, (m) => m + "\n" + ff + "\n");
+      }
+    }
   }
 
   return svg;
@@ -383,6 +863,8 @@ const I = ({ n, s = 20 }) => {
     layout: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="4" rx="1"/><rect x="14" y="10" width="7" height="4" rx="1"/><rect x="3" y="13" width="7" height="8" rx="1"/><rect x="14" y="17" width="7" height="4" rx="1"/></>,
     pkg: <><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></>,
     help: <><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></>,
+    "check-circle": <><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>,
+    circle: <><circle cx="12" cy="12" r="10"/></>,
   };
   return <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d[n]}</svg>;
 };
@@ -492,16 +974,32 @@ const Calibration = ({ model, onUpdate }) => {
         <div style={{ marginBottom: 10 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
             <label style={{ fontSize: 11, color: "var(--t2)" }}>Largura máxima</label>
-            <input type="number" value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value) || 100)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
+            <input type="number" value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value) || 10)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
           </div>
-          <input type="range" min="500" max="8000" step="50" value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value))} style={{ width: "100%", accentColor: color }} />
+          {/* Slider range adapts to template scale. 3 tiers based on origFontSize:
+              small (Illustrator ~24px), medium (CorelDraw small viewBox ~90px),
+              large (CorelDraw large viewBox ~500px+). Precision is finer for smaller
+              ranges so calibration isn't too coarse. */}
+          {(() => {
+            const [twMin, twMax, twStep] =
+              origFontSize < 40  ? [20, 600, 2] :
+              origFontSize < 200 ? [100, 4000, 10] :
+                                   [500, 8000, 50];
+            return <input type="range" min={twMin} max={twMax} step={twStep} value={c.tw} onChange={e => setTc(idx, "tw", parseInt(e.target.value))} style={{ width: "100%", accentColor: color }} />;
+          })()}
         </div>
         <div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
             <label style={{ fontSize: 11, color: "var(--t2)" }}>Tamanho fonte</label>
-            <input type="number" value={Math.round(c.tf)} onChange={e => setTc(idx, "tf", parseFloat(e.target.value) || 50)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
+            <input type="number" value={Math.round(c.tf * 100) / 100} onChange={e => setTc(idx, "tf", parseFloat(e.target.value) || 5)} style={{ width: 70, padding: "2px 6px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 6, color, fontSize: 12, fontFamily: "mono", textAlign: "right" }} />
           </div>
-          <input type="range" min="50" max="1500" step="5" value={c.tf} onChange={e => setTc(idx, "tf", parseFloat(e.target.value))} style={{ width: "100%", accentColor: color }} />
+          {(() => {
+            const [tfMin, tfMax, tfStep] =
+              origFontSize < 40  ? [5, 100, 0.5] :
+              origFontSize < 200 ? [20, 300, 1]  :
+                                   [50, 1500, 5];
+            return <input type="range" min={tfMin} max={tfMax} step={tfStep} value={c.tf} onChange={e => setTc(idx, "tf", parseFloat(e.target.value))} style={{ width: "100%", accentColor: color }} />;
+          })()}
         </div>
       </div>
     );
@@ -558,11 +1056,15 @@ function LoginScreen({ onLogin }) {
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
   const [error, setError] = useState("");
-  useEffect(() => { refreshUsers(); }, []); // lista de usuários do Supabase
+  const [loading, setLoading] = useState(true);
   const V = { "--bg": "#0f1117", "--card": "#181b24", "--inp": "#13151d", "--accent": "#e85d3a", "--t1": "#eaedf3", "--t2": "#7a8194", "--t3": "#4a5068", "--brd": "#262a38" };
+
+  // Lista de usuários do Supabase antes de liberar o login
+  useEffect(() => { refreshUsers().finally(() => setLoading(false)); }, []);
 
   const handleLogin = async (e) => {
     e.preventDefault();
+    if (loading) return;
     if (!user.trim() || !pass.trim()) { setError("Preencha todos os campos"); return; }
     let u = getUsers()[user.trim()];
     // usuário criado há pouco em outro computador: busca a lista de novo antes de recusar
@@ -577,7 +1079,7 @@ function LoginScreen({ onLogin }) {
 
   return (
     <div style={{ ...V, minHeight: "100vh", background: "var(--bg)", color: "var(--t1)", fontFamily: "'Outfit','Segoe UI',sans-serif", display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}textarea:focus,input:focus{outline:2px solid var(--accent);outline-offset:-1px}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}`}</style>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');*{box-sizing:border-box;margin:0;padding:0}textarea:focus,input:focus{outline:2px solid var(--accent);outline-offset:-1px}@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
       <div style={{ animation: "fadeIn .5s", width: 400, background: "var(--card)", borderRadius: 20, border: "1px solid var(--brd)", padding: 40, textAlign: "center" }}>
         <div style={{ width: 64, height: 64, borderRadius: 16, background: "linear-gradient(135deg,#e85d3a,#ff9b7b)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px" }}>
           <I n="zap" s={32} />
@@ -590,9 +1092,9 @@ function LoginScreen({ onLogin }) {
           <input value={pass} onChange={e => { setPass(e.target.value); setError(""); }} placeholder="Senha" type="password"
             style={{ width: "100%", padding: "14px 16px", background: "var(--inp)", border: "1px solid var(--brd)", borderRadius: 10, color: "var(--t1)", fontSize: 14, fontFamily: "inherit", marginBottom: 16 }} />
           {error && <p style={{ color: "#f87171", fontSize: 13, marginBottom: 12 }}>{error}</p>}
-          <button type="submit" style={{ width: "100%", background: "var(--accent)", color: "#fff", border: "none", padding: "14px", borderRadius: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", fontSize: 15, transition: "all .2s" }}
-            onMouseEnter={e => e.currentTarget.style.background = "#ff7b5c"} onMouseLeave={e => e.currentTarget.style.background = "var(--accent)"}>
-            Entrar
+          <button type="submit" disabled={loading} style={{ width: "100%", background: loading ? "var(--t3)" : "var(--accent)", color: "#fff", border: "none", padding: "14px", borderRadius: 10, fontWeight: 700, cursor: loading ? "wait" : "pointer", fontFamily: "inherit", fontSize: 15, transition: "all .2s" }}
+            onMouseEnter={e => { if (!loading) e.currentTarget.style.background = "#ff7b5c"; }} onMouseLeave={e => { if (!loading) e.currentTarget.style.background = "var(--accent)"; }}>
+            {loading ? "Conectando..." : "Entrar"}
           </button>
         </form>
       </div>
@@ -624,14 +1126,23 @@ export default function App() {
   const [fontOk, setFontOk] = useState({});
   const [fontOv, setFontOv] = useState({}); // {nameIndex: customFontSize}
   const [posOv, setPosOv] = useState({}); // {nameIndex: xOffset} manual horizontal offset
+  const [selectedVariant, setSelectedVariant] = useState(1); // 1 or 2 (for MULTI_VARIANT_MODELS) — Gerar tab
+  const [configVariant, setConfigVariant] = useState(1); // 1 or 2 — Configurar tab calibration
+  const [selectedFont, setSelectedFont] = useState(""); // font key from FONT_OPTIONS, "" = default
   const fontBytesRef = useRef({}); // {modelId: Uint8Array} font bytes in memory for PDF
   const [orderCode, setOrderCode] = useState(""); // codigo do pedido Shopee
   const [store, setStore] = useState(STORES[0]); // loja selecionada
   const [printQueue, setPrintQueue] = useState([]); // [{id, svg, label, store, orderCode, model, timestamp}]
   const [pdfGenerating, setPdfGenerating] = useState(false);
   const [dbLoading, setDbLoading] = useState(true);
-  const [pedidos, setPedidos] = useState([]); // [{id, pedido, remetente, envio, modelo, quantidade, feito, criadoEm}]
+  const [pedidos, setPedidos] = useState([]); // [{id, pedido, remetente, envio, modelo, quantidade, feito, obs, criadoEm}]
   const [pedidosParsing, setPedidosParsing] = useState(false);
+  const [pedidoSearch, setPedidoSearch] = useState("");
+  const [pedidoFilter, setPedidoFilter] = useState({ store: "", status: "" });
+  const [pedidoSort, setPedidoSort] = useState({ field: null, dir: "asc" });
+  const [pedidoSelected, setPedidoSelected] = useState(new Set());
+  const [pedidoDrag, setPedidoDrag] = useState(null);
+  const [toastMsg, setToastMsg] = useState("");
   const [layoutFiles, setLayoutFiles] = useState([]); // [{name, bytes, width, height}]
   const [layoutResults, setLayoutResults] = useState([]); // [{name, blob, widthMm, heightMm, items}]
   const [layoutProcessing, setLayoutProcessing] = useState(false);
@@ -651,7 +1162,7 @@ export default function App() {
     printLimit: 1000, printResults: [], printProcessing: false, generatedPdfs: [],
     orderCode: "", store: STORES[0], shape: "rect", // "rect" ou "circle"
   });
-  const fRef = useRef(null), tRef = useRef(null), foRef = useRef(null);
+  const fRef = useRef(null), tRef = useRef(null), foRef = useRef(null), fRef2 = useRef(null);
 
   const sel = models.find(m => m.id === selId);
 
@@ -659,11 +1170,14 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [dbModels, queue, dbOrders] = await Promise.all([
+        const userFilter = { userId: loggedUser, isAdmin };
+        const [dbModels, queue, dbOrders, dbUsers] = await Promise.all([
           db.fetchModels(),
-          db.fetchPrintQueue(),
-          db.fetchOrders(200),
+          db.fetchPrintQueue(userFilter),
+          db.fetchOrders(200, userFilter),
+          db.fetchUsersFromDb(),
         ]);
+        refreshUsers(); // lista de usuários do Supabase (src/lib/users.js)
         setModels(prev => prev.map(d => {
           const remote = dbModels.find(r => r.id === d.id);
           return remote ? { ...d, ...remote } : d;
@@ -673,13 +1187,94 @@ export default function App() {
           id: o.id, pedido: o.orderCode, remetente: o.store, envio: o.names?.[0] || "",
           modelo: o.fontOverrides?.modelo || "", quantidade: o.sheetsCount || 0,
           feito: o.fontOverrides?.feito || false, semArte: o.fontOverrides?.semArte || false,
-          skus: o.fontOverrides?.skus || null, criadoEm: o.createdAt,
+          skus: o.fontOverrides?.skus || null, obs: o.fontOverrides?.obs || "", criadoEm: o.createdAt,
         })));
       } catch (e) {
         console.error("Erro ao carregar do Supabase:", e);
       }
       setDbLoading(false);
     })();
+    // Preload Cookie font for contour models (MOD007 etc.)
+    const bp = import.meta.env.BASE_URL || "/";
+    fetch(bp + "fonts/cookie.ttf").then(r => r.arrayBuffer()).then(buf => {
+      cookieFontB64 = btoa(Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join(""));
+      // Also load into browser for inline SVG preview
+      const fc = new FontFace("Cookie", buf); fc.load().then(f => document.fonts.add(f));
+    }).catch(() => {});
+    fetch(bp + "fonts/comfortaa.ttf").then(r => r.arrayBuffer()).then(buf => {
+      comfortaaFontB64 = btoa(Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join(""));
+      const fc = new FontFace("Comfortaa", buf); fc.load().then(f => document.fonts.add(f));
+    }).catch(() => {});
+    fetch(bp + "fonts/comfortaabd.ttf").then(r => r.arrayBuffer()).then(buf => {
+      comfortaaBoldFontB64 = btoa(Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join(""));
+      const fc = new FontFace("Comfortaa", buf, { weight: "bold" }); fc.load().then(f => document.fonts.add(f));
+    }).catch(() => {});
+    // Preload MULTI_VARIANT font options (MOD031 selector)
+    for (const f of FONT_OPTIONS) {
+      fetch(bp + "fonts/" + f.file).then(r => r.arrayBuffer()).then(buf => {
+        fontB64Map[f.key] = btoa(Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join(""));
+        const fc = new FontFace(f.family, buf); fc.load().then(ff => document.fonts.add(ff));
+      }).catch(() => {});
+    }
+  }, []);
+
+  // Live-sync model changes across users. Covers EVERY admin edit that goes
+  // through upd() → updateModel() → Supabase: SVG uploads (v1 & v2), font
+  // uploads, calibration (maxWidth/fontSize), textCenters, fieldTypes,
+  // operational flag, displayName rename, resets. Operators see all of it
+  // without F5.
+  //
+  // svgData / svgData2 blobs: we keep the local copy if the URL didn't change
+  // (most edits don't touch the SVG, no point re-downloading). If the remote
+  // URL differs from what we had cached → null it out, which triggers the
+  // on-demand loader useEffect to refetch from Storage with cache-bust.
+  useEffect(() => {
+    const ch = db.subscribeModels((remote) => {
+      setModels(prev => prev.map(m => {
+        if (m.id !== remote.id) return m;
+        const merged = { ...m, ...remote };
+        // Invalidate cached SVG blob if its URL changed (admin re-uploaded)
+        if (remote.svgUrl !== m.svgUrl) merged.svgData = null;
+        else merged.svgData = m.svgData || null;
+        if (remote.svgUrl2 !== m.svgUrl2) merged.svgData2 = null;
+        else merged.svgData2 = m.svgData2 || null;
+        // Invalidate custom font cache if fontUrl changed
+        if (remote.fontUrl && remote.fontUrl !== m.fontUrl) {
+          delete customFontB64Map[m.fontUrl];
+          // Also drop any registered FontFace under the old family so the new
+          // file takes over when the font useEffect re-runs.
+          const fam = m.fontFamily;
+          if (fam) {
+            const toRm = [];
+            document.fonts.forEach(f => { if (f.family === fam) toRm.push(f); });
+            for (const f of toRm) { try { document.fonts.delete(f); } catch {} }
+          }
+        }
+        return merged;
+      }));
+    });
+    return () => { db.unsubscribe(ch); };
+  }, []);
+
+  // Live-sync orders: when admin imports PDFs or any user updates/deletes a
+  // pedido, all logged-in users see the change without F5.
+  useEffect(() => {
+    const dbOrderToPedido = (o) => ({
+      id: o.id, pedido: o.orderCode, remetente: o.store, envio: o.names?.[0] || "",
+      modelo: o.fontOverrides?.modelo || "", quantidade: o.sheetsCount || 0,
+      feito: o.fontOverrides?.feito || false, semArte: o.fontOverrides?.semArte || false,
+      skus: o.fontOverrides?.skus || null, obs: o.fontOverrides?.obs || "", criadoEm: o.createdAt,
+    });
+    const ch = db.subscribeOrders(({ type, order, id }) => {
+      if (type === "insert") {
+        setPedidos(prev => prev.some(p => p.id === id) ? prev : [dbOrderToPedido(order), ...prev]);
+      } else if (type === "update") {
+        setPedidos(prev => prev.map(p => p.id === id ? { ...p, ...dbOrderToPedido(order) } : p));
+      } else if (type === "delete") {
+        setPedidos(prev => prev.filter(p => p.id !== id));
+      }
+    });
+    return () => { db.unsubscribe(ch); };
   }, []);
 
   // Load SVG data on demand when a model is selected — always re-analyze for accurate centers
@@ -690,7 +1285,7 @@ export default function App() {
         const svgText = await db.downloadSvg(sel.svgUrl);
         const analysis = analyzeSvg(svgText);
         // Merge: keep user-calibrated values (maxWidth, fontSize overrides) but update centers & types
-        const merged = { svgData: svgText, textCenters: analysis.textCenters, fieldTypes: analysis.fieldTypes, fieldPerType: analysis.fieldPerType, allGlyphMaps: analysis.allGlyphMaps };
+        const merged = { svgData: svgText, textCenters: analysis.textCenters, fieldTypes: analysis.fieldTypes, fieldPerType: analysis.fieldPerType, allGlyphMaps: analysis.allGlyphMaps, fieldFntMap: analysis.fieldFntMap, fieldSiblings: analysis.fieldSiblings, fontFamily: analysis.fontFamily, fontSize: sel.fontSize || analysis.fontSize };
         // If no fields were stored yet, also update fields/fonts
         if (!sel.fields || sel.fields.length === 0) Object.assign(merged, analysis);
         setModels(p => p.map(m => m.id === sel.id ? { ...m, ...merged } : m));
@@ -703,14 +1298,115 @@ export default function App() {
     })();
   }, [sel?.id, sel?.svgUrl, sel?.svgData]);
 
-  const upd = useCallback((id, u) => {
-    setModels(p => p.map(m => m.id === id ? { ...m, ...u } : m));
-    // Persist to Supabase (fire and forget, non-blocking)
-    const dbUpdates = { ...u };
-    delete dbUpdates.svgData; // SVG data goes to Storage, not DB
-    if (Object.keys(dbUpdates).length > 0) {
-      db.updateModel(id, dbUpdates).catch(e => console.error("Erro ao salvar modelo:", e));
+  // Load variant 2 SVG data on demand (MULTI_VARIANT_MODELS)
+  useEffect(() => {
+    if (!sel || !MULTI_VARIANT_MODELS.has(sel.id)) return;
+    if (sel.svgData2 || !sel.svgUrl2) return;
+    (async () => {
+      try {
+        const svgText = await db.downloadSvg(sel.svgUrl2);
+        const a2 = analyzeSvg(svgText);
+        const defaultMaxW2 = a2.fieldTypes?.[0]?.maxWidth || null;
+        const merged = {
+          svgData2: svgText,
+          fields2: a2.fields,
+          textCenters2: a2.textCenters,
+          fieldFntMap2: a2.fieldFntMap,
+          fieldSiblings2: a2.fieldSiblings,
+          fontFamily2: a2.fontFamily,
+          fontSize2: sel.fontSize2 || a2.fontSize,
+          maxWidth2: sel.maxWidth2 || defaultMaxW2,
+        };
+        setModels(p => p.map(m => m.id === sel.id ? { ...m, ...merged } : m));
+      } catch (e) {
+        console.error("Erro ao baixar SVG variante 2:", e);
+      }
+    })();
+  }, [sel?.id, sel?.svgUrl2, sel?.svgData2]);
+
+  // Reset variant/font selectors when model changes
+  useEffect(() => {
+    setSelectedVariant(1);
+    setConfigVariant(1);
+    setSelectedFont("");
+  }, [selId]);
+
+  // Load custom TTF/OTF from Supabase Storage when a model with fontUrl is selected.
+  // Isolation: cache is keyed by fontUrl (each model has its own storage URL), and
+  // we re-register the browser FontFace for sel.fontFamily on every model switch.
+  // Previously the cache was keyed by fontFamily, which caused bleed — if MOD016 and
+  // MOD017 both used "DK Coal Brush", uploading a new TTF for one overwrote the other
+  // in the shared FontFace registry. Now each model selection replaces any previously
+  // registered FontFace with that family name so the active model always wins.
+  useEffect(() => {
+    if (!sel?.fontUrl || !sel?.fontFamily) return;
+    const family = sel.fontFamily;
+    const url = sel.fontUrl;
+    // Remove any previously registered FontFace under this family (from a prior model)
+    // so document.fonts doesn't mix variants.
+    const dropExisting = () => {
+      const toRemove = [];
+      document.fonts.forEach(f => { if (f.family === family) toRemove.push(f); });
+      for (const f of toRemove) { try { document.fonts.delete(f); } catch {} }
+    };
+
+    const registerFromCache = (entry) => {
+      try {
+        const bytes = Uint8Array.from(atob(entry.b64), c => c.charCodeAt(0));
+        dropExisting();
+        const fc = new FontFace(family, bytes.buffer);
+        return fc.load().then(ff => { document.fonts.add(ff); });
+      } catch { return Promise.resolve(); }
+    };
+
+    const cached = customFontB64Map[url];
+    if (cached) {
+      registerFromCache(cached).then(() => {
+        setFontOk(p => ({ ...p, [sel.id]: true }));
+        setModels(p => [...p]);
+      });
+      return;
     }
+    (async () => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const buf = await res.arrayBuffer();
+        const b64 = btoa(Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join(""));
+        const format = url.toLowerCase().endsWith(".otf") ? "opentype" : "truetype";
+        customFontB64Map[url] = { b64, format };
+        dropExisting();
+        const fc = new FontFace(family, buf);
+        await fc.load();
+        document.fonts.add(fc);
+        setFontOk(p => ({ ...p, [sel.id]: true }));
+        // Force a re-render so preview picks up the new font
+        setModels(p => [...p]);
+      } catch (e) {
+        console.error("Erro ao carregar fonte customizada:", e);
+      }
+    })();
+  }, [sel?.id, sel?.fontUrl, sel?.fontFamily]);
+
+  const upd = useCallback((id, u) => {
+    // The DB call lives INSIDE the setState updater so we have synchronous
+    // access to the freshly merged model. Previously we read a `merged` var
+    // set by the updater, but React 18 may defer the updater, so the read
+    // happened before the updater ran — leaving merged=null and the DB never
+    // touched. Side-effect in updater is pragmatic here (fire-and-forget, no
+    // re-render triggered) and the only way to get the latest state cheaply.
+    setModels(p => {
+      const next = p.map(m => m.id === id ? { ...m, ...u } : m);
+      const target = next.find(m => m.id === id);
+      if (target && Object.keys(u).length > 0) {
+        const dbUpdates = { ...target };
+        delete dbUpdates.svgData;
+        delete dbUpdates.svgData2;
+        db.updateModel(id, dbUpdates)
+          .catch(e => console.error("[upd] DB update FAILED:", e.message, e));
+      }
+      return next;
+    });
   }, []);
 
   const onSvg = (e) => {
@@ -718,15 +1414,66 @@ export default function App() {
     const r = new FileReader();
     r.onload = async (ev) => {
       const svg = ev.target.result;
-      const { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps } = analyzeSvg(svg);
-      const modelData = { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps };
+      let modelData;
+      try {
+        const { fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps, fieldFntMap, fieldSiblings } = analyzeSvg(svg);
+        modelData = { svgData: svg, fields, fontSize, fontFamily, glyphMap, defaultAdv, textCenters, fieldTypes, fieldPerType, allGlyphMaps, fieldFntMap, fieldSiblings };
+      } catch (aerr) {
+        console.error("[upload] analyzeSvg falhou:", aerr);
+        alert("Falha ao analisar o SVG: " + aerr.message + "\nVer console (F12) para detalhes.");
+        return;
+      }
+      console.log(`[upload] ${selId} analisado: ${modelData.fields.length} campos, fontSize=${modelData.fontSize}, fontFamily=${modelData.fontFamily}, fieldTypes=${modelData.fieldTypes.length}`);
       // Upload to Supabase Storage
       try {
         const svgUrl = await db.uploadSvg(selId, svg);
         upd(selId, { ...modelData, svgUrl });
+        console.log(`[upload] ${selId} svgUrl gravado, modelData aplicado via upd`);
       } catch (err) {
         console.error("Erro ao upload SVG:", err);
         upd(selId, modelData);
+      }
+    };
+    r.readAsText(file); e.target.value = "";
+  };
+  const onSvg2 = (e) => {
+    const file = e.target.files[0]; if (!file || !selId) return;
+    const r = new FileReader();
+    r.onload = async (ev) => {
+      const svg = ev.target.result;
+      const a2 = analyzeSvg(svg);
+      // Pick a sensible default maxWidth for variant 2 from analyzeSvg's
+      // fieldTypes[0] (which is already viewBox-scaled: vbW*0.25). Without
+      // this, resolveActiveModel would fall back to variant 1's maxWidth,
+      // which may be wrong for a different sticker layout (5x2 vs 4x2).
+      const defaultMaxW2 = a2.fieldTypes?.[0]?.maxWidth || null;
+      const modelData2 = {
+        svgData2: svg,
+        fields2: a2.fields,
+        textCenters2: a2.textCenters,
+        fieldFntMap2: a2.fieldFntMap,
+        fieldSiblings2: a2.fieldSiblings,
+        fontFamily2: a2.fontFamily,
+        fontSize2: a2.fontSize,
+        maxWidth2: defaultMaxW2,
+      };
+      try {
+        // Upload as <id>_2.svg via a synthetic id suffix
+        const path = `svg/${selId}_2.svg`;
+        const blob = new Blob([svg], { type: "image/svg+xml" });
+        let svgUrl2 = null;
+        if (db.isConnected()) {
+          const { supabase } = await import("./lib/supabase");
+          const { error } = await supabase.storage.from("stickers").upload(path, blob, { upsert: true });
+          if (!error) {
+            const { data } = supabase.storage.from("stickers").getPublicUrl(path);
+            svgUrl2 = data.publicUrl;
+          }
+        }
+        upd(selId, { ...modelData2, svgUrl2 });
+      } catch (err) {
+        console.error("Erro ao upload SVG variante 2:", err);
+        upd(selId, modelData2);
       }
     };
     r.readAsText(file); e.target.value = "";
@@ -753,11 +1500,21 @@ export default function App() {
       const nm = f.name.replace(/\.(ttf|otf|woff|woff2)$/i, "").replace(/[^a-zA-Z0-9\s-]/g, "");
       try {
         const fontBytes = new Uint8Array(ev.target.result);
+        // Remove any previously registered FontFace under this family (from another
+        // model or a previous version) so the new bytes take effect immediately.
+        const toRemove = [];
+        document.fonts.forEach(ff => { if (ff.family === nm) toRemove.push(ff); });
+        for (const ff of toRemove) { try { document.fonts.delete(ff); } catch {} }
         const fc = new FontFace(nm, fontBytes.buffer); await fc.load(); document.fonts.add(fc);
         // Keep font bytes in memory for PDF generation
         fontBytesRef.current[selId] = fontBytes;
         // Upload font to Supabase Storage for persistence
         const fontUrl = await db.uploadFont(selId, ev.target.result, f.name);
+        // Invalidate cached base64 for this URL so the new font bytes are embedded
+        // next time injectNames / useEffect runs for this model.
+        const b64 = btoa(Array.from(fontBytes, b => String.fromCharCode(b)).join(""));
+        const format = f.name.toLowerCase().endsWith(".otf") ? "opentype" : "truetype";
+        customFontB64Map[fontUrl] = { b64, format };
         upd(selId, { fontFamily: nm, fontSource: "file", fontUrl });
         setFontOk(p => ({ ...p, [selId]: true }));
       } catch (err) { alert("Erro: " + err.message); }
@@ -808,10 +1565,40 @@ export default function App() {
     return { t, s, f, e: s > 0 ? s * f - t : 0 };
   }, [sel, nl, isMultiType, typeLists, groupSize]);
 
+  // Resolve active model: for MULTI_VARIANT_MODELS swap variant 2 data if selected
+  const resolveActiveModel = () => {
+    if (!sel) return sel;
+    let m = { ...sel, orderCode, store };
+    if (MULTI_VARIANT_MODELS.has(sel.id) && selectedVariant === 2 && sel.svgData2) {
+      m.svgData = sel.svgData2;
+      m.fields = sel.fields2 || [];
+      m.textCenters = sel.textCenters2 || {};
+      m.fieldFntMap = sel.fieldFntMap2 || {};
+      m.fieldSiblings = sel.fieldSiblings2 || {};
+      if (sel.fontFamily2) m.fontFamily = sel.fontFamily2;
+      if (sel.fontSize2) m.fontSize = sel.fontSize2;
+      if (sel.maxWidth2) m.maxWidth = sel.maxWidth2;
+      // Clear variant 1's fieldTypes/fieldPerType so injectNames's auto-fit
+      // falls through to variant 2's model.fontSize/maxWidth (just swapped in
+      // above). Without this, variant 2 would use variant 1's font size /
+      // maxWidth for the shrink loop, which is wrong when the layouts differ
+      // (e.g. 5x2 vs 4x2 have different sticker sizes).
+      m.fieldTypes = [];
+      m.fieldPerType = {};
+    }
+    if (MULTI_VARIANT_MODELS.has(sel.id) && selectedFont) {
+      const fo = FONT_OPTIONS.find(f => f.key === selectedFont);
+      if (fo) m.fontOverride = fo.family;
+    }
+    return m;
+  };
+
   const gen = () => {
-    if (!sel?.svgData || !sel.fields.length || (!nl.length && !nl.some(Boolean))) return;
+    if (!sel) return;
+    const active = resolveActiveModel();
+    if (!active.svgData || !active.fields.length || (!nl.length && !nl.some(Boolean))) return;
     if (isMultiType && !Object.values(typeLists).some(l => l.length > 0)) return;
-    const fps = sel.fields.length;
+    const fps = active.fields.length;
     const res = [];
     for (let i = 0; i < Math.ceil(nl.length / fps); i++) {
       const sn = nl.slice(i * fps, (i + 1) * fps);
@@ -822,7 +1609,7 @@ export default function App() {
         if (fontOv[globalIdx] !== undefined) sheetOv[j] = fontOv[globalIdx];
         if (posOv[globalIdx] !== undefined) sheetPos[j] = posOv[globalIdx];
       }
-      res.push({ i: i + 1, svg: injectNames(sel.svgData, sn, { ...sel, orderCode, store }, sheetOv, sheetPos), n: sn, e: fps - sn.length });
+      res.push({ i: i + 1, svg: injectNames(active.svgData, sn, active, sheetOv, sheetPos), n: sn, e: fps - sn.length });
     }
     setSheets(res); setPi(0); setTab("preview");
   };
@@ -846,27 +1633,17 @@ export default function App() {
       names: s.n,
       timestamp: Date.now(),
     }));
-    try {
-      // Create order in DB
-      const orderId = await db.createOrder({
-        orderCode: orderCode || "SEM_CODIGO",
-        store,
-        modelId: sel.id,
-        names: nl,
-        fontOverrides: fontOv,
-        sheetsCount: sheets.length,
-      });
-      // Add to print queue in DB
-      await db.addToPrintQueue(items, orderId);
-      // Reload queue from DB to get IDs
-      const queue = await db.fetchPrintQueue();
-      setPrintQueue(queue);
-    } catch (err) {
-      console.error("Erro ao adicionar à fila:", err);
-      // Fallback: add locally
-      setPrintQueue(p => [...p, ...items]);
-    }
-    // Reset generate data for new order
+    // Optimistic UI: append items with temp ids IMMEDIATELY so the user sees
+    // them on the print tab without waiting for the Supabase round-trip.
+    // Previously the flow was insert + refetch (downloads every SVG already
+    // in the queue), which could take 5-10s for big MOD031 cartelas.
+    const tempItems = items.map((it, i) => ({
+      ...it,
+      id: `tmp-${Date.now()}-${i}`,
+      _pending: true,
+    }));
+    setPrintQueue(p => [...p, ...tempItems]);
+    // Reset generate data right away
     setNames("");
     setTypeNames({});
     setOrderCode("");
@@ -875,6 +1652,28 @@ export default function App() {
     setSheets([]);
     setPi(0);
     setTab("generate");
+    // Background insert — replace temp items with real saved rows when done.
+    db.addToPrintQueue(items, null, loggedUser)
+      .then((saved) => {
+        if (!saved || !saved.length) return;
+        setPrintQueue(p => {
+          const next = [...p];
+          // Replace each temp item (in order) with the matching saved row
+          let savedIdx = 0;
+          for (let i = 0; i < next.length && savedIdx < saved.length; i++) {
+            if (tempItems.some(t => t.id === next[i].id)) {
+              next[i] = saved[savedIdx++];
+            }
+          }
+          return next;
+        });
+      })
+      .catch((err) => {
+        console.error("Erro ao adicionar à fila:", err);
+        // Roll back the optimistic items if the insert failed
+        setPrintQueue(p => p.filter(x => !tempItems.some(t => t.id === x.id)));
+        alert("Falha ao salvar na fila: " + err.message);
+      });
   };
 
   const removeFromQueue = async (idx) => {
@@ -958,15 +1757,22 @@ export default function App() {
         }
       }
       if (pedido || skuItems.length) {
-        // Combine all SKUs into a single entry per label
+        // If the label has an order code but we couldn't extract any SKU/modelo,
+        // still import it and flag as "NÃO LOCALIZADO" — operator can edit later.
+        // Previously these pedidos silently failed to import.
         const totalQty = skuItems.reduce((sum, s) => sum + s.quantidade, 0);
+        const modelo = skuItems.length === 0
+          ? "NÃO LOCALIZADO"
+          : skuItems.length === 1
+            ? skuItems[0].modelo
+            : skuItems.map(s => s.modelo).join(" | ");
         results.push({
           id: crypto.randomUUID(),
           pedido,
           remetente,
           envio,
-          modelo: skuItems.length === 1 ? skuItems[0].modelo : skuItems.map(s => s.modelo).join(" | "),
-          skus: skuItems, // [{modelo, quantidade}]
+          modelo,
+          skus: skuItems.length ? skuItems : [{ modelo: "NÃO LOCALIZADO", quantidade: 0 }],
           quantidade: totalQty,
           feito: false,
           criadoEm: new Date().toISOString(),
@@ -986,31 +1792,49 @@ export default function App() {
         const results = await parseLabelPdf(file);
         allResults.push(...results);
       }
-      // Deduplicate by pedido
+      // Deduplicate by pedido — show which were skipped
       const existing = new Set(pedidos.map(p => p.pedido));
       const newOnes = allResults.filter(r => !existing.has(r.pedido));
+      const dupes = allResults.filter(r => existing.has(r.pedido));
       if (newOnes.length === 0) {
-        alert("Nenhum pedido novo encontrado (todos já existem na lista).");
+        showToast(`Nenhum pedido novo — ${dupes.length} já existiam`, 4000);
         setPedidosParsing(false);
         e.target.value = "";
         return;
       }
-      // Save to Supabase and get IDs
+      // Save to Supabase and get IDs. Keep only those that actually persisted
+      // so a silent DB failure doesn't leave "phantom" orders in memory that
+      // would vanish on the next refresh and mislead the operator.
+      const saved = [];
+      const failed = [];
+      // Only send `model_id` to Supabase if it matches a real MOD code — the
+      // orders.model_id column has a FK to models(id). SKUs like "5,5 - Preto"
+      // or "NÃO LOCALIZADO" would trigger a 409 violation. The full modelo
+      // string is preserved in fontOverrides.modelo so nothing is lost.
+      const validModelId = (s) => (s && /^MOD\d{3}$/i.test(s.trim())) ? s.trim().toUpperCase() : null;
       for (const p of newOnes) {
         try {
           const dbId = await db.createOrder({
             orderCode: p.pedido,
             store: p.remetente,
-            modelId: p.modelo,
+            modelId: validModelId(p.modelo),
             names: [p.envio],
             fontOverrides: { modelo: p.modelo, feito: false, skus: p.skus || null },
             sheetsCount: p.quantidade,
+            userId: loggedUser,
           });
-          if (dbId) p.id = dbId;
-        } catch (err) { console.error("Erro ao salvar pedido:", err); }
+          if (dbId) { p.id = dbId; saved.push(p); }
+          else failed.push(p);
+        } catch (err) {
+          console.error("Erro ao salvar pedido:", err);
+          failed.push(p);
+        }
       }
-      setPedidos(prev => [...newOnes, ...prev]);
-      alert(`${newOnes.length} pedido(s) importado(s) com sucesso!`);
+      if (saved.length) setPedidos(prev => [...saved, ...prev]);
+      const parts = [`${saved.length} importado(s)`];
+      if (dupes.length) parts.push(`${dupes.length} já existiam`);
+      if (failed.length) parts.push(`${failed.length} falharam`);
+      showToast(parts.join(" · "), 4000);
     } catch (err) {
       alert("Erro ao ler PDF: " + err.message);
       console.error(err);
@@ -1019,15 +1843,23 @@ export default function App() {
     e.target.value = "";
   };
 
+  // Every updateOrder call must send the FULL fontOverrides object — Supabase
+  // stores fontOverrides as a single JSONB column, so passing a partial object
+  // overwrites the whole thing and drops the other fields. Helper centralizes
+  // the shape so no future call forgets a field.
+  const fullOverrides = (p) => ({
+    modelo: p.modelo || "",
+    feito: p.feito || false,
+    semArte: p.semArte || false,
+    skus: p.skus || null,
+    obs: p.obs || "",
+  });
+
   const togglePedidoFeito = async (id) => {
     setPedidos(prev => prev.map(p => {
       if (p.id !== id) return p;
       const updated = { ...p, feito: !p.feito };
-      // Update in Supabase (reuse orders table font_overrides field)
-      if (typeof id === "number") {
-        db.updateOrder(id, { fontOverrides: { modelo: updated.modelo, feito: updated.feito, semArte: updated.semArte || false } })
-          .catch(e => console.error(e));
-      }
+      if (id) db.updateOrder(id, { fontOverrides: fullOverrides(updated) }).catch(e => console.error(e));
       return updated;
     }));
   };
@@ -1036,10 +1868,7 @@ export default function App() {
     setPedidos(prev => prev.map(p => {
       if (p.id !== id) return p;
       const updated = { ...p, semArte: !p.semArte };
-      if (typeof id === "number") {
-        db.updateOrder(id, { fontOverrides: { modelo: updated.modelo, feito: updated.feito, semArte: updated.semArte } })
-          .catch(e => console.error(e));
-      }
+      if (id) db.updateOrder(id, { fontOverrides: fullOverrides(updated) }).catch(e => console.error(e));
       return updated;
     }));
   };
@@ -1060,8 +1889,8 @@ export default function App() {
         updated.modelo = newName.trim();
         if (updated.skus && updated.skus[0]) updated.skus = [{ ...updated.skus[0], modelo: newName.trim() }];
       }
-      if (typeof pedidoId === "number") {
-        db.updateOrder(pedidoId, { fontOverrides: { modelo: updated.modelo, feito: updated.feito, semArte: updated.semArte || false, skus: updated.skus } })
+      if (pedidoId) {
+        db.updateOrder(pedidoId, { fontOverrides: fullOverrides(updated) })
           .catch(e => console.error(e));
       }
       return updated;
@@ -1070,7 +1899,130 @@ export default function App() {
 
   const removePedido = (id) => {
     setPedidos(prev => prev.filter(p => p.id !== id));
-    if (typeof id === "number") db.deleteOrder(id).catch(e => console.error(e));
+    if (id) db.deleteOrder(id).catch(e => console.error(e));
+  };
+
+  // ─── Toast helper ───
+  const showToast = (msg, ms = 3000) => { setToastMsg(msg); setTimeout(() => setToastMsg(""), ms); };
+
+  // ─── Bulk select helpers ───
+  const toggleSelectPedido = (id) => setPedidoSelected(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
+  const selectAllVisible = (ids) => setPedidoSelected(prev => prev.size === ids.length ? new Set() : new Set(ids));
+  const bulkAction = (action) => {
+    const ids = [...pedidoSelected];
+    if (!ids.length) return;
+    if (action === "feito") {
+      setPedidos(prev => {
+        const next = prev.map(p => ids.includes(p.id) ? { ...p, feito: true } : p);
+        for (const p of next) {
+          if (ids.includes(p.id)) db.updateOrder(p.id, { fontOverrides: fullOverrides(p) }).catch(() => {});
+        }
+        return next;
+      });
+      showToast(`${ids.length} pedido(s) marcados como feito`);
+    } else if (action === "semArte") {
+      setPedidos(prev => {
+        const next = prev.map(p => ids.includes(p.id) ? { ...p, semArte: true } : p);
+        for (const p of next) {
+          if (ids.includes(p.id)) db.updateOrder(p.id, { fontOverrides: fullOverrides(p) }).catch(() => {});
+        }
+        return next;
+      });
+      showToast(`${ids.length} pedido(s) marcados sem arte`);
+    } else if (action === "delete") {
+      if (!confirm(`Excluir ${ids.length} pedido(s)?`)) return;
+      setPedidos(prev => prev.filter(p => !ids.includes(p.id)));
+      ids.forEach(id => db.deleteOrder(id).catch(() => {}));
+      showToast(`${ids.length} pedido(s) excluídos`);
+    }
+    setPedidoSelected(new Set());
+  };
+
+  // ─── Update obs (notes) ───
+  const updatePedidoObs = (id, obs) => {
+    setPedidos(prev => prev.map(p => {
+      if (p.id !== id) return p;
+      const updated = { ...p, obs };
+      db.updateOrder(id, { fontOverrides: fullOverrides(updated) }).catch(() => {});
+      return updated;
+    }));
+  };
+
+  // ─── Export CSV ───
+  const exportPedidosCSV = () => {
+    const header = "Pedido,Loja,Envio,Modelo,Quantidade,Status,Observações\n";
+    const rows = pedidos.map(p =>
+      [p.pedido, p.remetente, p.envio, `"${(p.modelo || "").replace(/"/g, '""')}"`, p.quantidade, p.feito ? "Feito" : p.semArte ? "Sem Arte" : "Pendente", `"${(p.obs || "").replace(/"/g, '""')}"`].join(",")
+    ).join("\n");
+    const blob = new Blob(["\uFEFF" + header + rows], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+    a.download = `pedidos_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+    showToast("CSV exportado!");
+  };
+
+  // ─── Sort helper ───
+  const togglePedidoSort = (field) => {
+    setPedidoSort(prev => prev.field === field ? { field, dir: prev.dir === "asc" ? "desc" : "asc" } : { field, dir: "asc" });
+  };
+
+  // ─── Filter & sort pipeline ───
+  const getFilteredPedidos = () => {
+    let list = [...pedidos];
+    // Search
+    if (pedidoSearch.trim()) {
+      const q = pedidoSearch.toLowerCase();
+      list = list.filter(p => (p.pedido || "").toLowerCase().includes(q) || (p.remetente || "").toLowerCase().includes(q) || (p.modelo || "").toLowerCase().includes(q) || (p.obs || "").toLowerCase().includes(q));
+    }
+    // Filter by store
+    if (pedidoFilter.store) list = list.filter(p => p.remetente === pedidoFilter.store);
+    // Filter by status
+    if (pedidoFilter.status === "pendente") list = list.filter(p => !p.feito && !p.semArte);
+    else if (pedidoFilter.status === "semArte") list = list.filter(p => p.semArte && !p.feito);
+    else if (pedidoFilter.status === "feito") list = list.filter(p => p.feito);
+    else if (pedidoFilter.status === "pendentes") list = list.filter(p => !p.feito);
+    // Filter by date
+    if (pedidoFilter.date === "hoje") {
+      const t = new Date(); const td = `${String(t.getDate()).padStart(2,"0")}/${String(t.getMonth()+1).padStart(2,"0")}/${t.getFullYear()}`;
+      list = list.filter(p => p.envio === td);
+    } else if (pedidoFilter.date === "semana") {
+      const now = new Date(); now.setHours(0,0,0,0);
+      const end = new Date(now); end.setDate(end.getDate() + 7);
+      list = list.filter(p => {
+        if (!p.envio) return false;
+        const [d,m,y] = p.envio.split("/"); const dt = new Date(`${y}-${m}-${d}`);
+        return dt >= now && dt <= end;
+      });
+    }
+    // Sort
+    if (pedidoSort.field) {
+      const dir = pedidoSort.dir === "asc" ? 1 : -1;
+      list.sort((a, b) => {
+        let va = a[pedidoSort.field] || "", vb = b[pedidoSort.field] || "";
+        if (pedidoSort.field === "quantidade") return (a.quantidade - b.quantidade) * dir;
+        if (pedidoSort.field === "envio") {
+          const pa = va.split("/"); const pb = vb.split("/");
+          va = pa.length === 3 ? `${pa[2]}-${pa[1]}-${pa[0]}` : "";
+          vb = pb.length === 3 ? `${pb[2]}-${pb[1]}-${pb[0]}` : "";
+        }
+        return va < vb ? -dir : va > vb ? dir : 0;
+      });
+    }
+    return list;
+  };
+
+  // ─── Drag & drop reorder ───
+  const handlePedidoDrop = (targetId) => {
+    if (!pedidoDrag || pedidoDrag === targetId) return;
+    setPedidos(prev => {
+      const arr = [...prev];
+      const fromIdx = arr.findIndex(p => p.id === pedidoDrag);
+      const toIdx = arr.findIndex(p => p.id === targetId);
+      if (fromIdx < 0 || toIdx < 0) return prev;
+      const [item] = arr.splice(fromIdx, 1);
+      arr.splice(toIdx, 0, item);
+      return arr;
+    });
+    setPedidoDrag(null);
   };
 
   /* ─── Layout automático de PDFs ─── */
@@ -1084,9 +2036,12 @@ export default function App() {
       const bytes = new Uint8Array(await file.arrayBuffer());
       try {
         const doc = await PDFDocument.load(bytes);
-        const page = doc.getPage(0);
-        const { width, height } = page.getSize();
-        items.push({ name: file.name, bytes, width, height });
+        const pageCount = doc.getPageCount();
+        for (let pi = 0; pi < pageCount; pi++) {
+          const page = doc.getPage(pi);
+          const { width, height } = page.getSize();
+          items.push({ name: pageCount > 1 ? `${file.name} (p${pi + 1})` : file.name, bytes, width, height, pageIndex: pi });
+        }
       } catch (err) {
         console.error(`Erro ao ler ${file.name}:`, err);
       }
@@ -1138,7 +2093,9 @@ export default function App() {
 
           for (const item of placed) {
             const srcDoc = await PDFDocument.load(item.bytes);
-            const [embedded] = await doc.embedPages(srcDoc.getPages());
+            const pi = item.pageIndex || 0;
+            const srcPages = srcDoc.getPages();
+            const [embedded] = await doc.embedPages([srcPages[pi]]);
             page.drawPage(embedded, {
               x: item.x,
               y: totalH - item.y - item.height,
@@ -1197,23 +2154,109 @@ export default function App() {
       const dateStr = new Date().toISOString().slice(0, 10);
 
       // ── Helper: extract text elements from SVG ──
+      // Uses DOMParser so ancestor <g transform="..."> chains (matrix, translate,
+      // scale, rotate) are composed correctly — critical for CorelDraw exports
+      // like MOD016 where each <text> lives inside <g transform="matrix(...)">
+      // with local x/y far off-page (e.g. x="-5509.99"). Without composing the
+      // ancestor transforms, the PDF draws text off the page → invisible.
+      const parseTransform = (str) => {
+        // Returns { a, b, c, d, e, f } representing matrix [[a c e],[b d f],[0 0 1]]
+        let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+        if (!str) return M;
+        const compose = (A, B) => ({
+          a: A.a * B.a + A.c * B.b,
+          b: A.b * B.a + A.d * B.b,
+          c: A.a * B.c + A.c * B.d,
+          d: A.b * B.c + A.d * B.d,
+          e: A.a * B.e + A.c * B.f + A.e,
+          f: A.b * B.e + A.d * B.f + A.f,
+        });
+        const opRe = /(matrix|translate|scale|rotate)\s*\(([^)]*)\)/gi;
+        let mm;
+        while ((mm = opRe.exec(str)) !== null) {
+          const op = mm[1].toLowerCase();
+          const nums = mm[2].split(/[\s,]+/).filter(Boolean).map(Number);
+          let B = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+          if (op === "matrix" && nums.length >= 6) {
+            B = { a: nums[0], b: nums[1], c: nums[2], d: nums[3], e: nums[4], f: nums[5] };
+          } else if (op === "translate") {
+            B = { a: 1, b: 0, c: 0, d: 1, e: nums[0] || 0, f: nums[1] || 0 };
+          } else if (op === "scale") {
+            const sx = nums[0] || 1;
+            B = { a: sx, b: 0, c: 0, d: nums[1] !== undefined ? nums[1] : sx, e: 0, f: 0 };
+          } else if (op === "rotate") {
+            const rad = (nums[0] || 0) * Math.PI / 180;
+            const cs = Math.cos(rad), sn = Math.sin(rad);
+            B = { a: cs, b: sn, c: -sn, d: cs, e: 0, f: 0 };
+            // TODO: rotate with cx,cy would need pre/post translate; not used here.
+          }
+          M = compose(M, B);
+        }
+        return M;
+      };
+      const applyTransform = (t, x, y) => ({ x: t.a * x + t.c * y + t.e, y: t.b * x + t.d * y + t.f });
+
       const extractTexts = (svg) => {
         const texts = [];
-        const tRe = /<text\b([^>]*)>([^<]*)<\/text>/gi;
-        let tm;
-        while ((tm = tRe.exec(svg)) !== null) {
-          const attrs = tm[1];
-          const content = tm[2].replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-          if (!content.trim()) continue;
-          const x = parseFloat((attrs.match(/x="([^"]*)"/) || [])[1]);
-          const y = parseFloat((attrs.match(/y="([^"]*)"/) || [])[1]);
-          if (isNaN(x) || isNaN(y)) continue;
-          const cls = (attrs.match(/class="([^"]*)"/) || [])[1] || "";
-          const anchor = (attrs.match(/text-anchor="([^"]*)"/) || [])[1] || "start";
+        let doc;
+        try {
+          doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+        } catch (e) {
+          console.warn("[PDF] DOMParser failed:", e);
+          return texts;
+        }
+        // If parsererror was produced (malformed SVG), bail gracefully
+        if (doc.getElementsByTagName("parsererror").length) {
+          console.warn("[PDF] SVG parse error");
+          return texts;
+        }
+        // Walk up from a <text> element composing every ancestor's transform attribute
+        const ancestorTransform = (el) => {
+          let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+          const compose = (A, B) => ({
+            a: A.a * B.a + A.c * B.b,
+            b: A.b * B.a + A.d * B.b,
+            c: A.a * B.c + A.c * B.d,
+            d: A.b * B.c + A.d * B.d,
+            e: A.a * B.e + A.c * B.f + A.e,
+            f: A.b * B.e + A.d * B.f + A.f,
+          });
+          const chain = [];
+          let cur = el;
+          while (cur && cur.nodeType === 1) {
+            const tr = cur.getAttribute && cur.getAttribute("transform");
+            if (tr) chain.unshift(parseTransform(tr));
+            cur = cur.parentNode;
+          }
+          for (const t of chain) M = compose(M, t);
+          return M;
+        };
+
+        const textNodes = doc.getElementsByTagName("text");
+        for (const el of Array.from(textNodes)) {
+          // Skip contour halo/cut layers — only keep the fill text for PDF
+          if (el.hasAttribute("data-contour")) continue;
+          const content = (el.textContent || "").trim();
+          if (!content) continue;
+          const x0 = parseFloat(el.getAttribute("x"));
+          const y0 = parseFloat(el.getAttribute("y"));
+          if (isNaN(x0) || isNaN(y0)) continue;
+          const M = ancestorTransform(el);
+          const { x, y } = applyTransform(M, x0, y0);
+          const cls = el.getAttribute("class") || "";
+          const id = el.getAttribute("id") || "";
+          const anchor = el.getAttribute("text-anchor") || "start";
           let fontSize = 0;
-          const styleSize = attrs.match(/font-size:([0-9.]+)px/);
-          if (styleSize) fontSize = parseFloat(styleSize[1]);
-          texts.push({ x, y, content, cls, anchor, fontSize });
+          const style = el.getAttribute("style") || "";
+          const sm = style.match(/font-size:\s*([0-9.]+)px/);
+          if (sm) fontSize = parseFloat(sm[1]);
+          // Inline fill (from injectNames) takes precedence over the class's
+          // filN color. We force fill:#000000 on every injected text so the PDF
+          // always draws pure black, regardless of whether the template's .filN
+          // would otherwise be white (e.g. MOD002/017 white-on-black designs).
+          const fillMatch = style.match(/fill:\s*(#[0-9a-fA-F]{3,6})/);
+          const inlineFill = fillMatch ? fillMatch[1] : null;
+          texts.push({ x, y, content, cls, id, anchor, fontSize, inlineFill });
         }
         return texts;
       };
@@ -1221,6 +2264,22 @@ export default function App() {
       // ── Helper: extract vector cut lines from SVG ──
       const extractCutLines = (svg) => {
         const lines = [];
+        // Dedupe key: normalize endpoint order so (A→B) and (B→A) collapse to
+        // the same entry. Some CorelDraw exports (MOD010/011/012) include the
+        // same cut line 2-3 times — without dedup the cutter tries to cut each
+        // line multiple times, which slows down the job and risks over-cutting.
+        const seen = new Set();
+        const push = (x1, y1, x2, y2, type) => {
+          if ([x1, y1, x2, y2].some(isNaN)) return;
+          const r = (n) => Math.round(n * 100) / 100; // 2-decimal tolerance
+          const a = [r(x1), r(y1)], b = [r(x2), r(y2)];
+          const [p1, p2] = (a[0] < b[0] || (a[0] === b[0] && a[1] <= b[1])) ? [a, b] : [b, a];
+          const key = `${type}|${p1[0]},${p1[1]}|${p2[0]},${p2[1]}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          lines.push({ x1, y1, x2, y2, type });
+        };
+
         const strLineRe = /<line\b([^>]*class="[^"]*str[^"]*"[^>]*)\/?\s*>/gi;
         let lm;
         while ((lm = strLineRe.exec(svg)) !== null) {
@@ -1229,8 +2288,7 @@ export default function App() {
           const y1 = parseFloat((a.match(/y1\s*=\s*"([^"]*)"/) || [])[1]);
           const x2 = parseFloat((a.match(/x2\s*=\s*"([^"]*)"/) || [])[1]);
           const y2 = parseFloat((a.match(/y2\s*=\s*"([^"]*)"/) || [])[1]);
-          if ([x1, y1, x2, y2].some(isNaN)) continue;
-          lines.push({ x1, y1, x2, y2, type: a.includes("str0") ? "border" : "cut" });
+          push(x1, y1, x2, y2, a.includes("str0") ? "border" : "cut");
         }
         const strPolyRe = /<polygon\b([^>]*class="[^"]*str0[^"]*"[^>]*)\/?\s*>/gi;
         let pm;
@@ -1241,11 +2299,172 @@ export default function App() {
           for (let i = 0; i < coords.length; i++) {
             const [ax, ay] = coords[i];
             const [bx, by] = coords[(i + 1) % coords.length];
-            if ([ax, ay, bx, by].some(isNaN)) continue;
-            lines.push({ x1: ax, y1: ay, x2: bx, y2: by, type: "border" });
+            push(ax, ay, bx, by, "border");
           }
         }
         return lines;
+      };
+
+      // ── Helper: extract cut-contour <path class="...strN..."> as vector ──
+      // Emits each path's raw SVG d, its composed ancestor transform matrix, and
+      // a "cut" tag. CorelDraw's classic CutContour is str1 with stroke #EC2A90,
+      // but any strN is treated as a potential cut/border so the cutter follows
+      // the actual curve instead of a raster approximation.
+      const extractCutPaths = (svg) => {
+        const paths = [];
+        let doc;
+        try { doc = new DOMParser().parseFromString(svg, "image/svg+xml"); }
+        catch { return paths; }
+        if (doc.getElementsByTagName("parsererror").length) return paths;
+        // Reuse ancestorTransform logic inline (same math as extractTexts)
+        const composeMat = (A, B) => ({
+          a: A.a * B.a + A.c * B.b,
+          b: A.b * B.a + A.d * B.b,
+          c: A.a * B.c + A.c * B.d,
+          d: A.b * B.c + A.d * B.d,
+          e: A.a * B.e + A.c * B.f + A.e,
+          f: A.b * B.e + A.d * B.f + A.f,
+        });
+        const parseMat = (str) => {
+          let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+          if (!str) return M;
+          const opRe = /(matrix|translate|scale|rotate)\s*\(([^)]*)\)/gi;
+          let mm;
+          while ((mm = opRe.exec(str)) !== null) {
+            const op = mm[1].toLowerCase();
+            const n = mm[2].split(/[\s,]+/).filter(Boolean).map(Number);
+            let B = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+            if (op === "matrix" && n.length >= 6) B = { a: n[0], b: n[1], c: n[2], d: n[3], e: n[4], f: n[5] };
+            else if (op === "translate") B = { a: 1, b: 0, c: 0, d: 1, e: n[0] || 0, f: n[1] || 0 };
+            else if (op === "scale") { const sx = n[0] || 1; B = { a: sx, b: 0, c: 0, d: n[1] !== undefined ? n[1] : sx, e: 0, f: 0 }; }
+            else if (op === "rotate") { const r = (n[0] || 0) * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r); B = { a: cs, b: sn, c: -sn, d: cs, e: 0, f: 0 }; }
+            M = composeMat(M, B);
+          }
+          return M;
+        };
+        const ancestorMat = (el) => {
+          let M = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+          const chain = [];
+          let cur = el;
+          while (cur && cur.nodeType === 1) {
+            const tr = cur.getAttribute && cur.getAttribute("transform");
+            if (tr) chain.unshift(parseMat(tr));
+            cur = cur.parentNode;
+          }
+          for (const t of chain) M = composeMat(M, t);
+          return M;
+        };
+        // Helper: convert primitive SVG shapes (circle, ellipse, rect) to a d
+        // attribute so they can go through the same Bezier-aware parsePathD +
+        // PDF operator pipeline as <path>. Used by MOD004/005/006 which export
+        // sticker cut outlines as <circle class="str1"> / <ellipse class="str1">.
+        const K = 0.5522847498307936; // quadrant cubic-bezier approximation constant
+        const shapeToD = (el) => {
+          const tag = el.tagName.toLowerCase();
+          if (tag === "circle") {
+            const cx = parseFloat(el.getAttribute("cx")) || 0;
+            const cy = parseFloat(el.getAttribute("cy")) || 0;
+            const r = parseFloat(el.getAttribute("r")) || 0;
+            if (r <= 0) return null;
+            const k = r * K;
+            return `M ${cx + r} ${cy} C ${cx + r} ${cy + k}, ${cx + k} ${cy + r}, ${cx} ${cy + r} C ${cx - k} ${cy + r}, ${cx - r} ${cy + k}, ${cx - r} ${cy} C ${cx - r} ${cy - k}, ${cx - k} ${cy - r}, ${cx} ${cy - r} C ${cx + k} ${cy - r}, ${cx + r} ${cy - k}, ${cx + r} ${cy} Z`;
+          }
+          if (tag === "ellipse") {
+            const cx = parseFloat(el.getAttribute("cx")) || 0;
+            const cy = parseFloat(el.getAttribute("cy")) || 0;
+            const rx = parseFloat(el.getAttribute("rx")) || 0;
+            const ry = parseFloat(el.getAttribute("ry")) || 0;
+            if (rx <= 0 || ry <= 0) return null;
+            const kx = rx * K, ky = ry * K;
+            return `M ${cx + rx} ${cy} C ${cx + rx} ${cy + ky}, ${cx + kx} ${cy + ry}, ${cx} ${cy + ry} C ${cx - kx} ${cy + ry}, ${cx - rx} ${cy + ky}, ${cx - rx} ${cy} C ${cx - rx} ${cy - ky}, ${cx - kx} ${cy - ry}, ${cx} ${cy - ry} C ${cx + kx} ${cy - ry}, ${cx + rx} ${cy - ky}, ${cx + rx} ${cy} Z`;
+          }
+          if (tag === "rect") {
+            const x = parseFloat(el.getAttribute("x")) || 0;
+            const y = parseFloat(el.getAttribute("y")) || 0;
+            const w = parseFloat(el.getAttribute("width")) || 0;
+            const h = parseFloat(el.getAttribute("height")) || 0;
+            if (w <= 0 || h <= 0) return null;
+            return `M ${x} ${y} L ${x + w} ${y} L ${x + w} ${y + h} L ${x} ${y + h} Z`;
+          }
+          return null;
+        };
+        // Only str1+ is the CutContour convention (magenta #EC2A90). str0 is
+        // CorelDraw's black page/border stroke — treat separately (stays in the
+        // raster as a thin black frame; not a cut line for the machine).
+        for (const tag of ["path", "circle", "ellipse", "rect"]) {
+          for (const el of Array.from(doc.getElementsByTagName(tag))) {
+            const cls = el.getAttribute("class") || "";
+            const strMatch = cls.match(/\bstr(\d+)\b/);
+            if (!strMatch) continue;
+            if (strMatch[1] === "0") continue; // skip black page border
+            const d = tag === "path" ? el.getAttribute("d") : shapeToD(el);
+            if (!d) continue;
+            paths.push({ d, M: ancestorMat(el), cls });
+          }
+        }
+        return paths;
+      };
+
+      // Parse SVG path d attribute → flat list of PDF-space path operators
+      // after applying matrix M. Supports M/m, L/l, H/h, V/v, C/c, Z/z.
+      // Each operator is {op: "m"|"l"|"c"|"h", pts: [{x,y}, ...]} in SVG coords,
+      // caller applies final SVG→PDF transform (scX, -scY, pageHpt) when emitting.
+      const parsePathD = (d) => {
+        const ops = [];
+        const tokRe = /([MmLlHhVvCcZzSsQqTtAa])|(-?[0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)/gi;
+        let tok, cmd = null, nums = [], curX = 0, curY = 0, startX = 0, startY = 0;
+        const flush = () => {
+          if (!cmd) return;
+          if (cmd === "M") {
+            for (let i = 0; i + 1 < nums.length; i += 2) {
+              const x = nums[i], y = nums[i + 1];
+              if (i === 0) { ops.push({ op: "m", pts: [{ x, y }] }); startX = x; startY = y; }
+              else ops.push({ op: "l", pts: [{ x, y }] });
+              curX = x; curY = y;
+            }
+          } else if (cmd === "m") {
+            for (let i = 0; i + 1 < nums.length; i += 2) {
+              const x = curX + nums[i], y = curY + nums[i + 1];
+              if (i === 0) { ops.push({ op: "m", pts: [{ x, y }] }); startX = x; startY = y; }
+              else ops.push({ op: "l", pts: [{ x, y }] });
+              curX = x; curY = y;
+            }
+          } else if (cmd === "L") {
+            for (let i = 0; i + 1 < nums.length; i += 2) { curX = nums[i]; curY = nums[i + 1]; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); }
+          } else if (cmd === "l") {
+            for (let i = 0; i + 1 < nums.length; i += 2) { curX += nums[i]; curY += nums[i + 1]; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); }
+          } else if (cmd === "H") { for (const n of nums) { curX = n; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); } }
+          else if (cmd === "h") { for (const n of nums) { curX += n; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); } }
+          else if (cmd === "V") { for (const n of nums) { curY = n; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); } }
+          else if (cmd === "v") { for (const n of nums) { curY += n; ops.push({ op: "l", pts: [{ x: curX, y: curY }] }); } }
+          else if (cmd === "C") {
+            for (let i = 0; i + 5 < nums.length; i += 6) {
+              const c1 = { x: nums[i], y: nums[i + 1] };
+              const c2 = { x: nums[i + 2], y: nums[i + 3] };
+              const p  = { x: nums[i + 4], y: nums[i + 5] };
+              ops.push({ op: "c", pts: [c1, c2, p] });
+              curX = p.x; curY = p.y;
+            }
+          } else if (cmd === "c") {
+            for (let i = 0; i + 5 < nums.length; i += 6) {
+              const c1 = { x: curX + nums[i],     y: curY + nums[i + 1] };
+              const c2 = { x: curX + nums[i + 2], y: curY + nums[i + 3] };
+              const p  = { x: curX + nums[i + 4], y: curY + nums[i + 5] };
+              ops.push({ op: "c", pts: [c1, c2, p] });
+              curX = p.x; curY = p.y;
+            }
+          } else if (cmd === "Z" || cmd === "z") {
+            ops.push({ op: "h", pts: [] });
+            curX = startX; curY = startY;
+          }
+          nums = [];
+        };
+        while ((tok = tokRe.exec(d)) !== null) {
+          if (tok[1]) { flush(); cmd = tok[1]; }
+          else nums.push(parseFloat(tok[2]));
+        }
+        flush();
+        return ops;
       };
 
       // ── Helper: map font-family CSS to font file key ──
@@ -1260,6 +2479,10 @@ export default function App() {
         if (family.includes("trebuchet")) return "trebuc";
         if (family.includes("dk coal") || family.includes("coal brush")) return "dkcoalbrush";
         if (family.includes("misses")) return "misses";
+        if (family.includes("cerulean")) return "ceruleanlove";
+        if (family.includes("comfortaa")) return isBold ? "comfortaabd" : "comfortaa";
+        if (family.includes("cookie")) return "cookie";
+        if (family.includes("astral")) return "astralsisters";
         return null;
       };
 
@@ -1276,7 +2499,7 @@ export default function App() {
         "arial": "arial.ttf", "arialbd": "arialbd.ttf", "ariali": "ariali.ttf",
         "calibri": "calibri.ttf", "georgia": "Georgia.ttf", "verdana": "verdana.ttf",
         "tahoma": "tahoma.ttf", "comic": "comic.ttf", "trebuc": "trebuc.ttf",
-        "dkcoalbrush": "dkcoalbrush.otf", "misses": "misses.otf",
+        "dkcoalbrush": "dkcoalbrush.otf", "misses": "misses.otf", "ceruleanlove": "ceruleanlove.ttf", "comfortaa": "comfortaa.ttf", "comfortaabd": "comfortaabd.ttf", "cookie": "cookie.ttf", "astralsisters": "astralsisters.ttf",
       };
       const fontBytesCache = {};
       for (const [key, file] of Object.entries(FONT_FILES)) {
@@ -1299,6 +2522,80 @@ export default function App() {
         byModel[key].push(item);
       }
 
+      // ── 3b. Load polygon libs for contour die-cut (like Python Shapely+fontTools) ──
+      const _hasContour = Object.keys(byModel).some(id => CONTOUR_MODELS.has(id));
+      let _opentype = null, _CL = null;
+      if (_hasContour) {
+        try {
+          // Load libs via <script src> to avoid UMD/module detection issues with Vite
+          const loadScript = (url) => new Promise((ok, fail) => {
+            const s = document.createElement("script");
+            s.src = url; s.onload = ok; s.onerror = fail;
+            document.head.appendChild(s);
+          });
+          if (!window.opentype) await loadScript("https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js");
+          if (!window.ClipperLib) await loadScript("https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js");
+          _opentype = window.opentype;
+          _CL = window.ClipperLib;
+          console.log("[PDF] Contour libs loaded:", !!_opentype, !!_CL);
+        } catch (e) { console.error("[PDF] Failed to load contour libs:", e); }
+      }
+      const _otCache = {};
+
+      // Helpers: flatten bezier curves to polylines (same idea as Python's RecordingPen)
+      const _flatQ = (x0,y0,cx,cy,x1,y1,n=6) => {
+        const r=[];for(let i=1;i<=n;i++){const t=i/n,m=1-t;r.push({x:m*m*x0+2*m*t*cx+t*t*x1,y:m*m*y0+2*m*t*cy+t*t*y1})}return r;
+      };
+      const _flatC = (x0,y0,a,b,c,d,x1,y1,n=8) => {
+        const r=[];for(let i=1;i<=n;i++){const t=i/n,m=1-t;r.push({x:m*m*m*x0+3*m*m*t*a+3*m*t*t*c+t*t*t*x1,y:m*m*m*y0+3*m*m*t*b+3*m*t*t*d+t*t*t*y1})}return r;
+      };
+      const _pathToPolys = (cmds) => {
+        const polys=[]; let cur=[],cx=0,cy=0;
+        for(const c of cmds){
+          if(c.type==='M'){if(cur.length>=3)polys.push(cur);cur=[{x:c.x,y:c.y}];cx=c.x;cy=c.y;}
+          else if(c.type==='L'){cur.push({x:c.x,y:c.y});cx=c.x;cy=c.y;}
+          else if(c.type==='Q'){cur.push(..._flatQ(cx,cy,c.x1,c.y1,c.x,c.y));cx=c.x;cy=c.y;}
+          else if(c.type==='C'){cur.push(..._flatC(cx,cy,c.x1,c.y1,c.x2,c.y2,c.x,c.y));cx=c.x;cy=c.y;}
+          else if(c.type==='Z'){if(cur.length>=3)polys.push(cur);cur=[];}
+        }
+        if(cur.length>=3)polys.push(cur);
+        return polys;
+      };
+      // Douglas-Peucker polygon simplification — reduces points while keeping shape
+      const _simplify = (pts, tol) => {
+        if (pts.length <= 2) return pts;
+        let maxD = 0, maxI = 0;
+        const a = pts[0], b = pts[pts.length - 1];
+        const dx = b.X - a.X, dy = b.Y - a.Y, lenSq = dx*dx + dy*dy;
+        for (let i = 1; i < pts.length - 1; i++) {
+          const px = pts[i].X - a.X, py = pts[i].Y - a.Y;
+          let d;
+          if (lenSq === 0) d = Math.sqrt(px*px + py*py);
+          else { const ex = px - (px*dx+py*dy)/lenSq*dx, ey = py - (px*dx+py*dy)/lenSq*dy; d = Math.sqrt(ex*ex + ey*ey); }
+          if (d > maxD) { maxD = d; maxI = i; }
+        }
+        if (maxD > tol) {
+          const l = _simplify(pts.slice(0, maxI+1), tol);
+          const r = _simplify(pts.slice(maxI), tol);
+          return l.slice(0,-1).concat(r);
+        }
+        return [a, b];
+      };
+      // Chaikin corner-cutting smoothing — turns angular polygon into smooth organic curve
+      const _chaikin = (pts, iterations = 3) => {
+        let p = pts;
+        for (let it = 0; it < iterations; it++) {
+          const next = [];
+          for (let i = 0; i < p.length; i++) {
+            const a = p[i], b = p[(i + 1) % p.length];
+            next.push({ X: Math.round(0.75 * a.X + 0.25 * b.X), Y: Math.round(0.75 * a.Y + 0.25 * b.Y) });
+            next.push({ X: Math.round(0.25 * a.X + 0.75 * b.X), Y: Math.round(0.25 * a.Y + 0.75 * b.Y) });
+          }
+          p = next;
+        }
+        return p;
+      };
+
       // ── 4. Generate one PDF per model ──
       for (const [modelId, items] of Object.entries(byModel)) {
         const refSvg = items[0].svg;
@@ -1306,8 +2603,15 @@ export default function App() {
         const [, , vbW, vbH] = (vbMatch ? vbMatch[1] : "0 0 17709 12357").split(/[\s,]+/).map(Number);
         const svgWm = refSvg.match(/width="([0-9.]+)mm"/);
         const svgHm = refSvg.match(/height="([0-9.]+)mm"/);
-        const cWmm = svgWm ? parseFloat(svgWm[1]) : vbW * 0.01214;
-        const cHmm = svgHm ? parseFloat(svgHm[1]) : vbH * 0.01214;
+        // Unit-less viewBox → assume SVG spec default (1 user unit = 1 CSS px =
+        // 25.4/96 mm ≈ 0.2646 mm). This is what Illustrator exports use. For
+        // CorelDraw exports with viewBox ~10000+, always pair with width="..mm".
+        // Heuristic: if viewBox is very large (>4000), keep legacy 0.01214 factor
+        // (matches pre-existing CorelDraw imports where mm attr was absent).
+        const PX_TO_MM = 25.4 / 96; // 0.2646
+        const fallbackFactor = vbW > 4000 ? 0.01214 : PX_TO_MM;
+        const cWmm = svgWm ? parseFloat(svgWm[1]) : vbW * fallbackFactor;
+        const cHmm = svgHm ? parseFloat(svgHm[1]) : vbH * fallbackFactor;
         const pageWpt = cWmm * MM;
         const pageHpt = cHmm * MM;
         const scX = pageWpt / vbW;
@@ -1325,6 +2629,32 @@ export default function App() {
           const size = parseFloat((css.match(/font-size:([0-9.]+)px/) || [])[1]) || 24;
           const family = ((css.match(/font-family:'?([^;'"]+)/) || [])[1] || "").trim().toLowerCase();
           fntInfo["fnt" + fm[1]] = { size, fontKey: mapFontKey(family, css.includes("font-weight:bold"), css.includes("font-style:italic")) };
+        }
+        // Parse .filN fill colors from CSS so PDF text matches template intent
+        // (e.g. MOD002 has black sticker backgrounds + white text via fil6=#FEFEFE).
+        // Without this the PDF always drew black, making white-on-black text invisible.
+        const filColor = {}; // { "fil6": cmyk(...), ... }
+        const filRe = /\.fil(\d+)\s*\{[^}]*fill:\s*#([0-9a-fA-F]{3,6})/gi;
+        let fim;
+        const hexToRgb01 = (hex) => {
+          if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
+          const r = parseInt(hex.substring(0, 2), 16) / 255;
+          const g = parseInt(hex.substring(2, 4), 16) / 255;
+          const b = parseInt(hex.substring(4, 6), 16) / 255;
+          return { r, g, b };
+        };
+        const rgbToCmyk = ({ r, g, b }) => {
+          const k = 1 - Math.max(r, g, b);
+          if (k >= 0.9995) return cmyk(0, 0, 0, 1);
+          const c = (1 - r - k) / (1 - k);
+          const m = (1 - g - k) / (1 - k);
+          const y = (1 - b - k) / (1 - k);
+          return cmyk(c, m, y, k);
+        };
+        while ((fim = filRe.exec(refSvg)) !== null) {
+          const rgb = hexToRgb01(fim[2]);
+          // Pure white → CMYK (0,0,0,0). rgbToCmyk handles it (k=0, c=m=y=0).
+          filColor["fil" + fim[1]] = rgbToCmyk(rgb);
         }
 
         // Create PDF document for this model
@@ -1369,6 +2699,19 @@ export default function App() {
           let svgClean = item.svg;
           svgClean = svgClean.replace(/<line\b[^>]*class="[^"]*str[^"]*"[^>]*\/?\s*>/gi, "");
           svgClean = svgClean.replace(/<polygon\b[^>]*class="[^"]*str0[^"]*"[^>]*\/?\s*>/gi, "");
+          // Strip strN tokens from the class attribute of all shape elements so
+          // the raster doesn't double-draw the magenta cut stroke (vector
+          // CutContour is emitted separately above). Applies to path/circle/
+          // ellipse/rect/line/polygon/polyline — whichever primitive CorelDraw
+          // chose for the sticker outline (MOD004/006 circle, MOD005 ellipse,
+          // MOD016 path, etc.). filN tokens stay so sticker backgrounds/fills
+          // still render.
+          svgClean = svgClean.replace(/(<(?:path|circle|ellipse|rect|line|polygon|polyline)\b[^>]*\sclass=")([^"]*)(")/gi, (_m, pre, cls, post) => {
+            // Strip only cut strokes (str1+, magenta CutContour). Keep str0 —
+            // that's the black page frame and must stay in the raster.
+            const cleaned = cls.replace(/\bstr[1-9]\d*\b/g, "").replace(/\s+/g, " ").trim();
+            return pre + cleaned + post;
+          });
           svgClean = svgClean.replace(/<text\b[^>]*>[^<]*<\/text>/gi, "");
           const blob = await svgToPng(svgClean, 3);
           const buf = await blob.arrayBuffer();
@@ -1379,8 +2722,21 @@ export default function App() {
           const img = isJpeg ? await doc.embedJpg(imgData) : await doc.embedPng(imgData);
           page.drawImage(img, { x: 0, y: 0, width: pageWpt, height: pageHpt });
 
+          // Register CutContour color space in page resources (needed before text for contour models)
+          const pageDict = page.node;
+          let resources = pageDict.get(PDFName.of("Resources"));
+          if (!resources) { resources = ctx.obj({}); pageDict.set(PDFName.of("Resources"), resources); }
+          let colorSpaces = resources.get(PDFName.of("ColorSpace"));
+          if (!colorSpaces) { colorSpaces = ctx.obj({}); resources.set(PDFName.of("ColorSpace"), colorSpaces); }
+          colorSpaces.set(PDFName.of("CS_CutContour"), sepRef);
+
+          const isContourPdf = CONTOUR_MODELS.has(modelId);
+
           // Vector text
-          for (const t of extractTexts(item.svg)) {
+          const _dbgTexts = extractTexts(item.svg);
+          console.log(`[PDF ${modelId}] texts=${_dbgTexts.length}`, _dbgTexts.map(t => `${t.id||"<no-id>"}@${t.x.toFixed(0)},${t.y.toFixed(0)} cls="${t.cls}" "${t.content}"`));
+          console.log(`[PDF ${modelId}] fntInfo=`, JSON.stringify(fntInfo), "pdfFonts=", Object.keys(pdfFonts));
+          for (const t of _dbgTexts) {
             const fntClass = (t.cls.match(/fnt\d+/) || [])[0];
             const info = fntClass ? fntInfo[fntClass] : null;
             const fs = t.fontSize || (info ? info.size : 24);
@@ -1389,24 +2745,132 @@ export default function App() {
             const xPt = t.x * scX;
             const yPt = pageHpt - t.y * scY;
             try {
-              if (font) {
+              const isNameField = !t.id || t.id.startsWith("campo_nome");
+              if (isContourPdf && isNameField && font && t.content.trim() && _opentype && _CL) {
+                // ── Contour model: polygon-based CutContour (like Python Shapely buffer) ──
+                const fResName = "Fcontour_" + (info.fontKey || "def");
+                let fontDict = resources.get(PDFName.of("Font"));
+                if (!fontDict) { fontDict = ctx.obj({}); resources.set(PDFName.of("Font"), fontDict); }
+                fontDict.set(PDFName.of(fResName), font.ref);
+
+                // Parse font with opentype.js (cached)
+                if (!_otCache[info.fontKey] && fontBytesCache[info.fontKey]) {
+                  try {
+                    const ab = fontBytesCache[info.fontKey].buffer.slice(
+                      fontBytesCache[info.fontKey].byteOffset,
+                      fontBytesCache[info.fontKey].byteOffset + fontBytesCache[info.fontKey].byteLength
+                    );
+                    _otCache[info.fontKey] = _opentype.parse(ab);
+                  } catch(e) { console.warn("[PDF] opentype parse failed:", e); }
+                }
+                const otFont = _otCache[info.fontKey];
+
+                // Encode text for PDF text rendering (black fill)
+                const encoded = font.encodeText(t.content);
+                const hexStr = Array.from(encoded.asBytes ? encoded.asBytes() : encoded, b => b.toString(16).padStart(2, "0")).join("");
+
+                // Use opentype.js advance width for consistent centering
+                const otTw = otFont ? otFont.getAdvanceWidth(t.content, pdfFS) : font.widthOfTextAtSize(t.content, pdfFS);
+                const drawX = t.anchor === "middle" ? xPt - otTw / 2 : xPt;
+
+                console.log("[PDF] otFont parsed:", !!otFont, "fontKey:", info.fontKey);
+                if (otFont) {
+                  const haloW = pdfFS * 0.45; // offset distance (same as SVG halo)
+
+                  // 1) Get text outline as path commands (positioned at origin, PDF scale)
+                  const otPath = otFont.getPath(t.content, 0, 0, pdfFS);
+                  const polys = _pathToPolys(otPath.commands);
+
+                  // 2) Convert to ClipperLib integer format (scale ×100 for precision)
+                  const SC = 100;
+                  const clipPolys = polys.map(p => p.map(pt => ({X: Math.round(pt.x * SC), Y: Math.round(pt.y * SC)})));
+
+                  // 3) Union all letter polygons (handles cursive overlap like Shapely unary_union)
+                  const clipper = new _CL.Clipper();
+                  clipper.AddPaths(clipPolys, _CL.PolyType.ptSubject, true);
+                  const unionResult = [];
+                  clipper.Execute(_CL.ClipType.ctUnion, unionResult, _CL.PolyFillType.pftNonZero, _CL.PolyFillType.pftNonZero);
+
+                  // 4) Offset outward by haloW (like Shapely .buffer(padding))
+                  const co = new _CL.ClipperOffset();
+                  co.ArcTolerance = haloW * SC * 0.025; // smooth round curves with moderate point count
+                  co.AddPaths(unionResult, _CL.JoinType.jtRound, _CL.EndType.etClosedPolygon);
+                  const offsetResult = [];
+                  co.Execute(offsetResult, haloW * SC);
+
+                  // 4b) Simplify → Chaikin smooth → re-simplify for clean organic contour
+                  for (let pi = 0; pi < offsetResult.length; pi++) {
+                    offsetResult[pi] = _simplify(offsetResult[pi], haloW * SC * 0.06); // aggressive simplify
+                    offsetResult[pi] = _chaikin(offsetResult[pi], 3); // smooth curves
+                    offsetResult[pi] = _simplify(offsetResult[pi], haloW * SC * 0.01); // clean up excess
+                  }
+
+                  console.log("[PDF] polys:", polys.length, "union:", unionResult.length, "offset pts:", offsetResult.reduce((s,p) => s+p.length, 0));
+                  // 5) Convert offset polygons to PDF path operators
+                  const pathOps = [];
+                  for (const poly of offsetResult) {
+                    for (let i = 0; i < poly.length; i++) {
+                      const px = (drawX + poly[i].X / SC).toFixed(2);
+                      const py = (yPt - poly[i].Y / SC).toFixed(2); // flip Y for PDF
+                      pathOps.push(i === 0 ? `${px} ${py} m` : `${px} ${py} l`);
+                    }
+                    pathOps.push("h"); // close subpath
+                  }
+
+                  // 6) Draw CutContour outline + optional black fill + text
+                  const isDarkPdf = DARK_CONTOUR_MODELS.has(modelId);
+                  const ops = ["q", "1 j 1 J"];
+
+                  // For dark models: fill the offset polygon with black background (1mm bleed past cut)
+                  if (isDarkPdf) {
+                    const bleedPt = 2.835; // 1mm in PDF points
+                    ops.push("0 0 0 1 k", "0 0 0 1 K"); // CMYK black fill + stroke
+                    ops.push(`${(bleedPt * 2).toFixed(2)} w`); // stroke extends 1mm outward
+                    ops.push("1 j 1 J"); // round join + cap
+                    ops.push(...pathOps);
+                    ops.push("B"); // fill + stroke = black bleeds 1mm past cut line
+                  }
+
+                  // CutContour thin outline
+                  ops.push(`/CS_CutContour CS`, `1 SCN`);
+                  ops.push(`0.75 w`); // thin hairline cut line
+                  ops.push(...pathOps);
+                  ops.push("S"); // stroke only
+
+                  // Text fill (white for dark models, black for normal)
+                  ops.push(isDarkPdf ? "0 0 0 0 k" : "0 0 0 1 k"); // white or black CMYK
+                  ops.push(`BT /${fResName} ${pdfFS.toFixed(2)} Tf 0 Tr`);
+                  ops.push(`${drawX.toFixed(2)} ${yPt.toFixed(2)} Td`);
+                  ops.push(`<${hexStr}> Tj ET`);
+                  ops.push("Q");
+
+                  const opsBytes = new TextEncoder().encode(ops.join("\n"));
+                  const rawStream = ctx.stream(opsBytes);
+                  const rawRef = ctx.register(rawStream);
+                  const contents = pageDict.get(PDFName.of("Contents"));
+                  if (contents instanceof PDFArray) {
+                    contents.push(rawRef);
+                  } else if (contents) {
+                    pageDict.set(PDFName.of("Contents"), ctx.obj([contents, rawRef]));
+                  } else {
+                    pageDict.set(PDFName.of("Contents"), rawRef);
+                  }
+                }
+              } else if (font) {
                 const tw = font.widthOfTextAtSize(t.content, pdfFS);
                 const drawX = t.anchor === "middle" ? xPt - tw / 2 : xPt;
-                page.drawText(t.content, { x: drawX, y: yPt, size: pdfFS, font, color: textColor });
+                // Pick the first .filN class on the <text> (CorelDraw pattern)
+                // and use its CSS fill color. Fallback to pure black.
+                const filCls = (t.cls.match(/fil\d+/) || [])[0];
+                const col = (filCls && filColor[filCls]) ? filColor[filCls] : textColor;
+                page.drawText(t.content, { x: drawX, y: yPt, size: pdfFS, font, color: col });
               } else {
-                page.drawText(t.content, { x: xPt, y: yPt, size: pdfFS, color: textColor });
+                const filCls = (t.cls.match(/fil\d+/) || [])[0];
+                const col = (filCls && filColor[filCls]) ? filColor[filCls] : textColor;
+                page.drawText(t.content, { x: xPt, y: yPt, size: pdfFS, color: col });
               }
             } catch (e) { console.warn("[PDF] drawText failed:", t.content, e.message); }
           }
-
-          // Vector cut lines — border uses CMYK gray, cut uses CutContour spot color
-          // Register CutContour color space in page resources
-          const pageDict = page.node;
-          let resources = pageDict.get(PDFName.of("Resources"));
-          if (!resources) { resources = ctx.obj({}); pageDict.set(PDFName.of("Resources"), resources); }
-          let colorSpaces = resources.get(PDFName.of("ColorSpace"));
-          if (!colorSpaces) { colorSpaces = ctx.obj({}); resources.set(PDFName.of("ColorSpace"), colorSpaces); }
-          colorSpaces.set(PDFName.of("CS_CutContour"), sepRef);
 
           // Draw border lines with CMYK gray
           for (const ln of vectorLines.filter(l => l.type === "border")) {
@@ -1449,6 +2913,58 @@ export default function App() {
               pageDict.set(PDFName.of("Contents"), rawRef);
             }
           }
+
+          // Draw curved cut paths as vector CutContour (e.g. MOD002 uses
+          // <path class="fil1 str1"> for the sticker outline). Without this the
+          // cut line ended up baked only in the raster PNG and the cutter had
+          // nothing to follow.
+          const cutPaths = extractCutPaths(item.svg);
+          if (cutPaths.length) {
+            const pathOps = [
+              "q",
+              "/CS_CutContour CS",
+              "1 SCN",
+              "0.5 w",
+              "1 j 1 J", // round join + cap for smooth curves
+            ];
+            for (const cp of cutPaths) {
+              const ops = parsePathD(cp.d);
+              const M = cp.M;
+              // Compose path-element transform with viewBox→PDF transform.
+              // PDF y-up vs SVG y-down, so we flip y: yPdf = pageHpt - svgY*scY.
+              const toPdf = (pt) => {
+                // Apply element ancestor transform to get SVG-space world coord
+                const sx = M.a * pt.x + M.c * pt.y + M.e;
+                const sy = M.b * pt.x + M.d * pt.y + M.f;
+                return { x: sx * scX, y: pageHpt - sy * scY };
+              };
+              for (const op of ops) {
+                if (op.op === "m") {
+                  const p = toPdf(op.pts[0]);
+                  pathOps.push(`${p.x.toFixed(2)} ${p.y.toFixed(2)} m`);
+                } else if (op.op === "l") {
+                  const p = toPdf(op.pts[0]);
+                  pathOps.push(`${p.x.toFixed(2)} ${p.y.toFixed(2)} l`);
+                } else if (op.op === "c") {
+                  const c1 = toPdf(op.pts[0]);
+                  const c2 = toPdf(op.pts[1]);
+                  const p  = toPdf(op.pts[2]);
+                  pathOps.push(`${c1.x.toFixed(2)} ${c1.y.toFixed(2)} ${c2.x.toFixed(2)} ${c2.y.toFixed(2)} ${p.x.toFixed(2)} ${p.y.toFixed(2)} c`);
+                } else if (op.op === "h") {
+                  pathOps.push("h");
+                }
+              }
+            }
+            pathOps.push("S"); // stroke
+            pathOps.push("Q");
+            const bytes = new TextEncoder().encode(pathOps.join("\n"));
+            const rs = ctx.stream(bytes);
+            const rsRef = ctx.register(rs);
+            const cont = pageDict.get(PDFName.of("Contents"));
+            if (cont instanceof PDFArray) cont.push(rsRef);
+            else if (cont) pageDict.set(PDFName.of("Contents"), ctx.obj([cont, rsRef]));
+            else pageDict.set(PDFName.of("Contents"), rsRef);
+          }
         }
 
         // Save this model's PDF bytes
@@ -1462,9 +2978,12 @@ export default function App() {
       for (const { name, bytes } of pdfResults) {
         try {
           const doc = await PDFDoc.load(bytes);
-          const page = doc.getPage(0);
-          const { width, height } = page.getSize();
-          layoutItems.push({ name, bytes: new Uint8Array(bytes), width, height });
+          const pageCount = doc.getPageCount();
+          for (let pi = 0; pi < pageCount; pi++) {
+            const page = doc.getPage(pi);
+            const { width, height } = page.getSize();
+            layoutItems.push({ name: pageCount > 1 ? `${name} (p${pi + 1})` : name, bytes: new Uint8Array(bytes), width, height, pageIndex: pi });
+          }
         } catch (err) { console.error("Erro ao processar PDF para layout:", err); }
       }
       if (layoutItems.length) {
@@ -1505,21 +3024,23 @@ export default function App() {
         .bs:hover{border-color:var(--accent);color:var(--accent)}
       `}</style>
 
-      <header style={{ padding: "20px 32px", borderBottom: "1px solid var(--brd)", display: "flex", alignItems: "center", justifyContent: "space-between", background: "linear-gradient(180deg,rgba(232,93,58,.06),transparent)" }}>
+      <header style={{ padding: "20px 32px", borderBottom: "1px solid var(--brd)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12, background: "linear-gradient(180deg,rgba(232,93,58,.06),transparent)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <div style={{ width: 42, height: 42, borderRadius: 12, background: "linear-gradient(135deg,#e85d3a,#ff9b7b)", display: "flex", alignItems: "center", justifyContent: "center" }}><I n="zap" s={22} /></div>
           <div><h1 style={{ fontSize: 20, fontWeight: 700 }}>Sticker Studio</h1><p style={{ fontSize: 12, color: "var(--t2)" }}>Personalização de Adesivos · Shopee</p></div>
         </div>
-        <div style={{ display: "flex", gap: 4, background: "var(--card)", borderRadius: 12, padding: 4, border: "1px solid var(--brd)" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, background: "var(--card)", borderRadius: 12, padding: 4, border: "1px solid var(--brd)" }}>
           <Tab active={tab === "gallery"} onClick={() => setTab("gallery")} icon="grid" label="Modelos" />
           <Tab active={tab === "generate"} onClick={() => setTab("generate")} icon="list" label="Gerar" />
           <Tab active={tab === "preview"} onClick={() => setTab("preview")} icon="eye" label="Preview" />
           <Tab active={tab === "print"} onClick={() => setTab("print")} icon="printer" label={`Impressão${printQueue.length ? ` (${printQueue.length})` : ""}`} />
-          <Tab active={tab === "pedidos"} onClick={() => setTab("pedidos")} icon="clipboard" label={`Pedidos${pedidos.length ? ` (${pedidos.length})` : ""}`} />
+          <Tab active={tab === "pedidos"} onClick={() => setTab("pedidos")} icon="clipboard" label={<>Pedidos{pedidos.length ? ` (${pedidos.length})` : ""}{pedidos.some(p => { if (p.feito || !p.envio) return false; const [d,m,y] = p.envio.split("/"); const dt = new Date(`${y}-${m}-${d}`); const t = new Date(); t.setHours(0,0,0,0); return dt <= t; }) && <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#f87171", marginLeft: 6, animation: "pulse 1.5s infinite" }} />}</>} />
           <Tab active={tab === "cartela"} onClick={() => setTab("cartela")} icon="target" label="Cartelas" />
           <Tab active={tab === "nomes"} onClick={() => setTab("nomes")} icon="list" label="Etiquetas Nome" />
           <Tab active={tab === "lapisdtf"} onClick={() => setTab("lapisdtf")} icon="list" label="Lápis DTF UV" />
           <Tab active={tab === "lapis"} onClick={() => setTab("lapis")} icon="list" label="Lapis" />
+          <Tab active={tab === "vetorizar"} onClick={() => setTab("vetorizar")} icon="target" label="Vetorizar" />
+          <Tab active={tab === "ampliar"} onClick={() => setTab("ampliar")} icon="zap" label="Ampliar" />
           <Tab active={tab === "help"} onClick={() => setTab("help")} icon="help" label="Ajuda" />
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -1615,18 +3136,56 @@ export default function App() {
         {/* GALLERY */}
         {tab === "gallery" && <div style={{ animation: "fadeIn .3s" }}>
           <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Galeria de Modelos</h2>
-          <p style={{ color: "var(--t2)", fontSize: 14, marginBottom: 24 }}>Selecione para configurar</p>
+          <p style={{ color: "var(--t2)", fontSize: 14, marginBottom: 16 }}>Selecione para configurar</p>
+
+          {/* Status panel: compact list of every model with a green/red dot
+              indicating operational flag. Purely informational — gallery below
+              shows all models to everyone regardless of operational status.
+              Admin can toggle via the check icon on each card. */}
+          {(() => {
+            const opCount = models.filter(m => m.operational).length;
+            return (
+              <div style={{ background: "var(--card)", borderRadius: 12, border: "1px solid var(--brd)", padding: "14px 16px", marginBottom: 20 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--t1)" }}>Status Operacional</div>
+                  <div style={{ fontSize: 12, color: "var(--t2)" }}>
+                    <b style={{ color: "#22c55e" }}>{opCount}</b> operacional{opCount !== 1 ? "is" : ""} · <b style={{ color: "#f87171" }}>{models.length - opCount}</b> pendente{(models.length - opCount) !== 1 ? "s" : ""}
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {models.map(m => (
+                    <div key={m.id} title={m.operational ? "Operacional" : "Não operacional"} style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 9px", borderRadius: 6, background: "var(--bg)", border: "1px solid var(--brd)", fontSize: 11, fontFamily: "mono", color: "var(--t2)" }}>
+                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: m.operational ? "#22c55e" : "#f87171", display: "inline-block", boxShadow: m.operational ? "0 0 6px rgba(34,197,94,.5)" : "none" }} />
+                      {m.displayName || m.id}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(180px,1fr))", gap: 16 }}>
             {models.map(m => (
               <div key={m.id} className="card-h" onClick={() => { setSelId(m.id); setTab(m.svgData || m.svgUrl ? "generate" : "config"); }} style={{ background: "var(--card)", borderRadius: 14, border: `1px solid ${selId === m.id ? "var(--accent)" : "var(--brd)"}`, cursor: "pointer", overflow: "hidden", transition: "all .25s" }}>
                 <div style={{ height: 130, background: m.thumbUrl ? `url(${m.thumbUrl}) center/cover` : "linear-gradient(135deg,#1e2230,#262a38)", display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
                   {!m.thumbUrl && <I n="image" s={28} />}
                   {m.svgData && <div style={{ position: "absolute", top: 8, right: 8, background: "#34d399", borderRadius: 20, padding: "2px 8px", fontSize: 10, fontWeight: 700, color: "#000" }}>SVG</div>}
+                  {m.operational
+                    ? <div style={{ position: "absolute", top: 8, left: 8, background: "#22c55e", borderRadius: 20, padding: "2px 8px", fontSize: 10, fontWeight: 700, color: "#fff", display: "flex", alignItems: "center", gap: 3 }}><I n="check" s={10} />OP</div>
+                    : <div style={{ position: "absolute", top: 8, left: 8, background: "#ef4444", borderRadius: 20, padding: "2px 8px", fontSize: 10, fontWeight: 700, color: "#fff", display: "flex", alignItems: "center", gap: 3 }}><I n="alert" s={10} />OFF</div>
+                  }
                 </div>
                 <div style={{ padding: "10px 14px" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <div style={{ fontWeight: 700, fontSize: 14 }}>{m.displayName || m.id}</div>
                     <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                      {isAdmin && (
+                        <button onClick={(e) => {
+                          e.stopPropagation();
+                          console.log("[toggle operational]", m.id, "from", m.operational, "to", !m.operational);
+                          upd(m.id, { operational: !m.operational });
+                        }} title={m.operational ? "Marcar como NÃO operacional" : "Marcar como operacional (libera pra usuários)"} style={{ background: "none", border: "none", cursor: "pointer", color: m.operational ? "#22c55e" : "var(--t3)", padding: 2, display: "flex", transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = m.operational ? "#f87171" : "#22c55e"} onMouseLeave={e => e.currentTarget.style.color = m.operational ? "#22c55e" : "var(--t3)"}><I n={m.operational ? "check-circle" : "circle"} s={14} /></button>
+                      )}
                       <button onClick={(e) => {
                         e.stopPropagation();
                         setSelId(m.id); setTab("config");
@@ -1667,7 +3226,7 @@ export default function App() {
                 {/* SVG */}
                 <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
                   <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                    <I n="file" s={18} /> Arquivo SVG
+                    <I n="file" s={18} /> {MULTI_VARIANT_MODELS.has(sel.id) ? "Cartela 5x2" : "Arquivo SVG"}
                     {sel.svgData && <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: "rgba(52,211,153,.15)", color: "#34d399", marginLeft: 8 }}>OK</span>}
                   </h3>
                   <input ref={fRef} type="file" accept=".svg" onChange={onSvg} hidden />
@@ -1681,6 +3240,28 @@ export default function App() {
                     </div>
                   )}
                 </div>
+                {/* SVG Variant 2 (MULTI_VARIANT_MODELS) */}
+                {MULTI_VARIANT_MODELS.has(sel.id) && (
+                  <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
+                    <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
+                      <I n="file" s={18} /> Cartela 4x2
+                      {sel.svgData2 && <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: "rgba(52,211,153,.15)", color: "#34d399", marginLeft: 8 }}>OK</span>}
+                    </h3>
+                    <input ref={fRef2} type="file" accept=".svg" onChange={onSvg2} hidden />
+                    <button className="bp" onClick={() => fRef2.current?.click()} style={{ width: "100%" }}><I n="upload" s={16} /> {sel.svgData2 ? "Substituir" : "Upload SVG Cartela 4x2"}</button>
+                    {sel.svgData2 && sel.fields2 && sel.fields2.length > 0 && (
+                      <div style={{ marginTop: 12, padding: 12, background: "var(--bg)", borderRadius: 10, fontSize: 12 }}>
+                        <div style={{ color: "var(--t2)", marginBottom: 6 }}>Campos detectados:</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {sel.fields2.map(f => <span key={f.name} style={{ background: "rgba(167,139,250,.15)", color: "#a78bfa", padding: "3px 10px", borderRadius: 6, fontSize: 11, fontFamily: "mono" }}>{f.name} {f.occurrences > 1 ? `(×${f.occurrences})` : ""}</span>)}
+                        </div>
+                      </div>
+                    )}
+                    {sel.svgData2 && (
+                      <button className="bs" onClick={() => upd(selId, { svgData2: null, svgUrl2: null, fields2: [], textCenters2: {}, fieldFntMap2: {}, fieldSiblings2: {} })} style={{ width: "100%", marginTop: 10, color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Resetar Cartela 4x2</button>
+                    )}
+                  </div>
+                )}
                 {/* Font */}
                 <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 20 }}>
                   <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}><I n="font" s={18} /> Fonte p/ medição</h3>
@@ -1695,10 +3276,56 @@ export default function App() {
                 {sel.svgData && <button className="bs" onClick={() => upd(selId, { svgData: null, svgUrl: null, fields: [], thumbUrl: null, glyphMap: {}, defaultAdv: 504, textCenters: {} })} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={16} /> Resetar</button>}
               </div>
               <div>
-                {sel.svgData ? <Calibration model={sel} onUpdate={upd} />
-                : <div style={{ background: "var(--card)", borderRadius: 14, border: "1px dashed var(--brd)", padding: 40, textAlign: "center", minHeight: 300, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                    <I n="target" s={40} /><p style={{ color: "var(--t2)", marginTop: 16 }}>Upload do SVG para calibrar</p>
-                  </div>}
+                {MULTI_VARIANT_MODELS.has(sel.id) && (
+                  <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+                    {[1, 2].map(v => {
+                      const has = v === 1 ? !!sel.svgData : !!sel.svgData2;
+                      return (
+                        <button key={v} onClick={() => has && setConfigVariant(v)} disabled={!has} style={{
+                          flex: 1, padding: "10px 14px", borderRadius: 10, fontSize: 13, fontWeight: 600,
+                          cursor: has ? "pointer" : "not-allowed", fontFamily: "inherit", transition: "all .15s",
+                          border: configVariant === v ? "2px solid var(--accent)" : "1px solid var(--brd)",
+                          background: configVariant === v ? "rgba(232,93,58,.15)" : "var(--card)",
+                          color: !has ? "var(--t3)" : (configVariant === v ? "#ff7b5c" : "var(--t2)"),
+                          opacity: has ? 1 : 0.5,
+                        }}>Calibrar Cartela {v === 1 ? "5x2" : "4x2"}{!has ? " (vazia)" : ""}</button>
+                      );
+                    })}
+                  </div>
+                )}
+                {(() => {
+                  const isV2 = MULTI_VARIANT_MODELS.has(sel.id) && configVariant === 2;
+                  if (isV2) {
+                    if (!sel.svgData2) {
+                      return <div style={{ background: "var(--card)", borderRadius: 14, border: "1px dashed var(--brd)", padding: 40, textAlign: "center", minHeight: 300, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                        <I n="target" s={40} /><p style={{ color: "var(--t2)", marginTop: 16 }}>Upload da Cartela 4x2 para calibrar</p>
+                      </div>;
+                    }
+                    const model2 = {
+                      ...sel,
+                      svgData: sel.svgData2,
+                      fields: sel.fields2 || [],
+                      textCenters: sel.textCenters2 || {},
+                      fieldFntMap: sel.fieldFntMap2 || {},
+                      fieldSiblings: sel.fieldSiblings2 || {},
+                      fontFamily: sel.fontFamily2 || sel.fontFamily,
+                      fontSize: sel.fontSize2 || sel.fontSize,
+                      maxWidth: sel.maxWidth2 || sel.maxWidth,
+                      fieldTypes: [], // multi-type not supported in variant 2
+                    };
+                    const upd2 = (id, u) => {
+                      const mapped = {};
+                      if (u.maxWidth !== undefined) mapped.maxWidth2 = u.maxWidth;
+                      if (u.fontSize !== undefined) mapped.fontSize2 = u.fontSize;
+                      if (Object.keys(mapped).length) upd(id, mapped);
+                    };
+                    return <Calibration key={`${sel.id}-v2`} model={model2} onUpdate={upd2} />;
+                  }
+                  return sel.svgData ? <Calibration key={`${sel.id}-v1`} model={sel} onUpdate={upd} />
+                  : <div style={{ background: "var(--card)", borderRadius: 14, border: "1px dashed var(--brd)", padding: 40, textAlign: "center", minHeight: 300, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                      <I n="target" s={40} /><p style={{ color: "var(--t2)", marginTop: 16 }}>Upload do SVG para calibrar</p>
+                    </div>;
+                })()}
               </div>
             </div>
           </>}
@@ -1742,6 +3369,46 @@ export default function App() {
                   </div>
                 </div>
               </div>
+
+              {/* Cartela + Fonte selectors (MULTI_VARIANT_MODELS) */}
+              {MULTI_VARIANT_MODELS.has(sel.id) && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+                  <div style={{ background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 14, padding: 14 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                      <I n="grid" s={14} />
+                      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--t2)" }}>Cartela</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {[1, 2].map(v => {
+                        const has = v === 1 ? !!sel.svgData : !!sel.svgData2;
+                        return (
+                          <button key={v} onClick={() => has && setSelectedVariant(v)} disabled={!has} style={{
+                            flex: 1, padding: "10px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600,
+                            cursor: has ? "pointer" : "not-allowed", fontFamily: "inherit", transition: "all .15s",
+                            border: selectedVariant === v ? "2px solid var(--accent)" : "1px solid var(--brd)",
+                            background: selectedVariant === v ? "rgba(232,93,58,.15)" : "var(--inp)",
+                            color: !has ? "var(--t3)" : (selectedVariant === v ? "#ff7b5c" : "var(--t2)"),
+                            opacity: has ? 1 : 0.5,
+                          }}>Cartela {v === 1 ? "5x2" : "4x2"}{!has ? " (vazia)" : ""}</button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div style={{ background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 14, padding: 14 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                      <I n="font" s={14} />
+                      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--t2)" }}>Fonte</span>
+                    </div>
+                    <select value={selectedFont} onChange={e => setSelectedFont(e.target.value)} style={{
+                      width: "100%", padding: "10px 14px", background: "var(--inp)", border: "1px solid var(--brd)",
+                      borderRadius: 10, color: "var(--t1)", fontSize: 14, fontFamily: "inherit", cursor: "pointer",
+                    }}>
+                      <option value="">— Padrão do SVG —</option>
+                      {FONT_OPTIONS.map(f => <option key={f.key} value={f.key} style={{ fontFamily: f.family }}>{f.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
 
               {/* Textareas: multi-type shows side-by-side, single-type shows one */}
               {isMultiType ? (
@@ -1921,7 +3588,7 @@ export default function App() {
               <p style={{ color: "var(--t2)", fontSize: 13 }}>{printQueue.length} cartela(s) na fila</p>
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              {printQueue.length > 0 && <button className="bs" onClick={() => { setPrintQueue([]); db.clearPrintQueue().catch(e => console.error(e)); }} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
+              {printQueue.length > 0 && <button className="bs" onClick={() => { setPrintQueue([]); db.clearPrintQueue({ userId: loggedUser, isAdmin }).catch(e => console.error(e)); }} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
               <button className="bp" onClick={generatePdf} disabled={!printQueue.length || pdfGenerating} style={{ background: printQueue.length ? "#34d399" : undefined, padding: "12px 28px" }}>
                 <I n="printer" s={18} /> {pdfGenerating ? "Gerando PDF..." : `Gerar PDF (${printQueue.length})`}
               </button>
@@ -2109,7 +3776,11 @@ export default function App() {
         </div>}
         {/* PEDIDOS */}
         {tab === "pedidos" && <div style={{ animation: "fadeIn .3s" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+          {/* Toast notification */}
+          {toastMsg && <div style={{ position: "fixed", top: 24, right: 24, zIndex: 9999, background: "var(--accent)", color: "#fff", padding: "12px 24px", borderRadius: 12, fontWeight: 600, fontSize: 14, boxShadow: "0 8px 32px rgba(0,0,0,.3)", animation: "fadeIn .3s" }}>{toastMsg}</div>}
+
+          {/* Header */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
             <div>
               <h2 style={{ fontSize: 22, fontWeight: 700 }}>Controle de Pedidos</h2>
               <p style={{ color: "var(--t2)", fontSize: 13 }}>
@@ -2117,11 +3788,12 @@ export default function App() {
               </p>
             </div>
             <div style={{ display: "flex", gap: 8 }}>
+              <button className="bs" onClick={exportPedidosCSV} style={{ display: "flex", alignItems: "center", gap: 6 }}><I n="download" s={14} /> CSV</button>
               <label className="bp" style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "12px 24px" }}>
                 <I n="upload" s={18} /> {pedidosParsing ? "Lendo PDF..." : "Importar Etiquetas"}
                 <input type="file" accept=".pdf" multiple onChange={handleLabelUpload} style={{ display: "none" }} disabled={pedidosParsing} />
               </label>
-              {pedidos.length > 0 && <button className="bs" onClick={() => { if (confirm("Limpar todos os pedidos?")) { setPedidos([]); db.deleteAllOrders().catch(e => console.error(e)); } }} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
+              {pedidos.length > 0 && <button className="bs" onClick={() => { if (confirm("Limpar todos os pedidos?")) { setPedidos([]); db.deleteAllOrders().catch(() => {}); showToast("Pedidos limpos"); } }} style={{ color: "#f87171", borderColor: "rgba(248,113,113,.3)" }}><I n="trash" s={14} /> Limpar</button>}
             </div>
           </div>
 
@@ -2134,216 +3806,204 @@ export default function App() {
               </p>
             </div>
           ) : (<>
-            {/* Filter by status */}
             {(() => {
-              const pendentes = pedidos.filter(p => !p.feito);
-              const feitos = pedidos.filter(p => p.feito);
-              // Group pendentes by envio date
-              const byDate = {};
-              pendentes.forEach(p => {
-                const key = p.envio || "Sem data";
-                if (!byDate[key]) byDate[key] = [];
-                byDate[key].push(p);
-              });
-              const sortedDates = Object.keys(byDate).sort((a, b) => {
-                if (a === "Sem data") return 1;
-                if (b === "Sem data") return -1;
-                const [da, ma, ya] = a.split("/"); const [db2, mb, yb] = b.split("/");
-                return new Date(`${ya}-${ma}-${da}`) - new Date(`${yb}-${mb}-${db2}`);
-              });
+              const filtered = getFilteredPedidos();
+              const pendentes = filtered.filter(p => !p.feito);
+              const feitos = filtered.filter(p => p.feito);
+              const allStores = [...new Set(pedidos.map(p => p.remetente).filter(Boolean))].sort();
+              const storeCounts = {};
+              pedidos.filter(p => !p.feito).forEach(p => { const k = p.remetente || "Sem loja"; storeCounts[k] = (storeCounts[k] || 0) + 1; });
+              const urgentCount = pedidos.filter(p => { if (p.feito || !p.envio) return false; const [d,m,y] = p.envio.split("/"); const dt = new Date(`${y}-${m}-${d}`); const t = new Date(); t.setHours(0,0,0,0); return dt <= t; }).length;
+
+              const thStyle = { padding: "10px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1, cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" };
+              const sortIcon = (f) => pedidoSort.field === f ? (pedidoSort.dir === "asc" ? " ▲" : " ▼") : "";
+
+              const isUrgent = (p) => { if (!p.envio) return false; const [d,m,y] = p.envio.split("/"); const dt = new Date(`${y}-${m}-${d}`); const t = new Date(); t.setHours(0,0,0,0); return dt <= t; };
+
+              // Render a table row
+              const renderRow = (p, isDone) => (
+                <tr key={p.id} draggable={!isDone} onDragStart={() => setPedidoDrag(p.id)} onDragOver={e => e.preventDefault()} onDrop={() => handlePedidoDrop(p.id)}
+                  style={{ borderBottom: "1px solid var(--brd)", background: isDone ? "rgba(52,211,153,.04)" : p.semArte ? "rgba(251,191,36,.08)" : isUrgent(p) ? "rgba(248,113,113,.06)" : "transparent", transition: "background .2s", cursor: isDone ? "default" : "grab" }}>
+                  <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                    <input type="checkbox" checked={pedidoSelected.has(p.id)} onChange={() => toggleSelectPedido(p.id)} style={{ accentColor: "var(--accent)", width: 16, height: 16, cursor: "pointer" }} />
+                  </td>
+                  <td style={{ padding: "8px 12px", textAlign: "center" }}>
+                    <button onClick={() => togglePedidoFeito(p.id)} style={{ background: isDone ? "#34d399" : "transparent", border: `2px solid ${isDone ? "#34d399" : "var(--brd)"}`, borderRadius: 6, width: 22, height: 22, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      {isDone && <I n="check" s={13} />}
+                    </button>
+                  </td>
+                  <td style={{ padding: "8px 12px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontWeight: 600, fontFamily: "mono", fontSize: 12, textDecoration: isDone ? "line-through" : "none", color: isDone ? "var(--t3)" : "var(--t1)" }}>{p.pedido || "—"}</span>
+                      {p.pedido && <button onClick={() => { navigator.clipboard.writeText(p.pedido); showToast("Copiado!"); }} title="Copiar" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0 }}><I n="copy" s={12} /></button>}
+                      {p.semArte && <span style={{ padding: "2px 6px", borderRadius: 6, fontSize: 9, fontWeight: 700, background: "rgba(251,191,36,.2)", color: "#fbbf24" }}>SEM ARTE</span>}
+                    </div>
+                  </td>
+                  <td style={{ padding: "8px 12px", color: isDone ? "var(--t3)" : "var(--t1)" }}>{p.remetente || "—"}</td>
+                  <td style={{ padding: "8px 12px" }}>
+                    {p.envio ? <span style={{ padding: "2px 8px", borderRadius: 8, fontSize: 11, fontWeight: 600, background: isDone ? "rgba(52,211,153,.1)" : isUrgent(p) ? "rgba(248,113,113,.15)" : "rgba(251,191,36,.12)", color: isDone ? "#34d399" : isUrgent(p) ? "#f87171" : "#fbbf24" }}>{p.envio}</span> : <span style={{ color: "var(--t3)" }}>—</span>}
+                  </td>
+                  <td style={{ padding: "8px 12px" }}>
+                    {(p.skus && p.skus.length > 1) ? p.skus.map((s, si) => (
+                      <div key={si} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+                        <span style={{ padding: "2px 8px", borderRadius: 8, fontSize: 11, fontWeight: 600, background: isDone ? "rgba(52,211,153,.1)" : "rgba(232,93,58,.12)", color: isDone ? "#34d399" : "#e85d3a" }}>{s.modelo}</span>
+                        <button onClick={() => renameSku(p.id, si)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 1, display: "flex" }}><I n="edit" s={11} /></button>
+                      </div>
+                    )) : (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ padding: "2px 8px", borderRadius: 8, fontSize: 11, fontWeight: 600, background: isDone ? "rgba(52,211,153,.1)" : "rgba(232,93,58,.12)", color: isDone ? "#34d399" : "#e85d3a" }}>{p.modelo || "—"}</span>
+                        <button onClick={() => renameSku(p.id, 0)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 1, display: "flex" }}><I n="edit" s={11} /></button>
+                      </div>
+                    )}
+                  </td>
+                  <td style={{ padding: "8px 12px", textAlign: "center", fontFamily: "mono", fontWeight: 700, color: isDone ? "var(--t3)" : "var(--t1)" }}>
+                    {(p.skus && p.skus.length > 1) ? p.skus.map((s, si) => <div key={si}>{s.quantidade}</div>) : (p.quantidade || "—")}
+                  </td>
+                  <td style={{ padding: "8px 12px" }}>
+                    <input value={p.obs || ""} onChange={e => updatePedidoObs(p.id, e.target.value)} placeholder="Obs..."
+                      style={{ background: "transparent", border: "1px solid var(--brd)", borderRadius: 6, padding: "4px 8px", fontSize: 11, color: "var(--t1)", width: 100 }} />
+                  </td>
+                  <td style={{ padding: "8px 12px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                      <button onClick={() => toggleSemArte(p.id)} title={p.semArte ? "Remover alerta" : "Sem arte"} style={{ background: "none", border: "none", cursor: "pointer", color: p.semArte ? "#fbbf24" : "var(--t3)", padding: 2, display: "flex" }}><I n="alert" s={13} /></button>
+                      <button onClick={() => removePedido(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex" }}><I n="trash" s={13} /></button>
+                    </div>
+                  </td>
+                </tr>
+              );
 
               return <>
                 {/* Summary cards */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 24 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 16 }}>
                   {[
                     { l: "Total", v: pedidos.length, c: "#e85d3a" },
-                    { l: "Pendentes", v: pendentes.length, c: "#fbbf24" },
+                    { l: "Pendentes", v: pedidos.filter(p => !p.feito).length, c: "#fbbf24" },
                     { l: "Sem Arte", v: pedidos.filter(p => p.semArte && !p.feito).length, c: "#f59e0b" },
-                    { l: "Feitos", v: feitos.length, c: "#34d399" },
+                    { l: "Feitos", v: pedidos.filter(p => p.feito).length, c: "#34d399" },
                     { l: "Unidades", v: pedidos.reduce((s, p) => s + (p.quantidade || 0), 0), c: "var(--t1)" },
                   ].map((s, i) => (
-                    <div key={i} style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", padding: 16, textAlign: "center" }}>
-                      <div style={{ fontSize: 28, fontWeight: 700, color: s.c, fontFamily: "mono" }}>{s.v}</div>
-                      <div style={{ fontSize: 11, color: "var(--t3)", marginTop: 4 }}>{s.l}</div>
+                    <div key={i} style={{ background: "var(--card)", borderRadius: 12, border: "1px solid var(--brd)", padding: 14, textAlign: "center" }}>
+                      <div style={{ fontSize: 26, fontWeight: 700, color: s.c, fontFamily: "mono" }}>{s.v}</div>
+                      <div style={{ fontSize: 10, color: "var(--t3)", marginTop: 2 }}>{s.l}</div>
                     </div>
                   ))}
                 </div>
 
+                {/* Store counters */}
+                {Object.keys(storeCounts).length > 1 && (
+                  <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                    {Object.entries(storeCounts).sort((a,b) => b[1]-a[1]).map(([store, count]) => (
+                      <button key={store} onClick={() => setPedidoFilter(f => ({ ...f, store: f.store === store ? "" : store }))}
+                        style={{ padding: "6px 14px", borderRadius: 10, fontSize: 12, fontWeight: 600, cursor: "pointer", border: pedidoFilter.store === store ? "2px solid var(--accent)" : "1px solid var(--brd)", background: pedidoFilter.store === store ? "rgba(232,93,58,.1)" : "var(--card)", color: pedidoFilter.store === store ? "var(--accent)" : "var(--t2)", transition: "all .2s" }}>
+                        {store} <span style={{ fontFamily: "mono", marginLeft: 4 }}>{count}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Search + Filters bar */}
+                <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+                  <input value={pedidoSearch} onChange={e => setPedidoSearch(e.target.value)} placeholder="Buscar pedido, loja, modelo..."
+                    style={{ flex: 1, minWidth: 200, background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 10, padding: "10px 16px", fontSize: 13, color: "var(--t1)" }} />
+                  <select value={pedidoFilter.status} onChange={e => setPedidoFilter(f => ({ ...f, status: e.target.value }))}
+                    style={{ background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "var(--t1)", cursor: "pointer" }}>
+                    <option value="">Todos status</option>
+                    <option value="pendentes">Pendentes</option>
+                    <option value="pendente">Pendente (sem alerta)</option>
+                    <option value="semArte">Sem Arte</option>
+                    <option value="feito">Feitos</option>
+                  </select>
+                  <select value={pedidoFilter.date} onChange={e => setPedidoFilter(f => ({ ...f, date: e.target.value }))}
+                    style={{ background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "var(--t1)", cursor: "pointer" }}>
+                    <option value="">Todas datas</option>
+                    <option value="hoje">Envio hoje</option>
+                    <option value="semana">Esta semana</option>
+                  </select>
+                  {allStores.length > 1 && <select value={pedidoFilter.store} onChange={e => setPedidoFilter(f => ({ ...f, store: e.target.value }))}
+                    style={{ background: "var(--card)", border: "1px solid var(--brd)", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "var(--t1)", cursor: "pointer" }}>
+                    <option value="">Todas lojas</option>
+                    {allStores.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>}
+                  {(pedidoSearch || pedidoFilter.store || pedidoFilter.status || pedidoFilter.date) && (
+                    <button onClick={() => { setPedidoSearch(""); setPedidoFilter({ store: "", status: "", date: "" }); }} className="bs" style={{ fontSize: 12, padding: "10px 14px" }}>Limpar filtros</button>
+                  )}
+                </div>
+
+                {/* Urgent alert */}
+                {urgentCount > 0 && (
+                  <div style={{ background: "rgba(248,113,113,.1)", border: "1px solid rgba(248,113,113,.3)", borderRadius: 12, padding: "12px 20px", marginBottom: 16, display: "flex", alignItems: "center", gap: 10, animation: "fadeIn .5s" }}>
+                    <span style={{ fontSize: 20 }}>⚠️</span>
+                    <span style={{ fontWeight: 600, color: "#f87171", fontSize: 13 }}>{urgentCount} pedido(s) com envio para hoje ou atrasado!</span>
+                  </div>
+                )}
+
+                {/* Bulk action toolbar */}
+                {pedidoSelected.size > 0 && (
+                  <div style={{ background: "var(--accent)", borderRadius: 12, padding: "10px 20px", marginBottom: 16, display: "flex", alignItems: "center", gap: 12, animation: "fadeIn .2s" }}>
+                    <span style={{ fontWeight: 700, color: "#fff", fontSize: 13 }}>{pedidoSelected.size} selecionado(s)</span>
+                    <button onClick={() => bulkAction("feito")} style={{ background: "rgba(255,255,255,.2)", border: "none", borderRadius: 8, padding: "6px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>✓ Marcar feito</button>
+                    <button onClick={() => bulkAction("semArte")} style={{ background: "rgba(255,255,255,.2)", border: "none", borderRadius: 8, padding: "6px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>⚠ Sem arte</button>
+                    <button onClick={() => bulkAction("delete")} style={{ background: "rgba(255,255,255,.2)", border: "none", borderRadius: 8, padding: "6px 14px", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>🗑 Excluir</button>
+                    <button onClick={() => setPedidoSelected(new Set())} style={{ background: "none", border: "none", color: "rgba(255,255,255,.7)", cursor: "pointer", marginLeft: "auto", fontSize: 12 }}>Cancelar</button>
+                  </div>
+                )}
+
+                {/* Results info */}
+                <div style={{ fontSize: 12, color: "var(--t3)", marginBottom: 8 }}>
+                  {filtered.length !== pedidos.length ? `Mostrando ${filtered.length} de ${pedidos.length} pedidos` : `${pendentes.length} pendente(s) · ${feitos.length} feito(s)`}
+                </div>
+
                 {/* Table — Pendentes */}
-                <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", overflow: "hidden" }}>
+                {pendentes.length > 0 && (
+                <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", overflow: "hidden", marginBottom: 20 }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                     <thead>
                       <tr style={{ borderBottom: "2px solid var(--brd)", textAlign: "left" }}>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1, width: 40 }}>Status</th>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Pedido</th>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Loja</th>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Envio Previsto</th>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Modelo</th>
-                        <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1, textAlign: "center" }}>Qtd</th>
-                        <th style={{ padding: "12px 16px", width: 40 }}></th>
+                        <th style={{ ...thStyle, width: 36, cursor: "default" }}>
+                          <input type="checkbox" checked={pedidoSelected.size > 0 && pendentes.every(p => pedidoSelected.has(p.id))} onChange={() => selectAllVisible(pendentes.map(p => p.id))} style={{ accentColor: "var(--accent)", width: 16, height: 16, cursor: "pointer" }} />
+                        </th>
+                        <th style={{ ...thStyle, width: 36, cursor: "default" }}>●</th>
+                        <th style={thStyle} onClick={() => togglePedidoSort("pedido")}>Pedido{sortIcon("pedido")}</th>
+                        <th style={thStyle} onClick={() => togglePedidoSort("remetente")}>Loja{sortIcon("remetente")}</th>
+                        <th style={thStyle} onClick={() => togglePedidoSort("envio")}>Envio{sortIcon("envio")}</th>
+                        <th style={thStyle} onClick={() => togglePedidoSort("modelo")}>Modelo{sortIcon("modelo")}</th>
+                        <th style={{ ...thStyle, textAlign: "center" }} onClick={() => togglePedidoSort("quantidade")}>Qtd{sortIcon("quantidade")}</th>
+                        <th style={{ ...thStyle, cursor: "default" }}>Obs</th>
+                        <th style={{ ...thStyle, width: 60, cursor: "default" }}></th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {sortedDates.map(date => (
-                        byDate[date].map((p) => {
-                          const isUrgent = (() => {
-                            if (!p.envio) return false;
-                            const [d, m, y] = p.envio.split("/");
-                            const envDate = new Date(`${y}-${m}-${d}`);
-                            const today = new Date(); today.setHours(0,0,0,0);
-                            return envDate <= today;
-                          })();
-                          return (
-                            <tr key={p.id} style={{ borderBottom: "1px solid var(--brd)", background: p.semArte ? "rgba(251,191,36,.08)" : isUrgent ? "rgba(248,113,113,.06)" : "transparent", transition: "background .2s" }}>
-                              <td style={{ padding: "10px 16px", textAlign: "center" }}>
-                                <button onClick={() => togglePedidoFeito(p.id)} style={{ background: "transparent", border: "2px solid var(--brd)", borderRadius: 6, width: 24, height: 24, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all .2s" }} />
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                                  <span style={{ fontWeight: 600, fontFamily: "mono", fontSize: 12 }}>{p.pedido || "—"}</span>
-                                  {p.pedido && <button onClick={() => { navigator.clipboard.writeText(p.pedido); }} title="Copiar" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0, transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="copy" s={13} /></button>}
-                                  {p.semArte && <span style={{ padding: "2px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, background: "rgba(251,191,36,.2)", color: "#fbbf24", whiteSpace: "nowrap" }}>SEM ARTE</span>}
-                                </div>
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>{p.remetente || "—"}</td>
-                              <td style={{ padding: "10px 16px" }}>
-                                {p.envio ? (
-                                  <span style={{ padding: "3px 10px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: isUrgent ? "rgba(248,113,113,.15)" : "rgba(251,191,36,.12)", color: isUrgent ? "#f87171" : "#fbbf24" }}>
-                                    {p.envio}
-                                  </span>
-                                ) : <span style={{ color: "var(--t3)" }}>—</span>}
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>
-                                {(p.skus && p.skus.length > 1) ? (
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                    {p.skus.map((s, si) => (
-                                      <div key={si} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                        <span style={{ padding: "3px 10px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "rgba(232,93,58,.12)", color: "#e85d3a" }}>
-                                          {s.modelo}
-                                        </span>
-                                        <button onClick={() => renameSku(p.id, si)} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0, transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={12} /></button>
-                                      </div>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                    <span style={{ padding: "3px 10px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "rgba(232,93,58,.12)", color: "#e85d3a" }}>
-                                      {p.modelo || "—"}
-                                    </span>
-                                    <button onClick={() => renameSku(p.id, 0)} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0, transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={12} /></button>
-                                  </div>
-                                )}
-                              </td>
-                              <td style={{ padding: "10px 16px", textAlign: "center", fontFamily: "mono" }}>
-                                {(p.skus && p.skus.length > 1) ? (
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                    {p.skus.map((s, si) => (
-                                      <span key={si} style={{ fontWeight: 700 }}>{s.quantidade}</span>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <span style={{ fontWeight: 700 }}>{p.quantidade || "—"}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                  <button onClick={() => toggleSemArte(p.id)} title={p.semArte ? "Remover alerta" : "Marcar sem arte"} style={{ background: "none", border: "none", cursor: "pointer", color: p.semArte ? "#fbbf24" : "var(--t3)", padding: 2, display: "flex", transition: "color .2s" }} onMouseEnter={e => { if (!p.semArte) e.currentTarget.style.color = "#fbbf24"; }} onMouseLeave={e => { if (!p.semArte) e.currentTarget.style.color = "var(--t3)"; }}>
-                                    <I n="alert" s={14} />
-                                  </button>
-                                  <button onClick={() => removePedido(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex" }}>
-                                    <I n="trash" s={14} />
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })
-                      ))}
-                    </tbody>
+                    <tbody>{pendentes.map(p => renderRow(p, false))}</tbody>
                   </table>
                 </div>
+                )}
 
                 {/* Feitos section */}
                 {feitos.length > 0 && (
-                  <div style={{ marginTop: 24 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                      <h3 style={{ fontSize: 15, fontWeight: 700, color: "#34d399" }}>Concluidos ({feitos.length})</h3>
+                  <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <h3 style={{ fontSize: 14, fontWeight: 700, color: "#34d399" }}>Concluídos ({feitos.length})</h3>
                       <button className="bs" onClick={() => {
                         const codes = feitos.map(p => p.pedido).filter(Boolean);
-                        if (!codes.length) return alert("Nenhum codigo para copiar.");
+                        if (!codes.length) return;
                         navigator.clipboard.writeText(codes.join("\n"));
-                        alert(`${codes.length} codigo(s) copiado(s)!`);
-                      }} style={{ color: "#34d399", borderColor: "rgba(52,211,153,.3)", display: "flex", alignItems: "center", gap: 6 }}>
-                        <I n="copy" s={14} /> Copiar todos os codigos
+                        showToast(`${codes.length} código(s) copiado(s)`);
+                      }} style={{ color: "#34d399", borderColor: "rgba(52,211,153,.3)", display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                        <I n="copy" s={13} /> Copiar códigos
                       </button>
                     </div>
                     <div style={{ background: "var(--card)", borderRadius: 14, border: "1px solid var(--brd)", overflow: "hidden" }}>
                       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                         <thead>
                           <tr style={{ borderBottom: "2px solid var(--brd)", textAlign: "left" }}>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1, width: 40 }}>Status</th>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Pedido</th>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Loja</th>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Envio Previsto</th>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>Modelo</th>
-                            <th style={{ padding: "12px 16px", fontWeight: 600, color: "var(--t2)", fontSize: 11, textTransform: "uppercase", letterSpacing: 1, textAlign: "center" }}>Qtd</th>
-                            <th style={{ padding: "12px 16px", width: 40 }}></th>
+                            <th style={{ ...thStyle, width: 36, cursor: "default" }}></th>
+                            <th style={{ ...thStyle, width: 36, cursor: "default" }}>●</th>
+                            <th style={thStyle}>Pedido</th><th style={thStyle}>Loja</th><th style={thStyle}>Envio</th>
+                            <th style={thStyle}>Modelo</th><th style={{ ...thStyle, textAlign: "center" }}>Qtd</th>
+                            <th style={{ ...thStyle, cursor: "default" }}>Obs</th>
+                            <th style={{ ...thStyle, width: 60, cursor: "default" }}></th>
                           </tr>
                         </thead>
-                        <tbody>
-                          {feitos.map(p => (
-                            <tr key={p.id} style={{ borderBottom: "1px solid var(--brd)", background: "rgba(52,211,153,.04)" }}>
-                              <td style={{ padding: "10px 16px", textAlign: "center" }}>
-                                <button onClick={() => togglePedidoFeito(p.id)} style={{ background: "#34d399", border: "2px solid #34d399", borderRadius: 6, width: 24, height: 24, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                                  <I n="check" s={14} />
-                                </button>
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                                  <span style={{ fontWeight: 600, fontFamily: "mono", fontSize: 12, textDecoration: "line-through", color: "var(--t3)" }}>{p.pedido || "—"}</span>
-                                  {p.pedido && <button onClick={() => { navigator.clipboard.writeText(p.pedido); }} title="Copiar" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0 }}><I n="copy" s={13} /></button>}
-                                </div>
-                              </td>
-                              <td style={{ padding: "10px 16px", color: "var(--t3)" }}>{p.remetente || "—"}</td>
-                              <td style={{ padding: "10px 16px", color: "var(--t3)" }}>{p.envio || "—"}</td>
-                              <td style={{ padding: "10px 16px" }}>
-                                {(p.skus && p.skus.length > 1) ? (
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                    {p.skus.map((s, si) => (
-                                      <div key={si} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                        <span style={{ padding: "3px 10px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "rgba(52,211,153,.1)", color: "#34d399" }}>
-                                          {s.modelo}
-                                        </span>
-                                        <button onClick={() => renameSku(p.id, si)} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0, transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "#34d399"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={12} /></button>
-                                      </div>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                    <span style={{ padding: "3px 10px", borderRadius: 8, fontSize: 12, fontWeight: 600, background: "rgba(52,211,153,.1)", color: "#34d399" }}>{p.modelo || "—"}</span>
-                                    <button onClick={() => renameSku(p.id, 0)} title="Renomear" style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex", flexShrink: 0, transition: "color .2s" }} onMouseEnter={e => e.currentTarget.style.color = "#34d399"} onMouseLeave={e => e.currentTarget.style.color = "var(--t3)"}><I n="edit" s={12} /></button>
-                                  </div>
-                                )}
-                              </td>
-                              <td style={{ padding: "10px 16px", textAlign: "center", fontFamily: "mono", color: "var(--t3)" }}>
-                                {(p.skus && p.skus.length > 1) ? (
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                                    {p.skus.map((s, si) => (
-                                      <span key={si}>{s.quantidade}</span>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <span>{p.quantidade || "—"}</span>
-                                )}
-                              </td>
-                              <td style={{ padding: "10px 16px" }}>
-                                <button onClick={() => removePedido(p.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--t3)", padding: 2, display: "flex" }}>
-                                  <I n="trash" s={14} />
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
+                        <tbody>{feitos.map(p => renderRow(p, true))}</tbody>
                       </table>
                     </div>
                   </div>
@@ -3078,6 +4738,8 @@ export default function App() {
         {tab === "nomes" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><NameLabels /></Suspense>}
         {tab === "lapisdtf" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><NameLabels key="dtf" variant="dtf" /></Suspense>}
         {tab === "lapis" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando PrintLab...</div>}><PrintLab /></Suspense>}
+        {tab === "vetorizar" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><Vectorize /></Suspense>}
+        {tab === "ampliar" && <Suspense fallback={<div style={{ textAlign: "center", padding: 60, color: "var(--t2)" }}>Carregando...</div>}><Upscale onVectorize={file => { sendFiles([file]); setTab("vetorizar"); }} /></Suspense>}
 
         {/* HELP / MANUAL */}
         {tab === "help" && <div style={{ animation: "fadeIn .3s", maxWidth: 800 }}>
