@@ -25,3 +25,5 @@ A pesquisa digita o código, aguarda o resultado abaixo da barra e clica na linh
 Substitua os arquivos da pasta instalada pelos do novo ZIP, abra chrome://extensions ou edge://extensions e clique em **Recarregar** na Ponte Duoke. Se a extensão está carregada diretamente da pasta `extension/duoke-bridge` deste projeto, basta recarregá-la. Atualize as abas do Studio e do Duoke e conecte as duas novamente.
 
 O Duoke abre uma conversa por vez para leitura. Após a coleta, o botão de extração do Lápis envia até 10 conversas ao Gemini por chamada e aplica os nomes de cada lote juntos. Por exemplo, 16 conversas selecionadas são processadas em dois lotes, de 10 e 6. A atualização da extensão não exige alterar os segredos do Supabase.
+
+`OPEN` (1.3.0) contém um `code` e serve ao botão **Conferir no Duoke**: traz a aba do Duoke pareada para a frente e abre a conversa do pedido com a mesma busca da coleta. Não devolve a conversa, não envia mensagem e é recusado enquanto houver coleta ou envio em andamento.

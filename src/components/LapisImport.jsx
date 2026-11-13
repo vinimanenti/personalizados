@@ -6,7 +6,7 @@ import { createCollectionRun, createSendRun } from '../lib/lapis-collection.mjs'
 import { AUTOPILOT_DEFAULT_MESSAGE, MAX_ASK_MESSAGE, MAX_SEND_ORDERS, classifyForAutopilot, loadAwaiting, planAsk, planAutopilot, recordSends, saveAwaiting, validateAskMessage } from '../../shared/lapis-autopilot.mjs';
 import { mergeLabelCodes } from '../../shared/shopee-label.mjs';
 import { CYCLE_MINUTES, DEFAULT_CYCLE_MINUTES, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, expireState, formatCycleMessage, isDue,
-  normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../../shared/lapis-continuous.mjs';
+  markDone, normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../../shared/lapis-continuous.mjs';
 import { createAutopilotClient, resolveAutopilotEndpoint } from '../lib/lapis-autopilot-api.mjs';
 import './LapisImport.css';
 
@@ -38,6 +38,29 @@ function readPilotSettings() {
   } catch { return PILOT_OFF; }
 }
 const timeText = at => new Date(at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+// Today shows the time; other days show the date too.
+const whenText = at => new Date(at).toDateString() === new Date().toDateString() ? timeText(at)
+  : new Date(at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+const PILOT_ROWS = 30;
+const PILOT_PHASES = [
+  { key: 'all', label: 'Todos' },
+  { key: 'review', label: 'Para revisar', badge: 'Para revisar', tone: 'alert' },
+  { key: 'failed', label: 'Sem leitura', badge: 'Sem leitura', tone: 'error' },
+  { key: 'awaiting', label: 'Aguardando cliente', badge: 'Aguardando cliente', tone: 'wait' },
+  { key: 'pending', label: 'A ler', badge: 'A ler', tone: 'muted' },
+  { key: 'done', label: 'Na fila hoje', badge: 'Na fila', tone: 'ok' },
+];
+const PHASE_RANK = { review: 0, failed: 1, awaiting: 2, pending: 3, done: 4 };
+const namesText = names => (names || []).map(entry => entry.quantity ? `${entry.name} (${entry.quantity})` : entry.name).join(', ');
+function pilotDetail(entry) {
+  if (entry.phase === 'done') return namesText(entry.review?.names) || 'Cartela enviada à fila de impressão.';
+  if (entry.phase === 'review') return [namesText(entry.review?.names), entry.review?.reason].filter(Boolean).join(' · ') || 'Use Trazer para revisão para ver a conversa.';
+  if (entry.phase === 'failed') return 'Conversa não encontrada no Duoke em 3 ciclos seguidos.';
+  if (entry.phase === 'awaiting') return entry.sentAt ? `Cobrado às ${whenText(entry.sentAt)}${entry.sendStatus === 'unconfirmed' ? ' (envio não confirmado)' : ''}.` : 'Aguardando o cliente mandar o nome.';
+  if (entry.lastStatus === 'not_found') return 'Conversa lida, cliente ainda sem nome.';
+  if (entry.failures) return `Tentativa ${entry.failures} de 3 sem encontrar a conversa.`;
+  return 'Será lido no próximo ciclo.';
+}
 const requestId = () => globalThis.crypto?.randomUUID?.() || `lapis-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const revision = order => JSON.stringify([order.id, order.names.map(({ name, quantity }) => [name, quantity])]);
 const post = (type, id, extra = {}) => window.postMessage({ source: 'sticker-studio', version: 1, requestId: id, type, ...extra }, window.location.origin);
@@ -116,7 +139,7 @@ function queueError(order) {
   catch (error) { return error.message; }
 }
 
-function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, connected, sendStatus, waitingSince, onResend }) {
+function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
   const validation = queueError(result);
   const canExtract = source.status === 'collected' && source.text.trim() && source.text.length <= 12000;
   const status = accepted ? 'Na fila' : hasNames(result) ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
@@ -143,7 +166,10 @@ function OrderReview({ source, result, extractionError, selected, reviewed, acce
     </div>)}
     <div className="lapis-order-footer">
       <button type="button" className="lapis-link-button" disabled={busy} onClick={onAddName}>+ Adicionar nome</button>
-      {!hasNames(result) ? <button type="button" disabled={busy || !connected} onClick={onRetry}>Buscar novamente</button> : null}
+      <span className="lapis-order-actions">
+        <button type="button" className="lapis-open-button" disabled={!canOpen} onClick={onOpen} title="Abre a conversa deste pedido na aba do Duoke">{opening ? 'Abrindo…' : 'Conferir no Duoke'}</button>
+        {!hasNames(result) ? <button type="button" disabled={busy || !connected} onClick={onRetry}>Buscar novamente</button> : null}
+      </span>
       {result?.names.length ? <label className="lapis-check lapis-review-check"><input type="checkbox" disabled={busy || Boolean(validation) || accepted} checked={Boolean(reviewed)} onChange={onReview} />{accepted ? 'Revisão adicionada à fila' : 'Conferi os nomes e as quantidades'}</label> : null}
     </div>
     {result?.names.length && validation ? <p className="lapis-error">{validation}</p> : null}
@@ -171,12 +197,15 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [awaitingSaved, setAwaitingSaved] = useState(true);
   const [askMessage, setAskMessage] = useState(readAskMessage);
   const [sendStatus, setSendStatus] = useState(dict);
-  const job = useRef(null), extraction = useRef(null), workflow = useRef(null), mounted = useRef(false), pendingStatus = useRef(new Map()), statusDeadline = useRef(null), enqueuing = useRef(false);
+  const job = useRef(null), extraction = useRef(null), workflow = useRef(null), mounted = useRef(false), pendingStatus = useRef(new Map()), statusDeadline = useRef(null), enqueuing = useRef(false), pendingOpen = useRef(new Map());
   const busy = phase !== 'idle' || queueBusy || uploading;
   const [pilot, setPilot] = useState(readPilotSettings);
   // null while not loaded: no cycle runs without the shared state.
   const [pilotState, setPilotStateValue] = useState(null);
   const [pilotInfo, setPilotInfo] = useState({ lastRun: 0, summary: '', error: '', loading: false });
+  const [openingId, setOpeningId] = useState('');
+  const [pilotFilter, setPilotFilter] = useState('all');
+  const [pilotRows, setPilotRows] = useState(PILOT_ROWS);
   const pilotStateRef = useRef(null), pilotSaved = useRef(new Set()), pilotSaveTimer = useRef(null), lastCycle = useRef(NaN),
     pendingAsk = useRef(null), disconnectedSince = useRef(0), disconnectAlerted = useRef(false), cycleFailureAlerted = useRef(false), tickRef = useRef(null);
   const pilotActive = pilot.enabled && pilotState !== null;
@@ -283,6 +312,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         setConnection({ connected: data.connected === true, duokeConnected: data.duokeConnected === true, busy: data.busy === true, checking: false });
         return;
       }
+      const opened = pendingOpen.current.get(data.requestId);
+      if (opened && ['OPENED', 'ERROR'].includes(data.type)) { pendingOpen.current.delete(data.requestId); opened(data); return; }
       job.current?.receive(data);
     };
     window.addEventListener('message', listener);
@@ -614,7 +645,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         // A queued order is answered: it leaves the pilot and the awaiting list, or the mirror would bring it back.
         const ids = orders.map(order => order.id);
         setAwaiting(current => Object.fromEntries(Object.entries(current).filter(([id]) => !ids.includes(id))));
-        setPilotState(current => removeFromState(current, ids));
+        const namesById = new Map(orders.map(order => [order.id, order.names]));
+        setPilotState(current => markDone(current, ids, { namesById }));
       }
       setNotice(`${orders.length} cartela${orders.length === 1 ? '' : 's'} adicionada${orders.length === 1 ? '' : 's'} à fila de impressão.`);
     } catch (failure) { setError(failure.message || 'Não foi possível adicionar os pedidos à fila.'); }
@@ -645,6 +677,25 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const connected = connection.connected && connection.duokeConnected;
   const connectionText = connection.checking && !connection.connected ? 'Verificando conexão…' : connected ? 'Duoke conectado' : connection.connected ? 'Conecte a aba do Duoke' : 'Conecte a extensão';
 
+  // "Conferir no Duoke": the extension brings the Duoke tab forward and opens the
+  // order's conversation (same search as collection, nothing is read back or sent).
+  const canOpen = connected && !connection.busy && !busy && !openingId;
+  const openInDuoke = async code => {
+    if (!canOpen) return;
+    setOpeningId(code); setError('');
+    const id = requestId();
+    const reply = await new Promise(resolve => {
+      const timer = setTimeout(() => { pendingOpen.current.delete(id); resolve({ type: 'ERROR', error: 'O Duoke não respondeu a tempo. Confira se a aba continua conectada.' }); }, 50000);
+      pendingOpen.current.set(id, data => { clearTimeout(timer); resolve(data); });
+      post('OPEN', id, { code });
+    });
+    if (!mounted.current) return;
+    setOpeningId('');
+    if (reply.type === 'OPENED' && reply.status === 'collected') setNotice(`Conversa do pedido ${code} aberta no Duoke.`);
+    else if (reply.type === 'OPENED' && reply.status === 'not_found') setError(`O pedido ${code} não foi encontrado no Duoke.`);
+    else setError(typeof reply.error === 'string' && reply.error ? reply.error : `Não foi possível abrir o pedido ${code} no Duoke.`);
+  };
+
   // Runs every PILOT_TICK from the latest render (via ref), so it always sees current state.
   tickRef.current = ({ force = false } = {}) => {
     if (!pilotActive) return;
@@ -660,7 +711,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     }
     disconnectedSince.current = 0; disconnectAlerted.current = false;
     if (pendingAsk.current && !pilot.autoAsk) pendingAsk.current = null;
-    if (pendingAsk.current || workflow.current || busy || connection.busy) return;
+    if (pendingAsk.current || workflow.current || busy || connection.busy || openingId) return;
     if (!force && !isDue(lastCycle.current, pilot.minutes, now)) return;
     lastCycle.current = now;
     const current = expireState(pilotStateRef.current, now);
@@ -682,8 +733,10 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     sendAsk(ids, { automatic: true });
   }, [phase, connected, connection.busy, pilot.enabled, pilot.autoAsk]);
 
-  const pilotCounts = { pending: 0, awaiting: 0, review: 0, failed: 0 };
+  const pilotCounts = { pending: 0, awaiting: 0, review: 0, failed: 0, done: 0 };
   for (const entry of stateList(pilotState || {})) pilotCounts[entry.phase]++;
+  const pilotList = stateList(pilotState || {}).filter(entry => pilotFilter === 'all' || entry.phase === pilotFilter)
+    .sort((a, b) => PHASE_RANK[a.phase] - PHASE_RANK[b.phase] || (a.phase === 'done' ? (b.doneAt || 0) - (a.doneAt || 0) : a.addedAt - b.addedAt));
   const pilotIds = phaseName => stateList(pilotState || {}).filter(entry => entry.phase === phaseName).map(entry => entry.id);
   const nextCycle = pilotActive && Number.isFinite(lastCycle.current) ? lastCycle.current + pilot.minutes * 60000 : 0;
   const testTelegram = async () => {
@@ -733,8 +786,31 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
           <span><strong>{pilotCounts.awaiting}</strong>aguardando cliente</span>
           <span className={pilotCounts.review ? 'is-alert' : ''}><strong>{pilotCounts.review}</strong>para revisar</span>
           <span className={pilotCounts.failed ? 'is-alert' : ''}><strong>{pilotCounts.failed}</strong>sem leitura</span>
+          <span className={pilotCounts.done ? 'is-ok' : ''}><strong>{pilotCounts.done}</strong>na fila hoje</span>
           <span><strong>{pilotInfo.lastRun ? timeText(pilotInfo.lastRun) : '—'}</strong>último ciclo</span>
           <span><strong>{busy ? 'agora' : nextCycle ? timeText(Math.max(nextCycle, Date.now())) : connected ? 'em instantes' : 'parado'}</strong>{connected ? 'próximo ciclo' : 'Duoke desconectado'}</span>
+        </div> : null}
+        {pilotState && stateList(pilotState).length ? <div className="lapis-pilot-list">
+          <div className="lapis-pilot-filters" role="tablist" aria-label="Filtrar pedidos do piloto">
+            {PILOT_PHASES.map(item => {
+              const total = item.key === 'all' ? stateList(pilotState).length : pilotCounts[item.key];
+              return item.key === 'all' || total ? <button key={item.key} type="button" role="tab" aria-selected={pilotFilter === item.key}
+                className={pilotFilter === item.key ? 'is-active' : ''} onClick={() => { setPilotFilter(item.key); setPilotRows(PILOT_ROWS); }}>{item.label}<span>{total}</span></button> : null;
+            })}
+          </div>
+          {pilotList.length ? <ul className="lapis-pilot-rows">
+            {pilotList.slice(0, pilotRows).map(entry => {
+              const meta = PILOT_PHASES.find(item => item.key === entry.phase);
+              return <li key={entry.id} className={`lapis-pilot-row is-${meta.tone}`}>
+                <code className="lapis-pilot-code">{entry.id}</code>
+                <span className={`lapis-pilot-badge is-${meta.tone}`}>{meta.badge}</span>
+                <span className="lapis-pilot-when" title="Entrou no piloto">{entry.phase === 'done' && entry.doneAt ? `às ${whenText(entry.doneAt)}` : `desde ${whenText(entry.addedAt)}`}</span>
+                <span className="lapis-pilot-detail">{pilotDetail(entry)}</span>
+                <button type="button" className="lapis-link-button" disabled={!canOpen} onClick={() => openInDuoke(entry.id)}>{openingId === entry.id ? 'Abrindo…' : 'Conferir no Duoke'}</button>
+              </li>;
+            })}
+          </ul> : <p className="lapis-batch-hint">Nenhum pedido neste filtro.</p>}
+          {pilotList.length > pilotRows ? <button type="button" className="lapis-link-button lapis-pilot-more" onClick={() => setPilotRows(rows => rows + PILOT_ROWS)}>Mostrar mais {Math.min(PILOT_ROWS, pilotList.length - pilotRows)} de {pilotList.length - pilotRows}</button> : null}
         </div> : null}
         {pilotInfo.summary ? <p className="lapis-reason">{pilotInfo.summary}</p> : null}
         {pilotInfo.error ? <p className="lapis-error" role="alert">{pilotInfo.error}</p> : null}
@@ -749,7 +825,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
           {pilotCounts.failed ? <button type="button" className="lapis-link-button" disabled={busy} onClick={() => setPilotState(current => removeFromState(current, pilotIds('failed')))}>Descartar sem leitura</button> : null}
           {pilot.telegram ? <button type="button" className="lapis-link-button" disabled={!accessCode.trim()} onClick={testTelegram}>Testar Telegram</button> : null}
         </div>
-        <p className="lapis-batch-hint">Pedidos entram no piloto pelo Processar lote, pelas etiquetas em PDF + Incluir códigos colados, ou cobrados por aqui. Saem quando vão para a fila; ficam no máximo 7 dias. Para revisar e sem leitura esperam você.</p>
+        <p className="lapis-batch-hint">Pedidos entram no piloto pelo Processar lote, pelas etiquetas em PDF + Incluir códigos colados, ou cobrados por aqui. Os que vão para a fila aparecem como Na fila até a meia-noite; os outros ficam no máximo 7 dias. Para revisar e sem leitura esperam você.</p>
       </> : null}
     </div>
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : phase === 'sending' ? 'Enviando mensagens no Duoke' : phase === 'queueing' ? 'Adicionando à fila' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}
@@ -790,6 +866,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       return <OrderReview key={source.id} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={acceptedSet.has(fingerprint)} busy={busy} connected={connected && !connection.busy}
         sendStatus={sendStatus[source.id]} waitingSince={awaiting[source.id]?.sentAt} onResend={() => sendAsk([source.id])}
         onRetry={() => startCollection({ codes: [source.id], retry: true })}
+        onOpen={() => openInDuoke(source.id)} opening={openingId === source.id} canOpen={canOpen}
         onSelect={() => setDraft(current => ({ ...current, selected: dict({ ...current.selected, [source.id]: !current.selected[source.id] }) }))}
         onEdit={(index, field, value) => editOrder(source, names => names.map((entry, i) => i === index ? { ...entry, [field]: value } : entry))}
         onAddName={() => {

@@ -201,3 +201,11 @@ Para isso, o estado passa a guardar, só nos pedidos em revisão, os nomes suger
    ```
 
 Validação: testes do handler (token, origem, negociação de protocolo, notificações, lotes recusados, três ferramentas, erros de entrada e de armazenamento sem vazar detalhes) e um teste com o cliente oficial `@modelcontextprotocol/sdk` (Streamable HTTP) contra o handler em um servidor HTTP local. A conexão real do Hermes com o Supabase ainda precisa ser confirmada pelo usuário.
+
+## Lista de espera do piloto e "Conferir no Duoke" (13/11/2026)
+
+- **Lista de espera:** o painel Piloto contínuo mostra cada pedido com seu status (A ler, Aguardando cliente, Para revisar, Sem leitura, Na fila), filtros por status, horário e detalhe (nomes sugeridos e motivo da revisão, horário da cobrança, tentativas). Pedidos colados ou lidos do PDF aparecem na hora como "A ler".
+- **Na fila hoje:** pedidos enviados à fila, automaticamente ou pelo botão Adicionar à fila, viram a fase `done` com os nomes da cartela e ficam visíveis até a meia-noite de Brasília (UTC-3, sem horário de verão). Não voltam a ciclos, cobranças ou revisão, mesmo se o código for colado de novo. O MCP mostra essa fase como `na_fila_hoje`.
+- **Conferir no Duoke (Ponte Duoke 1.3.0):** comando `OPEN` (Studio → ponte → worker → content script). O worker traz a aba do Duoke pareada para a frente e o content script usa a mesma busca e confirmação da coleta (`collectOrder`) para abrir a conversa do pedido. Não devolve o texto da conversa, não envia mensagem e recusa o pedido se houver coleta ou envio em andamento. Disponível em cada pedido da revisão e em cada linha da lista do piloto.
+
+Validação: testes de fase `done` (expiração à meia-noite de Brasília, sem reabertura por colagem, ciclo ou envio, fila manual com nomes), do MCP com `na_fila_hoje`, do comando `OPEN` no worker, no content script e na ponte do Studio, e teste de ponta a ponta no Chromium com a Ponte simulada (lista, ciclo, abrir com pedido encontrado e não encontrado, filtro, fila manual e estado preservado após recarregar, em tela larga e de celular).

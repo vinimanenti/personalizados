@@ -8,9 +8,9 @@ import { ENTRY_TTL, MAX_FAILURES, normalizeEntry } from '../shared/lapis-continu
 export const MAX_MCP_BYTES = 64_000;
 const SUPPORTED_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u;
-const PHASE_LABEL = { pending: 'a_ler', awaiting: 'aguardando_cliente', review: 'para_revisar', failed: 'sem_leitura' };
+const PHASE_LABEL = { pending: 'a_ler', awaiting: 'aguardando_cliente', review: 'para_revisar', failed: 'sem_leitura', done: 'na_fila_hoje' };
 const PHASE_BY_LABEL = Object.fromEntries(Object.entries(PHASE_LABEL).map(([phase, label]) => [label, phase]));
-const PHASE_ORDER = { review: 0, failed: 1, awaiting: 2, pending: 3 };
+const PHASE_ORDER = { review: 0, failed: 1, awaiting: 2, pending: 3, done: 4 };
 const HOUR = 60 * 60 * 1000;
 
 class HttpError extends Error {
@@ -58,6 +58,8 @@ function describe(entry, now) {
     item.nomes_sugeridos = (entry.review?.names || []).map(name => name.quantity ? `${name.name} (${name.quantity})` : name.name);
     item.motivo = entry.review?.reason || 'Sem detalhe guardado. Use "Trazer para revisão" no Lápis.';
   }
+  if (entry.phase === 'done') Object.assign(item, { na_fila_em: when(entry.doneAt),
+    nomes: (entry.review?.names || []).map(name => name.quantity ? `${name.name} (${name.quantity})` : name.name) });
   if (entry.phase === 'failed') item.motivo = `Conversa não encontrada no Duoke em ${MAX_FAILURES} ciclos seguidos.`;
   if (entry.phase === 'pending' && entry.lastStatus === 'not_found') item.observacao = 'Conversa lida, cliente ainda não mandou o nome.';
   return item;
@@ -65,15 +67,15 @@ function describe(entry, now) {
 
 const TOOLS = [
   { name: 'resumo_piloto', title: 'Resumo do piloto do Lápis',
-    description: 'Situação atual do piloto contínuo de nomes para lápis (Sticker Studio): quantos pedidos estão a ler, aguardando o cliente mandar o nome, para revisar e sem leitura, mais o pedido mais antigo e a última atividade. Pedidos que já foram para a fila de impressão não aparecem.',
+    description: 'Situação atual do piloto contínuo de nomes para lápis (Sticker Studio): quantos pedidos estão a ler, aguardando o cliente mandar o nome, para revisar, sem leitura e já enviados à fila de impressão hoje, mais o pedido mais antigo e a última atividade.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'listar_pedidos', title: 'Listar pedidos do piloto',
-    description: 'Lista pedidos do piloto contínuo. Sem fase, traz todos começando pelos que precisam do operador (para_revisar, depois sem_leitura). Para revisão, inclui os nomes sugeridos pela IA e o motivo da dúvida.',
+    description: 'Lista pedidos do piloto contínuo. Sem fase, traz todos começando pelos que precisam do operador (para_revisar, depois sem_leitura) e terminando nos enviados à fila hoje (na_fila_hoje). Para revisão, inclui os nomes sugeridos pela IA e o motivo da dúvida; para na_fila_hoje, os nomes que foram para a cartela.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {
       fase: { type: 'string', enum: Object.values(PHASE_LABEL), description: 'Filtra por fase.' },
       limite: { type: 'integer', minimum: 1, maximum: 100, default: 20, description: 'Máximo de pedidos na resposta.' } } } },
   { name: 'consultar_pedido', title: 'Consultar um pedido',
-    description: 'Situação de um pedido da Shopee no piloto contínuo pelo código (ex.: 2611135XBM2J42). Se não estiver no piloto, ele já foi para a fila de impressão, expirou após 7 dias ou nunca entrou.',
+    description: 'Situação de um pedido da Shopee no piloto contínuo pelo código (ex.: 2611135XBM2J42), incluindo se já foi para a fila de impressão hoje. Se não estiver no piloto, foi para a fila antes de hoje, expirou após 7 dias ou nunca entrou.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['codigo'], properties: {
       codigo: { type: 'string', minLength: 1, maxLength: 80, description: 'Código do pedido Shopee.' } } } },
 ].map(tool => ({ ...tool, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } }));
@@ -89,7 +91,7 @@ async function runTool(name, args, { store, now }) {
   if (name === 'resumo_piloto') {
     const counts = Object.fromEntries(Object.values(PHASE_LABEL).map(label => [label, 0]));
     for (const entry of entries) counts[PHASE_LABEL[entry.phase]]++;
-    const oldest = entries.filter(entry => entry.phase !== 'failed').sort((a, b) => a.addedAt - b.addedAt)[0];
+    const oldest = entries.filter(entry => entry.phase !== 'failed' && entry.phase !== 'done').sort((a, b) => a.addedAt - b.addedAt)[0];
     const latest = Math.max(...entries.map(entry => entry.updatedAt));
     return { total: entries.length, por_fase: counts,
       precisam_do_operador: counts.para_revisar + counts.sem_leitura,
@@ -97,7 +99,7 @@ async function runTool(name, args, { store, now }) {
       pedido_mais_antigo: oldest ? describe(oldest, now) : null,
       ultima_atividade: entries.length ? when(latest) : null,
       cobrancas_automaticas_enviadas: entries.reduce((sum, entry) => sum + entry.autoAsks, 0),
-      observacao: 'Pedidos que foram para a fila de impressão saem do piloto. Última atividade é a última mudança registrada em algum pedido.' };
+      observacao: 'na_fila_hoje mostra os pedidos enviados à fila de impressão hoje; eles somem à meia-noite (horário de Brasília). Última atividade é a última mudança registrada em algum pedido.' };
   }
   if (name === 'listar_pedidos') {
     if (args.fase !== undefined && !PHASE_BY_LABEL[args.fase]) throw new ToolInputError(`fase deve ser uma de: ${Object.values(PHASE_LABEL).join(', ')}.`);
@@ -112,7 +114,7 @@ async function runTool(name, args, { store, now }) {
     if (!ID_PATTERN.test(code)) throw new ToolInputError('codigo inválido: use só letras, números, _ ou -.');
     const entry = entries.find(item => item.id.toUpperCase() === code);
     return entry ? { encontrado: true, pedido: describe(entry, now) }
-      : { encontrado: false, codigo: code, mensagem: 'Pedido não está no piloto: já foi para a fila de impressão, expirou após 7 dias ou nunca entrou no piloto.' };
+      : { encontrado: false, codigo: code, mensagem: 'Pedido não está no piloto: foi para a fila de impressão antes de hoje, expirou após 7 dias ou nunca entrou no piloto.' };
   }
   throw new ToolInputError(`Ferramenta desconhecida: ${name}.`);
 }

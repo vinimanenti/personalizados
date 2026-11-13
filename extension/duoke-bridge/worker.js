@@ -85,7 +85,7 @@ async function handle(message, sender) {
     await deliver(studio.tabId, event);
     return { ok: true };
   }
-  if (message?.channel !== 'duoke-studio' || !validId(message.requestId) || !['STATUS', 'START', 'SEND', 'CANCEL'].includes(message.type)) return { type: 'ERROR', error: 'Comando inválido.' };
+  if (message?.channel !== 'duoke-studio' || !validId(message.requestId) || !['STATUS', 'START', 'SEND', 'CANCEL', 'OPEN'].includes(message.type)) return { type: 'ERROR', error: 'Comando inválido.' };
   const studio = await senderMatches(sender, 'studio');
   if (!studio) return { type: 'ERROR', error: 'Conecte esta aba do Studio pelo popup da extensão.' };
   await reconcileJob();
@@ -103,6 +103,20 @@ async function handle(message, sender) {
   }
   if (!duoke) return { type: 'ERROR', error: 'Conecte a aba Duoke pelo popup da extensão.' };
   if (activeJob) return { type: 'ERROR', error: `${jobName(activeJob)} já está em andamento.` };
+  if (message.type === 'OPEN') {
+    if (!validCode(message.code)) return { type: 'ERROR', error: 'Código de pedido inválido.' };
+    // Bring the paired Duoke tab to the front first, so the operator sees the conversation open.
+    try {
+      const tab = await chrome.tabs.update(duoke.tabId, { active: true });
+      if (Number.isInteger(tab?.windowId)) await chrome.windows?.update(tab.windowId, { focused: true });
+    } catch { /* Focus is a convenience; opening still proceeds. */ }
+    let opened;
+    try { opened = await chrome.tabs.sendMessage(duoke.tabId, { channel: 'duoke-command', type: 'OPEN', requestId: message.requestId, code: message.code }); }
+    catch { return { type: 'ERROR', error: 'A aba Duoke foi recarregada ou desconectada. Conecte-a novamente.' }; }
+    if (!opened?.ok) return { type: 'ERROR', error: opened?.busy ? 'O Duoke está ocupado com outra coleta. Tente de novo em instantes.' : 'Não foi possível abrir o pedido no Duoke.' };
+    const status = ['collected', 'not_found', 'error'].includes(opened.status) ? opened.status : 'error';
+    return { type: 'OPENED', status, ...(typeof opened.error === 'string' ? { error: opened.error.slice(0, 300) } : {}) };
+  }
   const sending = message.type === 'SEND';
   const limit = sending ? 100 : 200;
   if (!Array.isArray(message.codes) || !message.codes.length || message.codes.length > limit || message.codes.some(code => !validCode(code))) return { type: 'ERROR', error: `Lista de pedidos inválida (máximo ${limit} códigos).` };

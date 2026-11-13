@@ -384,7 +384,7 @@ test('timeout identifies whether the order header, customer text or content refr
 });
 
 const workerSource = await readFile(new URL('../extension/duoke-bridge/worker.js', import.meta.url), 'utf8');
-function workerFixture({ savedJob = null, collectorJob = null } = {}) {
+function workerFixture({ savedJob = null, collectorJob = null, openReply = { ok: true, status: 'collected' } } = {}) {
   let listener;
   let currentJob = collectorJob;
   const values = {
@@ -396,7 +396,9 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
   const events = [];
   const injected = [];
   const commands = [];
+  const focus = [];
   const chrome = {
+    windows: { update: async (id, props) => { focus.push(['window', id, props]); } },
     runtime: { id: 'extension-id', getURL: file => `chrome-extension://extension-id/${file}`, onMessage: { addListener: fn => { listener = fn; } } },
     storage: { session: {
       get: async keys => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).filter(key => key in values).map(key => [key, structuredClone(values[key])])),
@@ -412,7 +414,9 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
         if (message.type === 'PING') return { ok: true, jobId: currentJob, busy: Boolean(currentJob) };
         if (['START', 'SEND'].includes(message.type)) { currentJob = message.requestId; commands.push(plain(message)); return { ok: true }; }
         if (message.type === 'CANCEL') return { ok: true };
+        if (message.type === 'OPEN') { commands.push(plain(message)); return openReply; }
       },
+      update: async (id, props) => { focus.push(['tab', id, props]); return { id, windowId: 7 }; },
       onRemoved: { addListener: () => {} },
     },
   };
@@ -420,7 +424,7 @@ function workerFixture({ savedJob = null, collectorJob = null } = {}) {
   const studio = { id: chrome.runtime.id, tab: { id: 1 }, frameId: 0, origin: values.studio.origin, url: tabs.get(1).url };
   const duoke = { id: chrome.runtime.id, tab: { id: 2 }, frameId: 0, origin: values.duoke.origin, url: tabs.get(2).url };
   const send = (message, sender = studio) => new Promise(resolve => listener(message, sender, resolve));
-  return { send, studio, duoke, tabs, events, values, injected, commands, popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') } };
+  return { send, studio, duoke, tabs, events, values, injected, commands, focus, popup: { id: chrome.runtime.id, url: chrome.runtime.getURL('popup.html') } };
 }
 test('worker rejects unpaired tab, wrong origin, subframe and arbitrary commands', async () => {
   const f = workerFixture();
@@ -705,4 +709,76 @@ test('stale shop messages from the previous conversation never count as an empty
   f.search.onClick = () => f.result(f.input.value, () => { f.set(S.header, [new Node('ID do Pedido: 2610216BYGJDGR')]); });
   const summary = await f.collector.run(['2610216BYGJDGR']);
   assert.equal(summary.orders[0].status, 'error'); assert.match(summary.orders[0].error, /atualização das mensagens/);
+});
+
+test('worker OPEN focuses the paired Duoke tab and opens the order without starting a job', async () => {
+  const f = workerFixture();
+  const reply = await f.send({ channel: 'duoke-studio', requestId: 'open-1', type: 'OPEN', code: '2611135XBM2J42' });
+  assert.deepEqual(plain(reply), { type: 'OPENED', status: 'collected' });
+  assert.deepEqual(plain(f.focus), [['tab', 2, { active: true }], ['window', 7, { focused: true }]]);
+  assert.deepEqual(plain(f.commands), [{ channel: 'duoke-command', type: 'OPEN', requestId: 'open-1', code: '2611135XBM2J42' }]);
+  assert.equal(f.values.activeJob, undefined, 'opening never creates a collection or send job');
+  assert.equal((await f.send({ channel: 'duoke-studio', requestId: 'open-2', type: 'OPEN', code: 'a b;c' })).type, 'ERROR');
+  assert.equal((await f.send({ channel: 'duoke-studio', requestId: 'open-3', type: 'OPEN', code: '2611135XBM2J42' }, f.duoke)).type, 'ERROR', 'only the paired Studio may ask');
+});
+
+test('worker OPEN reports a busy or missing order honestly', async () => {
+  const busy = workerFixture({ openReply: { ok: false, busy: true } });
+  assert.match((await busy.send({ channel: 'duoke-studio', requestId: 'o1', type: 'OPEN', code: 'ABC123' })).error, /ocupado/);
+  const missing = workerFixture({ openReply: { ok: true, status: 'not_found' } });
+  assert.deepEqual(plain(await missing.send({ channel: 'duoke-studio', requestId: 'o2', type: 'OPEN', code: 'ABC123' })), { type: 'OPENED', status: 'not_found' });
+  const running = workerFixture();
+  await running.send({ channel: 'duoke-studio', requestId: 'job-1', type: 'START', codes: ['ABC123'] });
+  assert.match((await running.send({ channel: 'duoke-studio', requestId: 'o3', type: 'OPEN', code: 'ABC123' })).error, /andamento/);
+});
+
+test('content OPEN uses the collector search, answers asynchronously and blocks batches meanwhile', async () => {
+  const contentSource = await readFile(new URL('../extension/duoke-bridge/duoke-content.js', import.meta.url), 'utf8');
+  let listener, finishOpen;
+  const opened = [];
+  const chrome = { runtime: { id: 'extension-id', onMessage: { addListener: fn => { listener = fn; } }, sendMessage: async () => ({ ok: true }) } };
+  const collector = { createCollector: () => ({
+    collectOrder: (code, signal) => { opened.push([code, signal instanceof AbortSignal]); return new Promise(resolve => { finishOpen = resolve; }); },
+    run: async () => ({ completed: 1, total: 1, cancelled: false }),
+    send: async () => { throw new Error('OPEN must never send'); },
+  }) };
+  vm.runInNewContext(contentSource, { chrome, location: new URL('https://ai.duoke.com/?lang=pt#/dk/main/chat'), document: {}, AbortController, AbortSignal, setTimeout, clearTimeout, StickerDuokeCollector: collector });
+  let reply;
+  const keepOpen = listener({ channel: 'duoke-command', type: 'OPEN', requestId: 'open-1', code: 'ABC123' }, { id: chrome.runtime.id }, value => { reply = value; });
+  assert.equal(keepOpen, true, 'keeps the response channel open');
+  assert.deepEqual(opened, [['ABC123', true]]);
+  let blocked;
+  listener({ channel: 'duoke-command', type: 'START', requestId: 'batch', codes: ['X1'] }, { id: chrome.runtime.id }, value => { blocked = value; });
+  assert.equal(blocked.ok, false, 'no batch while the conversation is opening');
+  let second;
+  listener({ channel: 'duoke-command', type: 'OPEN', requestId: 'open-2', code: 'ABC124' }, { id: chrome.runtime.id }, value => { second = value; });
+  assert.deepEqual(plain(second), { ok: false, busy: true });
+  finishOpen({ id: 'ABC123', status: 'collected', text: 'conversa' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(reply), { ok: true, status: 'collected' }, 'the conversation text is not returned');
+  let after;
+  listener({ channel: 'duoke-command', type: 'START', requestId: 'batch-2', codes: ['X1'] }, { id: chrome.runtime.id }, value => { after = value; });
+  assert.equal(after.ok, true, 'batches resume after opening');
+  for (let i = 0; i < 3; i++) await new Promise(resolve => setImmediate(resolve));
+  let invalid;
+  listener({ channel: 'duoke-command', type: 'OPEN', requestId: 'open-3', code: '../x' }, { id: chrome.runtime.id }, value => { invalid = value; });
+  assert.deepEqual(plain(invalid), { ok: false });
+  assert.equal(opened.length, 1, 'an invalid code never reaches the collector');
+});
+
+test('studio bridge forwards OPEN with a valid code only', async () => {
+  const source = await readFile(new URL('../extension/duoke-bridge/studio-bridge.js', import.meta.url), 'utf8');
+  const sent = [], published = [];
+  let onWindowMessage;
+  const window = { location: { origin: 'https://vinimanenti.github.io' }, addEventListener: (type, fn) => { if (type === 'message') onWindowMessage = fn; },
+    postMessage: message => published.push(message) };
+  const chrome = { runtime: { sendMessage: async message => { sent.push(message); return { type: 'OPENED', status: 'collected' }; }, onMessage: { addListener: () => {} } } };
+  vm.runInNewContext(source, { window, chrome, location: window.location });
+  const post = data => onWindowMessage({ source: window, origin: window.location.origin, data: { source: 'sticker-studio', version: 1, ...data } });
+  await post({ type: 'OPEN', requestId: 'r1', code: '2611135XBM2J42' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(plain(sent), [{ channel: 'duoke-studio', type: 'OPEN', requestId: 'r1', code: '2611135XBM2J42' }]);
+  assert.deepEqual(plain(published.at(-1)), { type: 'OPENED', status: 'collected', requestId: 'r1', source: 'sticker-duoke', version: 1 });
+  await post({ type: 'OPEN', requestId: 'r2', code: 'x y' });
+  assert.equal(sent.length, 1); assert.equal(published.at(-1).type, 'ERROR');
 });

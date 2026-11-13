@@ -223,7 +223,8 @@ export function createGeminiHandler({ env = {}, fetchImpl = globalThis.fetch, co
           await upstream.body?.cancel().catch(() => {});
           try { await pause(delay, signal); } catch (error) { throw upstreamFailure(error); }
         }
-        if (!upstream.ok) throw upstreamFailure(await providerError(upstream, signal));
+        // providerStatus is Google's original HTTP code, kept only for the server log.
+        if (!upstream.ok) throw upstreamFailure(Object.assign(await providerError(upstream, signal), { providerStatus: upstream.status }));
         try {
           const data = JSON.parse(await readBounded(upstream.body, MAX_RESPONSE_BYTES, signal));
           const candidate = data.candidates?.[0];
@@ -267,7 +268,8 @@ export function createGeminiHandler({ env = {}, fetchImpl = globalThis.fetch, co
       try { normalized = await viaGemini(gemini.signal); }
       catch (error) {
         if (!claudeClient || !error.upstream || controller.signal.aborted) throw error;
-        console.warn(`[lapis-extract] Gemini falhou (HTTP ${error.status}); tentando o Claude (${claudeModel}).`);
+        // The message is our own classification (never the provider body), so it is safe to log.
+        console.warn(`[lapis-extract] Gemini falhou (HTTP ${error.status}${error.providerStatus ? `, Google ${error.providerStatus}` : ''}, modelo ${model}): ${String(error.message).slice(0, 200)} Tentando o Claude (${claudeModel}).`);
         normalized = await viaClaude();
         console.info('[lapis-extract] Extração concluída pelo Claude.');
       } finally {

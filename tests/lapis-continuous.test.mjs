@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeReview, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, ENTRY_TTL, expireState, formatCycleMessage, isDue, MAX_CYCLE_ORDERS,
+import { dayKey, markDone, normalizeReview, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, ENTRY_TTL, expireState, formatCycleMessage, isDue, MAX_CYCLE_ORDERS,
   MAX_FAILURES, normalizeEntry, normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../shared/lapis-continuous.mjs';
 
 const HOUR = 60 * 60 * 1000;
@@ -62,7 +62,7 @@ test('applyCycle removes queued orders, flags new reviews once and plans automat
   const hashes = new Map([['ASK', 'b'.repeat(64)]]);
   const awaiting = { WAIT: { sentAt: NOW - 2 * HOUR, status: 'sent' } };
   const out = applyCycle(s, { ids: Object.keys(classified), classified, results, hashes, awaiting, autoAsk: true, now: NOW });
-  assert.deepEqual(out.queued, ['AUTO']); assert.equal(out.state.AUTO, undefined);
+  assert.deepEqual(out.queued, ['AUTO']); assert.equal(out.state.AUTO.phase, 'done'); assert.equal(out.state.AUTO.doneAt, NOW);
   assert.deepEqual(out.newReview, ['REV']);
   assert.equal(out.state.ASK.hash, 'b'.repeat(64)); assert.equal(out.state.ASK.lastStatus, 'not_found');
   assert.equal(out.state.WAIT.phase, 'awaiting');
@@ -128,4 +128,33 @@ test('orders in review keep their suggested names and reason, bounded and plain'
   assert.equal(normalizeReview({ names: [], reason: '' }), null);
   const failedQueue = applyCycle(s, { ids: ['R1'], classified: { R1: 'auto' }, results: new Map([['R1', { status: 'found', names: [{ name: 'Caio' }], reason: '' }]]), queueFailed: true, now: NOW });
   assert.match(failedQueue.state.R1.review.reason, /não entrou na fila/u);
+});
+
+test('orders sent to the queue stay visible as done until the end of the day in São Paulo', () => {
+  const results = new Map([['A', { status: 'found', names: [{ name: 'SOPHIA', quantity: null, evidence: 'SOPHIA' }] }]]);
+  const out = applyCycle(normalizeState([{ id: 'A', phase: 'pending', addedAt: NOW - HOUR, updatedAt: NOW - HOUR, autoAsks: 0, failures: 0 }], NOW),
+    { ids: ['A'], classified: { A: 'auto' }, results, now: NOW });
+  assert.deepEqual(out.state.A.review, { names: [{ name: 'SOPHIA', quantity: null }], reason: '' });
+  assert.deepEqual(cycleCodes(out.state), [], 'done never enters a cycle');
+  assert.equal(normalizeEntry(out.state.A, NOW).phase, 'done', 'survives the server validation the same day');
+  const endOfDay = (dayKey(NOW) + 1) * 24 * HOUR + 3 * HOUR;
+  assert.equal(normalizeEntry(out.state.A, endOfDay - 1)?.phase, 'done', 'still there at 23:59 in São Paulo');
+  assert.equal(normalizeEntry(out.state.A, endOfDay), null, 'gone at midnight in São Paulo');
+  assert.equal(normalizeEntry({ ...out.state.A, doneAt: undefined }, NOW), null, 'done needs a valid doneAt');
+});
+
+test('a done order is not reopened by a pasted code, a later cycle or a send result', () => {
+  const done = normalizeState([{ id: 'A', phase: 'done', doneAt: NOW - HOUR, addedAt: NOW - 2 * HOUR, updatedAt: NOW - HOUR, autoAsks: 0, failures: 0 }], NOW);
+  assert.equal(addToInbox(done, ['A'], NOW).added, 0);
+  assert.equal(applyCycle(done, { ids: ['A'], classified: { A: 'ask' }, now: NOW }).state.A.phase, 'done');
+  assert.equal(applyCycle(done, { ids: ['A'], classified: { A: 'review' }, now: NOW }).newReview.length, 0);
+  assert.equal(recordPilotSends(done, [{ id: 'A', status: 'sent' }], { now: NOW }).A.phase, 'done');
+});
+
+test('orders queued by hand become done with their names', () => {
+  const s = normalizeState([{ id: 'R', phase: 'review', addedAt: NOW - HOUR, updatedAt: NOW - HOUR, autoAsks: 0, failures: 0, review: { names: [{ name: 'Ana', quantity: 50 }], reason: 'dúvida' } }], NOW);
+  const byHand = markDone(s, ['R', 'missing'], { namesById: new Map([['R', [{ name: 'Ana Clara', quantity: 50 }]]]), now: NOW });
+  assert.equal(byHand.R.phase, 'done'); assert.deepEqual(byHand.R.review, { names: [{ name: 'Ana Clara', quantity: 50 }], reason: '' });
+  assert.equal(byHand.missing, undefined);
+  assert.deepEqual(markDone(s, ['R'], { now: NOW }).R.review, { names: [{ name: 'Ana', quantity: 50 }], reason: '' }, 'keeps the suggested names without a correction');
 });

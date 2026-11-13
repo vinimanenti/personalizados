@@ -12,6 +12,7 @@ const rows = () => [
   entry('W1', 'awaiting', { sendStatus: 'sent', sentAt: NOW - 26 * HOUR, autoAsks: 1 }),
   entry('R1', 'review', { review: { names: [{ name: 'Ana', quantity: 50 }, { name: 'Bia', quantity: null }], reason: 'Quantidades diferentes' } }),
   entry('F1', 'failed', { failures: 3 }),
+  entry('D1', 'done', { doneAt: NOW - HOUR, review: { names: [{ name: 'SOPHIA', quantity: null }], reason: '' } }),
 ];
 const call = (handler, body, headers = {}) => handler(new Request('https://x.supabase.co/functions/v1/lapis-mcp', { method: 'POST',
   headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
@@ -47,7 +48,7 @@ test('initialize negotiates the protocol, notifications get 202 and tools are re
 
 test('resumo_piloto counts phases and flags customers waiting more than 24 h', async () => {
   const data = (await tool(make(), 'resumo_piloto', {})).structuredContent;
-  assert.deepEqual(data.por_fase, { a_ler: 1, aguardando_cliente: 1, para_revisar: 1, sem_leitura: 1 });
+  assert.deepEqual(data.por_fase, { a_ler: 1, aguardando_cliente: 1, para_revisar: 1, sem_leitura: 1, na_fila_hoje: 1 });
   assert.equal(data.precisam_do_operador, 2); assert.equal(data.aguardando_ha_mais_de_24h, 1);
   assert.equal(data.pedido_mais_antigo.codigo, 'A1'); assert.equal(data.cobrancas_automaticas_enviadas, 1);
   assert.match(data.ultima_atividade, /13\/11\/2026/u);
@@ -56,7 +57,9 @@ test('resumo_piloto counts phases and flags customers waiting more than 24 h', a
 test('listar_pedidos puts the operator first and explains reviews with names and reason', async () => {
   const handler = make();
   const all = (await tool(handler, 'listar_pedidos', {})).structuredContent;
-  assert.deepEqual(all.pedidos.map(p => p.codigo), ['R1', 'F1', 'W1', 'A1']);
+  assert.deepEqual(all.pedidos.map(p => p.codigo), ['R1', 'F1', 'W1', 'A1', 'D1']);
+  const done = (await tool(handler, 'listar_pedidos', { fase: 'na_fila_hoje' })).structuredContent.pedidos[0];
+  assert.deepEqual(done.nomes, ['SOPHIA']); assert.match(done.na_fila_em, /13\/11\/2026/u);
   const review = (await tool(handler, 'listar_pedidos', { fase: 'para_revisar' })).structuredContent.pedidos[0];
   assert.deepEqual(review.nomes_sugeridos, ['Ana (50)', 'Bia']); assert.equal(review.motivo, 'Quantidades diferentes');
   assert.equal((await tool(handler, 'listar_pedidos', { limite: 1 })).structuredContent.pedidos.length, 1);

@@ -18,7 +18,13 @@ export const MAX_NOTIFY_CHARS = 3500;
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
-const PHASES = new Set(['pending', 'awaiting', 'review', 'failed']);
+// done: sent to the print queue today. Kept only until the end of the day in São Paulo,
+// so the waiting list shows what already left; it never enters a cycle again.
+const PHASES = new Set(['pending', 'awaiting', 'review', 'failed', 'done']);
+const DAY = 24 * 60 * 60 * 1000;
+// Brazil has no daylight saving time since 2019: São Paulo is always UTC-3.
+const SAO_PAULO_OFFSET = 3 * 60 * 60 * 1000;
+export const dayKey = at => Math.floor((at - SAO_PAULO_OFFSET) / DAY);
 const LAST_STATUS = new Set(['found', 'not_found', 'review']);
 const SENT_STATES = new Set(['sent', 'unconfirmed']);
 const CLOCK_SKEW = 5 * 60 * 1000;
@@ -30,12 +36,14 @@ const count = (value, max) => Number.isInteger(value) && value >= 0 && value <= 
 export function normalizeEntry(raw, now = Date.now()) {
   if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !ID_PATTERN.test(raw.id) || !PHASES.has(raw.phase)) return null;
   if (!isTime(raw.addedAt, now) || now - raw.addedAt >= ENTRY_TTL) return null;
+  if (raw.phase === 'done' && (!isTime(raw.doneAt, now) || dayKey(raw.doneAt) !== dayKey(now))) return null;
   const entry = { id: raw.id, phase: raw.phase, addedAt: raw.addedAt, updatedAt: isTime(raw.updatedAt, now) ? raw.updatedAt : raw.addedAt,
     autoAsks: count(raw.autoAsks, 20), failures: count(raw.failures, 20) };
   if (typeof raw.hash === 'string' && HASH_PATTERN.test(raw.hash)) entry.hash = raw.hash;
   if (LAST_STATUS.has(raw.lastStatus)) entry.lastStatus = raw.lastStatus;
   if (SENT_STATES.has(raw.sendStatus) && isTime(raw.sentAt, now)) { entry.sendStatus = raw.sendStatus; entry.sentAt = raw.sentAt; }
-  if (entry.phase === 'review') { const review = normalizeReview(raw.review); if (review) entry.review = review; }
+  if (entry.phase === 'review' || entry.phase === 'done') { const review = normalizeReview(raw.review); if (review) entry.review = review; }
+  if (entry.phase === 'done') entry.doneAt = raw.doneAt;
   return entry;
 }
 
@@ -143,7 +151,9 @@ export function applyCycle(state, { ids, classified, results = new Map(), hashes
     const previous = next[id] || { id, phase: 'pending', addedAt: now, updatedAt: now, autoAsks: 0, failures: 0 };
     let kind = classified[id];
     if (kind === 'auto' && queueFailed) kind = 'review';
-    if (kind === 'auto') { delete next[id]; queued.push(id); continue; }
+    // An order already sent to the queue today stays there (e.g. its code pasted again).
+    if (previous.phase === 'done') { if (kind === 'auto') queued.push(id); continue; }
+    if (kind === 'auto') { next[id] = doneEntry(previous, results.get(id)?.names, now); queued.push(id); continue; }
     if (!kind || kind === 'pending') continue;
     const entry = { ...previous, updatedAt: now };
     if (hashes.has(id)) entry.hash = hashes.get(id);
@@ -171,11 +181,33 @@ export function applyCycle(state, { ids, classified, results = new Map(), hashes
   return { state: next, askIds, queued, newReview, newFailed };
 }
 
+function doneEntry(previous, names, now) {
+  const { review: _review, failures: _failures, ...rest } = previous;
+  const entry = { ...rest, phase: 'done', doneAt: now, updatedAt: now, failures: 0 };
+  const review = normalizeReview({ names, reason: '' });
+  if (review) entry.review = review;
+  else if (previous.review?.names?.length) entry.review = { names: previous.review.names, reason: '' };
+  return entry;
+}
+
+/**
+ * Orders the operator sent to the print queue by hand. They stay visible as done
+ * until the end of the day. namesById: Map id -> [{ name, quantity }].
+ */
+export function markDone(state, ids, { namesById = new Map(), now = Date.now() } = {}) {
+  const next = Object.assign(Object.create(null), state);
+  for (const id of new Set(ids)) {
+    if (!next[id] || next[id].phase === 'done') continue;
+    next[id] = doneEntry(next[id], namesById.get(id), now);
+  }
+  return next;
+}
+
 /** Records the outcome of a send run. Automatic sends count toward MAX_AUTO_ASKS. */
 export function recordPilotSends(state, results, { automatic = false, now = Date.now() } = {}) {
   const next = Object.assign(Object.create(null), state);
   for (const { id, status } of results) {
-    if (!SENT_STATES.has(status) || !next[id]) continue;
+    if (!SENT_STATES.has(status) || !next[id] || next[id].phase === 'done') continue;
     next[id] = { ...next[id], phase: next[id].phase === 'review' ? 'review' : 'awaiting', sentAt: now, sendStatus: status, updatedAt: now,
       autoAsks: next[id].autoAsks + (automatic ? 1 : 0) };
   }

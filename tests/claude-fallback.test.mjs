@@ -96,3 +96,16 @@ test('without a Claude client the Gemini error is returned as before', quiet(asy
   const response = await handler(request());
   assert.equal(response.status, 502); assert.equal((await response.json()).error, 'Não foi possível acessar o serviço de extração.');
 }));
+
+test('the fallback log names Google\'s status and our reason, never the provider body', async () => {
+  const lines = [];
+  const { warn, info } = console; console.warn = (...args) => lines.push(args.join(' ')); console.info = () => {};
+  try {
+    const handler = createGeminiHandler({ env: { ...env, GEMINI_MODEL: 'gemini-old-model' }, claudeClient: fakeClaude(claudeMessage(extraction)), consumeQuota: async () => true,
+      fetchImpl: async () => new Response(JSON.stringify({ error: { message: 'models/gemini-old-model secret-body-detail' } }), { status: 404 }) });
+    assert.equal((await handler(request())).status, 200);
+  } finally { console.warn = warn; console.info = info; }
+  const line = lines.find(text => text.includes('Gemini falhou'));
+  assert.match(line, /Google 404/u); assert.match(line, /modelo gemini-old-model/u); assert.match(line, /GEMINI_MODEL/u);
+  assert.doesNotMatch(line, /secret-body-detail/u);
+});
