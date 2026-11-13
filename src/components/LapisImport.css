@@ -64,12 +64,14 @@
 .lapis-upload strong { font-size: 12px; font-weight: 600; }
 .lapis-upload small { color: var(--lapis-muted); font-size: 10px; line-height: 1.6; margin-top: 5px; }
 .lapis-upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
-.lapis-upload.is-disabled, .lapis-upload.is-disabled input { opacity: .5; cursor: not-allowed; }
+.lapis-upload.is-disabled { opacity: .5; cursor: not-allowed; }
+.lapis-upload.is-disabled input { cursor: not-allowed; }
 .lapis-label-upload { position: relative; display: inline-flex; align-items: center; padding: 8px 12px; border: 1px dashed #4a4a58; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; transition: border-color .15s, background .15s; }
 .lapis-label-upload:hover { border-color: var(--lapis-blue); background: rgba(67,97,238,.04); }
 .lapis-label-upload:focus-within { outline: 2px solid var(--lapis-blue); outline-offset: 3px; }
 .lapis-label-upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
-.lapis-label-upload.is-disabled, .lapis-label-upload.is-disabled input { opacity: .5; cursor: not-allowed; }
+.lapis-label-upload.is-disabled { opacity: .5; cursor: not-allowed; }
+.lapis-label-upload.is-disabled input { cursor: not-allowed; }
 .lapis-progress { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(100px, 2fr) auto; align-items: center; gap: 18px; padding: 16px 24px; background: rgba(67,97,238,.06); border-top: 1px solid var(--lapis-line); }
 .lapis-progress strong, .lapis-progress span { display: block; font-size: 12px; }
 .lapis-progress span { color: var(--lapis-muted); margin-top: 4px; font: 10px monospace; }
@@ -212,3 +214,32 @@
 .lapis-cartela-list { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 .lapis-cartela-list strong { color: var(--t1, #ededf1); font-weight: 600; margin-right: 6px; }
 @media (max-width: 680px) { .lapis-name.has-cartela { grid-template-columns: minmax(0, 1fr) 80px; } .lapis-name.has-cartela .lapis-icon-button { grid-column: 2; justify-self: end; } }
+
+/* Processing queue: one row per pasted list or PDF. */
+.lapis-batches { margin: 0 24px 16px; border: 1px solid var(--lapis-line); border-radius: 8px; overflow: hidden; }
+.lapis-batches-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--lapis-line); font-size: 11px; color: var(--lapis-muted); }
+.lapis-batches-head strong { font-size: 12px; color: var(--t1, #ededf1); }
+.lapis-batches-head .lapis-link-button { margin-left: auto; }
+.lapis-batch-rows { list-style: none; margin: 0; padding: 0; }
+.lapis-batch { display: grid; grid-template-columns: minmax(120px, 1.2fr) 80px 190px minmax(0, 2fr) auto; align-items: center; gap: 4px 14px; padding: 8px 14px; font-size: 11px; border-top: 1px solid var(--lapis-line); }
+.lapis-batch:first-child { border-top: 0; }
+.lapis-batch.is-selected { background: rgba(128,151,255,.08); }
+.lapis-batch-name { font-weight: 600; color: var(--t1, #ededf1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lapis-batch-count, .lapis-batch-detail { color: var(--lapis-muted); }
+.lapis-batch-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lapis-batch-status { white-space: nowrap; color: var(--lapis-muted); }
+.lapis-batch.is-running .lapis-batch-status { color: var(--lapis-blue); font-weight: 600; }
+.lapis-batch.is-done .lapis-batch-status { color: #86dcb6; }
+.lapis-batch.is-error .lapis-batch-status, .lapis-batch.is-error .lapis-batch-detail { color: #fa9285; }
+.lapis-batch.is-cancelled .lapis-batch-status { color: #f2c278; }
+.lapis-batch-actions { display: inline-flex; align-items: center; gap: 10px; justify-self: end; }
+.lapis-batch-actions .lapis-link-button { font-size: 11px; white-space: nowrap; }
+.lapis-batch-chip { margin: 0 24px 10px; font-size: 11px; color: var(--lapis-muted); }
+.lapis-batch-chip strong { color: var(--t1, #ededf1); }
+@media (max-width: 760px) {
+  .lapis-batches, .lapis-batch-chip { margin-left: 16px; margin-right: 16px; }
+  .lapis-batch { grid-template-columns: minmax(0, 1fr) auto; }
+  .lapis-batch-detail { grid-column: 1 / -1; white-space: normal; }
+  .lapis-batch-actions { grid-column: 1 / -1; justify-self: start; }
+}
+

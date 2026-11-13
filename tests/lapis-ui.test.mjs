@@ -80,6 +80,28 @@ test('ask panel lists only askable customers and awaiting orders show Verificar 
   assert.match(markup, /Enviar para 2 clientes<\/button>/);
   assert.match(markup, /2 clientes aguardando resposta/);
   assert.match(markup, /Verificar respostas · 2/);
-  assert.match(markup, /Processar lote/);
+  assert.match(markup, /Processar lista/);
   assert.match(markup, /type="password"[^>]*value="codigo-de-teste"/, 'remembered access code is restored');
 });
+
+test('the processing queue shows each list with its status and summary', () => {
+  const now = Date.now();
+  const batches = [
+    { id: 'b1', number: 1, label: 'etiquetas-manha', codes: ['A1', 'A2'], status: 'done', addedAt: now - 60000, doneAt: now - 30000, summary: { ready: 1, review: 0, ask: 1, failed: 0 } },
+    { id: 'b2', number: 2, label: 'Lista 2', codes: ['B1'], status: 'running', addedAt: now - 20000 },
+    { id: 'b3', number: 3, label: 'Lista 3', codes: ['C1', 'C2', 'C3'], status: 'error', addedAt: now - 10000, error: 'O limite é de 500 pedidos' },
+    { id: 'old', number: 0, label: 'Ontem', codes: ['Z1'], status: 'done', addedAt: now - 2 * 86400000 }];
+  const store = { ss_session: JSON.stringify({ user: 'test-only', ts: 1 }), 'ss_lapis_batches_v1:test-only': JSON.stringify(batches) };
+  const module = { exports: {} };
+  vm.runInNewContext(compiled.outputFiles[0].text, { module, exports: module.exports, require: createRequire(import.meta.url), console, URL, setTimeout, clearTimeout,
+    localStorage: { getItem: key => store[key] ?? null, setItem() {}, removeItem() {} },
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  });
+  const markup = renderToStaticMarkup(React.createElement(module.exports.default));
+  assert.equal((markup.match(/<li class="lapis-batch /g) || []).length, 3, 'lists older than a day are dropped');
+  assert.match(markup, /etiquetas-manha.*2 pedidos.*Concluída às.*1 para conferir · 0 com dúvida · 1 para cobrar · 0 sem leitura/su);
+  assert.match(markup, /lapis-batch is-waiting[^>]*><span class="lapis-batch-name"[^>]*>Lista 2/u, 'a list running when the page closed waits again');
+  assert.match(markup, /is-error.*O limite é de 500 pedidos.*Tentar de novo/su);
+  assert.match(markup, /1 na espera/u);
+});
+

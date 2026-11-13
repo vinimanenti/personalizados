@@ -117,6 +117,35 @@ function readAskMessage() {
   } catch { return AUTOPILOT_DEFAULT_MESSAGE; }
 }
 
+// Lists waiting to be processed: each pasted list or PDF becomes one, processed in order.
+// Kept on this computer so a reload does not lose what was queued.
+const BATCH_LIMIT = 40;
+const BATCH_TTL = 24 * 60 * 60 * 1000;
+function batchesKey() {
+  try {
+    const user = JSON.parse(localStorage.getItem('ss_session') || 'null')?.user;
+    return typeof user === 'string' && user ? `ss_lapis_batches_v1:${user}` : null;
+  } catch { return null; }
+}
+function readBatches(key) {
+  if (!key) return [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || '[]');
+    if (!Array.isArray(saved)) return [];
+    const now = Date.now();
+    return saved.filter(batch => batch && typeof batch.id === 'string' && typeof batch.label === 'string' && Array.isArray(batch.codes) && batch.codes.every(code => typeof code === 'string')
+      && Number.isFinite(batch.addedAt) && now - batch.addedAt < BATCH_TTL && ['waiting', 'running', 'done', 'error', 'cancelled'].includes(batch.status))
+      // A list that was running when the page closed starts again.
+      .map(batch => batch.status === 'running' ? { ...batch, status: 'waiting' } : batch).slice(-BATCH_LIMIT);
+  } catch { return []; }
+}
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+function batchSummary(summary) {
+  if (!summary) return '';
+  if (summary.empty) return 'Todos já tinham nomes nesta tela.';
+  return [`${summary.ready} para conferir`, `${summary.review} com dúvida`, `${summary.ask} para cobrar`, `${summary.failed} sem leitura`].join(' · ');
+}
+
 const sinceText = sentAt => {
   const hours = Math.floor((Date.now() - sentAt) / 3600000);
   return hours < 1 ? 'há menos de 1 hora' : hours < 24 ? `há ${hours} h` : `há ${Math.floor(hours / 24)} dia${hours >= 48 ? 's' : ''}`;
@@ -283,6 +312,24 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [expandedIds, setExpandedIds] = useState(() => new Set());
   const toggleExpanded = id => setExpandedIds(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const [pilotSettingsOpen, setPilotSettingsOpen] = useState(false);
+  const [batchStore] = useState(batchesKey);
+  const [batches, setBatches] = useState(() => readBatches(batchStore));
+  const [batchFilter, setBatchFilter] = useState('');
+  const runningBatch = useRef('');
+  const updateBatch = (id, patch) => setBatches(current => current.map(batch => batch.id === id ? { ...batch, ...patch } : batch));
+  // Adds a list to the processing queue; returns how many codes it took.
+  const enqueueBatch = (codes, label) => {
+    const unique = [...new Set(codes)];
+    if (!unique.length) return 0;
+    setBatches(current => {
+      const number = current.reduce((max, batch) => Math.max(max, batch.number || 0), 0) + 1;
+      const finished = current.filter(batch => batch.status === 'done');
+      // Oldest finished lists make room; waiting lists are never dropped.
+      const keep = current.length >= BATCH_LIMIT && finished.length ? current.filter(batch => batch !== finished[0]) : current;
+      return [...keep, { id: requestId(), number, label: label || `Lista ${number}`, codes: unique, status: 'waiting', addedAt: Date.now() }];
+    });
+    return unique.length;
+  };
   const pilotStateRef = useRef(null), pilotSaved = useRef(new Set()), pilotSaveTimer = useRef(null), lastCycle = useRef(NaN),
     pendingAsk = useRef(null), disconnectedSince = useRef(0), disconnectAlerted = useRef(false), cycleFailureAlerted = useRef(false), tickRef = useRef(null);
   const pilotActive = pilot.enabled && pilotState !== null;
@@ -378,6 +425,11 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     try { if (askMessage.trim()) localStorage.setItem(ASK_MESSAGE_KEY, askMessage); } catch { /* Storage unavailable. */ }
   }, [askMessage]);
 
+  useEffect(() => {
+    if (!batchStore) return;
+    try { localStorage.setItem(batchStore, JSON.stringify(batches)); } catch { /* Storage unavailable. */ }
+  }, [batches, batchStore]);
+
   const probe = () => {
     const id = requestId();
     pendingStatus.current.clear(); pendingStatus.current.set(id, Date.now());
@@ -422,20 +474,23 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     };
   }, []);
 
-  const startCollection = async ({ codes, retry = false, autopilot = false, cycle = false } = {}) => {
-    if (workflow.current || busy) return;
+  // Returns what happened, so the list queue can show a status per list.
+  const startCollection = async ({ codes, retry = false, autopilot = false, cycle = false, batch = false } = {}) => {
+    if (workflow.current || busy) return { skipped: true };
     const controller = new AbortController();
     try {
       let base = draft;
       const requested = codes || parseOrderCodes(draft.codes);
-      if (cycle) {
-        // Cycles run all day: drop orders already in the queue so the 500-order review limit is not reached.
+      if (cycle || batch) {
+        // Cycles and lists run all day: drop orders already in the queue so the 500-order review limit is not reached.
         const queuedIds = new Set(base.collected.filter(order => base.results[order.id] && isAccepted(base.results[order.id], order) && !requested.includes(order.id)).map(order => order.id));
         if (queuedIds.size && base.collected.length + requested.length > 400) {
           base = { ...base, collected: base.collected.filter(order => !queuedIds.has(order.id)),
             results: dict(Object.fromEntries(Object.entries(base.results).filter(([id]) => !queuedIds.has(id)))) };
           setDraft(base);
         }
+      }
+      if (cycle) {
         // Orders the operator already named in this screen are theirs: out of the cycle.
         const named = requested.filter(id => hasNames(base.results[id]));
         if (named.length) setPilotState(current => applyCycle(current, { ids: named,
@@ -447,7 +502,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         setPilotState(current => addToInbox(current, plan.codes).state);
         if (added) setPilotInfo(current => ({ ...current, summary: `${added} pedido${added === 1 ? ' entrou' : 's entraram'} no piloto contínuo.` }));
       }
-      if (!plan.codes.length) { if (!cycle) setNotice('Todos estes pedidos já têm nomes. Confira os resultados para adicionar à fila.'); return; }
+      if (!plan.codes.length) { if (!cycle && !batch) setNotice('Todos estes pedidos já têm nomes. Confira os resultados para adicionar à fila.'); return { ok: true, summary: { empty: true } }; }
       if (!accessCode.trim()) throw new Error('Informe o código de acesso à extração antes de iniciar o lote.');
       if (plan.collect.length && (!connected || connection.busy)) throw new Error('Conecte as abas e aguarde a coleta atual antes de continuar.');
       workflow.current = controller; setError('');
@@ -468,7 +523,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         job.current = run;
         await run.start(); job.current = null;
       }
-      if (controller.signal.aborted || !mounted.current) return;
+      if (controller.signal.aborted || !mounted.current) return { aborted: true };
       let extractable = [...sources.values()].filter(canExtract);
       const extracted = { results: new Map(), errors: dict() };
       const hashes = new Map();
@@ -490,14 +545,17 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       }
       if (extractable.length) await performExtraction(extractable, controller, extracted);
       else if (!autopilot) setNotice('Coleta concluída sem conversas disponíveis para extração. Veja Sem nomes e Falhas para refazer.');
-      if (autopilot && !controller.signal.aborted && mounted.current) await finishAutopilot(plan.codes, sources, extracted, { cycle, hashes });
+      if (autopilot && !controller.signal.aborted && mounted.current) return { ok: true, summary: await finishAutopilot(plan.codes, sources, extracted, { cycle, batch, hashes }) };
+      return { ok: true };
     } catch (failure) {
       reportFailure(failure);
+      if (batch) return { ok: false, aborted: failure.name === 'AbortError', error: failure.message };
       if (cycle && failure.name !== 'AbortError' && mounted.current) {
         setPilotInfo(current => ({ ...current, error: `Ciclo: ${failure.message}` }));
         // One alert per failure streak; a successful cycle re-arms it.
         if (!cycleFailureAlerted.current) { cycleFailureAlerted.current = true; notifyTelegram(`Lápis · o ciclo do piloto falhou: ${failure.message}`); }
       }
+      return { ok: false, aborted: failure.name === 'AbortError', error: failure.message };
     }
     finally { finishWorkflow(controller); }
   };
@@ -549,24 +607,26 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     try {
       // Loaded on demand so pdf.js stays out of the Lápis bundle until labels are used.
       const { readShopeeLabels } = await import('../lib/shopee-label-pdf.mjs');
+      // Each PDF becomes its own list in the processing queue.
       const labels = [];
-      let pages = 0, missing = 0;
+      let pages = 0, missing = 0, lists = 0, codesQueued = 0;
+      const empty = [];
       for (const file of files) {
         const read = await readShopeeLabels(file);
         labels.push(...read.labels); pages += read.pages; missing += read.missing;
+        const { added } = mergeLabelCodes('', read.labels);
+        if (added.length) { lists++; codesQueued += enqueueBatch(added, file.name.replace(/\.pdf$/iu, '').slice(0, 60) || undefined); }
+        else empty.push(file.name);
       }
       if (!mounted.current) return;
       if (!labels.length) throw new Error(`Nenhum código de pedido encontrado em ${pages} página${pages === 1 ? '' : 's'}. Confira se o PDF é a etiqueta de envio da Shopee.`);
-      // The codes textarea is disabled while uploading, so draft.codes is current here.
-      const { codes, added, duplicates } = mergeLabelCodes(draft.codes, labels);
       setDraft(current => {
         const shipDates = dict(current.shipDates);
         for (const label of labels) if (label.envio) shipDates[label.pedido] = label.envio;
-        return { ...current, codes, shipDates };
+        return { ...current, shipDates };
       });
-      setNotice(`${labels.length} etiqueta${labels.length === 1 ? ' lida' : 's lidas'} · ${added.length} código${added.length === 1 ? ' adicionado' : 's adicionados'}` +
-        (duplicates ? ` · ${duplicates} já estava${duplicates === 1 ? '' : 'm'} na lista` : '') +
-        (missing ? ` · ${missing} página${missing === 1 ? '' : 's'} sem código` : '') + '.');
+      setNotice(`${plural(lists, 'lista adicionada', 'listas adicionadas')} à fila de processamento · ${plural(codesQueued, 'pedido', 'pedidos')}` +
+        (missing ? ` · ${plural(missing, 'página', 'páginas')} sem código` : '') + (empty.length ? ` · sem códigos: ${empty.join(', ')}` : '') + '.');
     } catch (failure) { if (mounted.current) setError(failure.message); }
     finally { if (mounted.current) setUploading(false); }
   };
@@ -612,10 +672,13 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     for (const entry of pilotOnly) rows.push({ id: entry.id, entry, bucket: PILOT_BUCKET[entry.phase] });
     return rows;
   }, [draft.collected, draft.results, draft.extractionErrors, acceptedSet, awaiting, pilotState]);
+  const batchCodes = useMemo(() => new Set(batches.find(batch => batch.id === batchFilter)?.codes || []), [batches, batchFilter]);
+  const inBatch = row => !batchFilter || batchCodes.has(row.id);
   const tabCounts = Object.fromEntries(TABS.map(([key]) => [key, 0]));
-  for (const row of unified) tabCounts[row.bucket]++;
-  tabCounts.all = unified.length;
-  const filteredOrders = filter === 'all' ? unified : unified.filter(row => row.bucket === filter || expandedIds.has(row.id));
+  const batchRows = unified.filter(row => !batchFilter || batchCodes.has(row.id));
+  for (const row of batchRows) tabCounts[row.bucket]++;
+  tabCounts.all = batchRows.length;
+  const filteredOrders = unified.filter(row => inBatch(row) && (filter === 'all' || row.bucket === filter || expandedIds.has(row.id)));
   const pageCount = Math.max(1, Math.ceil(filteredOrders.length / PAGE_SIZE));
   const currentPage = Math.min(reviewPage, pageCount - 1);
   const visibleOrders = filteredOrders.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
@@ -668,7 +731,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
 
   // Safe orders go straight to the queue; customers without names wait for the
   // operator to confirm the ask message. Nothing is sent from here.
-  const finishAutopilot = async (ids, sources, extracted, { cycle = false, hashes = new Map() } = {}) => {
+  const finishAutopilot = async (ids, sources, extracted, { cycle = false, batch = false, hashes = new Map() } = {}) => {
     const plan = planAutopilot({ ids, sources, results: extracted.results, extractionErrors: extracted.errors,
       isQueued: order => isAccepted(order, sources.get(order.id)), awaiting, shipDates: draft.shipDates });
     setAwaiting(plan.awaiting);
@@ -695,8 +758,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       // Sent by the idle effect below, after this workflow releases the Duoke tab.
       if (pilotOut.askIds.length) pendingAsk.current = pilotOut.askIds;
     }
-    if (!mounted.current) return;
-    const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    const counts = { ready: readyIds.size, review: plan.counts.review, ask: plan.askable.length, failed: plan.counts.failed };
+    if (!mounted.current) return counts;
     const summary = [`${cycle ? 'Ciclo do piloto' : 'Lote processado'}: ${plural(readyIds.size, 'nome pronto', 'nomes prontos')} para conferir`,
       `${plan.counts.review} com dúvida`,
       plural(plan.askable.length, 'cliente para cobrar', 'clientes para cobrar'),
@@ -706,7 +769,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     if (cycle) {
       cycleFailureAlerted.current = false;
       setPilotInfo(current => ({ ...current, lastRun: Date.now(), summary, error: current.error.startsWith('Ciclo:') ? '' : current.error }));
-    } else { setFilter(plan.askable.length ? 'aguardando' : 'all'); setReviewPage(0); }
+    } else if (!batch) { setFilter(plan.askable.length ? 'aguardando' : 'all'); setReviewPage(0); }
     // Telegram only when something needs the operator; quiet cycles stay quiet.
     // Only orders with doubts are listed by name; ready ones are a count, so the chat is not flooded.
     const doubtful = pilotOut ? pilotOut.newReview.filter(id => !readyIds.has(id)) : [];
@@ -717,6 +780,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         note: newReady ? `${plural(newReady, 'pedido novo pronto', 'pedidos novos prontos')} para conferir no Studio.` : '',
         awaitingCount: stateList(pilotOut.state).filter(entry => entry.phase === 'awaiting').length }));
     }
+    return counts;
   };
 
   const sendAsk = async (ids, { automatic = false } = {}) => {
@@ -863,6 +927,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     disconnectedSince.current = 0; disconnectAlerted.current = false;
     if (pendingAsk.current && !pilot.autoAsk) pendingAsk.current = null;
     if (pendingAsk.current || workflow.current || busy || connection.busy || openingId) return;
+    // Lists the operator added go first; the cycle runs when the queue is empty.
+    if (batches.some(batch => batch.status === 'waiting')) return;
     if (!force && !isDue(lastCycle.current, pilot.minutes, now)) return;
     lastCycle.current = now;
     const current = expireState(pilotStateRef.current, now);
@@ -884,6 +950,20 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     sendAsk(ids, { automatic: true });
   }, [phase, connected, connection.busy, pilot.enabled, pilot.autoAsk]);
 
+  // Processes the next waiting list whenever the Duoke tab and this screen are free.
+  useEffect(() => {
+    if (runningBatch.current || workflow.current || busy || !connected || connection.busy || openingId || pendingAsk.current || !accessCode.trim()) return;
+    const next = batches.find(batch => batch.status === 'waiting');
+    if (!next) return;
+    runningBatch.current = next.id;
+    updateBatch(next.id, { status: 'running', startedAt: Date.now(), error: '' });
+    startCollection({ codes: next.codes, retry: true, autopilot: true, batch: true }).then(out => {
+      if (out?.skipped) updateBatch(next.id, { status: 'waiting' });
+      else if (out?.ok) updateBatch(next.id, { status: 'done', doneAt: Date.now(), summary: out.summary || null });
+      else updateBatch(next.id, { status: out?.aborted ? 'cancelled' : 'error', error: out?.aborted ? '' : (out?.error || 'Falha desconhecida').slice(0, 300) });
+    }).finally(() => { runningBatch.current = ''; });
+  }, [batches, phase, queueBusy, uploading, connected, connection.busy, openingId, accessCode]);
+
   const pilotCounts = { pending: 0, awaiting: 0, review: 0, failed: 0, done: 0 };
   for (const entry of stateList(pilotState || {})) pilotCounts[entry.phase]++;
   const pilotIds = phaseName => stateList(pilotState || {}).filter(entry => entry.phase === phaseName).map(entry => entry.id);
@@ -903,9 +983,23 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     <div className="lapis-input-grid">
       <div className="lapis-input-panel">
         <div className="lapis-section-title"><span>01</span><h3>Buscar no Duoke</h3></div>
-        <label className="lapis-field">Códigos dos pedidos<textarea value={draft.codes} disabled={busy} maxLength={100000} rows={4} placeholder={'Cole os códigos, um por linha\n323265626\n323265627'} onChange={event => setDraft(current => ({ ...current, codes: event.target.value }))} /></label>
-        <p className="lapis-batch-hint">Até 500 pedidos por lote. Coleta em etapas automáticas, com TXT completo para download.</p>
-        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !draft.codes.trim()} onClick={() => startCollection({ autopilot: true })} title="Coleta, extrai, deixa os nomes prontos para você conferir e separa os clientes para cobrar">Processar lote <span aria-hidden="true">→</span></button><button type="button" disabled={busy || !draft.codes.trim()} onClick={() => startCollection()}>Coletar e extrair</button><label className={`lapis-label-upload${busy ? ' is-disabled' : ''}`} title="Lê o código do pedido e o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={busy} onChange={uploadLabels} /></label><a href="https://ai.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
+        <label className="lapis-field">Códigos dos pedidos<textarea value={draft.codes} disabled={uploading} maxLength={100000} rows={4} placeholder={'Cole a lista de códigos: ela entra na fila de processamento e o campo fica livre para a próxima\n323265626\n323265627'}
+          onChange={event => setDraft(current => ({ ...current, codes: event.target.value }))}
+          onPaste={event => {
+            // A pasted list goes straight to the processing queue; the field stays free for the next one.
+            const codes = parseOrderCodes(event.clipboardData?.getData('text') || '');
+            if (!codes.length) return;
+            event.preventDefault();
+            const count = enqueueBatch(codes);
+            setNotice(`${plural(count, 'pedido entrou', 'pedidos entraram')} na fila de processamento.`); setError('');
+          }} /></label>
+        <p className="lapis-batch-hint">Cole uma lista ou carregue PDFs de etiquetas: cada um entra na fila abaixo e é processado em ordem. Pode adicionar a próxima enquanto a anterior roda.</p>
+        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={!draft.codes.trim()} onClick={() => {
+          const count = enqueueBatch(parseOrderCodes(draft.codes));
+          if (!count) { setError('Nenhum código de pedido válido no campo.'); return; }
+          setDraft(current => ({ ...current, codes: '' }));
+          setNotice(`${plural(count, 'pedido entrou', 'pedidos entraram')} na fila de processamento.`); setError('');
+        }} title="Manda a lista para a fila de processamento (coleta, extrai e deixa os nomes prontos para conferir) e limpa o campo">Processar lista <span aria-hidden="true">→</span></button><button type="button" disabled={busy || !draft.codes.trim()} onClick={() => startCollection()}>Coletar e extrair</button><label className={`lapis-label-upload${uploading ? ' is-disabled' : ''}`} title="Cada PDF vira uma lista na fila de processamento, com o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={uploading} onChange={uploadLabels} /></label><a href="https://ai.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
         <label className="lapis-field">Código de acesso à extração<input type="password" value={accessCode} maxLength={256} autoComplete="off" disabled={busy} placeholder="Informe uma vez neste computador" onChange={event => { setAccessCode(event.target.value); saveAccessCode(event.target.value); }} /></label>
         <details className="lapis-help"><summary>Conectar as abas pela primeira vez</summary><ol><li><a href={`${import.meta.env.BASE_URL}downloads/duoke-bridge.zip`} download>Baixe a extensão Duoke</a> e extraia o ZIP.</li><li>Em chrome://extensions ou edge://extensions, ative o modo de desenvolvedor e escolha “Carregar sem compactação”. Selecione a pasta extraída.</li><li>Abra a extensão na aba do Sticker Studio e clique em conectar. Faça o mesmo na aba do Duoke com sua conta aberta.</li><li>Volte aqui e clique em ↻ para verificar a conexão.</li></ol><p>A extensão lê as conversas dos pedidos informados e só envia mensagens quando você confirma a cobrança.</p></details>
       </div>
@@ -916,6 +1010,29 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         <p className="lapis-batch-hint">O código de acesso fica guardado neste navegador. Apague o campo para esquecê-lo.</p>
       </div>
     </div>
+    {batches.length ? <div className="lapis-batches" aria-label="Fila de processamento">
+      <div className="lapis-batches-head"><strong>Fila de processamento</strong>
+        <span>{plural(batches.filter(batch => batch.status === 'waiting').length, 'na espera', 'na espera')}{!connected ? ' · conecte o Duoke para começar' : !accessCode.trim() ? ' · informe o código de acesso' : ''}</span>
+        {batches.some(batch => batch.status === 'done') ? <button type="button" className="lapis-link-button" onClick={() => { setBatches(current => current.filter(batch => batch.status !== 'done')); if (batches.find(batch => batch.id === batchFilter)?.status === 'done') setBatchFilter(''); }}>Limpar concluídas</button> : null}
+      </div>
+      <ul className="lapis-batch-rows">{batches.map(batch => {
+        const running = batch.status === 'running';
+        const label = running ? `Processando${phase === 'collecting' ? ' · coletando' : phase === 'extracting' ? ' · extraindo' : ''} ${progress.total ? `${progress.completed}/${progress.total}` : ''}`.trim()
+          : batch.status === 'waiting' ? 'Na espera' : batch.status === 'done' ? `Concluída às ${timeText(batch.doneAt || batch.addedAt)}` : batch.status === 'cancelled' ? 'Cancelada' : 'Erro';
+        return <li key={batch.id} className={`lapis-batch is-${batch.status}${batchFilter === batch.id ? ' is-selected' : ''}`}>
+          <span className="lapis-batch-name" title={batch.label}>{batch.label}</span>
+          <span className="lapis-batch-count">{plural(batch.codes.length, 'pedido', 'pedidos')}</span>
+          <span className="lapis-batch-status">{label}</span>
+          <span className="lapis-batch-detail">{batch.status === 'done' ? batchSummary(batch.summary) : batch.status === 'error' ? batch.error : batch.status === 'waiting' ? `adicionada às ${timeText(batch.addedAt)}` : ''}</span>
+          <span className="lapis-batch-actions">
+            {batch.status === 'done' ? <button type="button" className="lapis-link-button" onClick={() => { setBatchFilter(current => current === batch.id ? '' : batch.id); setFilter('all'); setReviewPage(0); }}>{batchFilter === batch.id ? 'Ver todos' : 'Ver pedidos'}</button> : null}
+            {['error', 'cancelled'].includes(batch.status) ? <button type="button" className="lapis-link-button" onClick={() => updateBatch(batch.id, { status: 'waiting', error: '' })}>Tentar de novo</button> : null}
+            {running ? <button type="button" className="lapis-link-button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button>
+              : <button type="button" className="lapis-icon-button" onClick={() => { setBatches(current => current.filter(item => item.id !== batch.id)); if (batchFilter === batch.id) setBatchFilter(''); }} aria-label={`Remover ${batch.label}`} title={batch.status === 'waiting' ? 'Tirar da fila' : 'Remover'}>×</button>}
+          </span>
+        </li>;
+      })}</ul>
+    </div> : null}
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : phase === 'sending' ? 'Enviando mensagens no Duoke' : phase === 'queueing' ? 'Adicionando à fila' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}
     {error ? <p className="lapis-alert lapis-error" role="alert">{error}</p> : null}
     {uploading ? <p className="lapis-notice" role="status">Lendo arquivo…</p> : null}
@@ -950,6 +1067,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     {pilot.enabled && pilotInfo.summary ? <p className="lapis-notice lapis-pilot-summary">{pilotInfo.summary}</p> : null}
     {pilot.enabled && pilotInfo.error ? <p className="lapis-alert lapis-error" role="alert">{pilotInfo.error}</p> : null}
     {unified.length > 0 ? <>
+      {batchFilter ? <p className="lapis-batch-chip">Mostrando só os pedidos de <strong>{batches.find(batch => batch.id === batchFilter)?.label}</strong> <button type="button" className="lapis-link-button" onClick={() => setBatchFilter('')}>Ver todos</button></p> : null}
       <div className="lapis-filters" role="tablist" aria-label="Filtrar pedidos">
         {TABS.map(([key, label]) => key === 'all' || tabCounts[key] || filter === key ? <button type="button" role="tab" key={key} aria-selected={filter === key} aria-pressed={filter === key} className={`lapis-filter lapis-filter-${key}`} onClick={() => { setFilter(key); setReviewPage(0); }}>{label}<strong>{tabCounts[key]}</strong></button> : null)}
       </div>
