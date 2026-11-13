@@ -53,11 +53,20 @@ test('rejects invented IDs, duplicate/missing orders, names and nonliteral evide
   assert.throws(() => normalizeExtraction([{...extracted,id:'UNKNOWN'}], [source]));
   assert.throws(() => normalizeExtraction([extracted,extracted], [source]));
   assert.throws(() => normalizeExtraction([], [source]));
-  for (const item of [ {name:'Inventado',quantity:null,evidence:source.text}, {name:'Abimmael',quantity:null,evidence:'nome é Abimmael.'},
-    {name:'Abimmael',quantity:null,evidence:''}, {name:'Abimmael',quantity:50,evidence:source.text}, {name:'Abimmael',quantity:0,evidence:source.text} ]) {
-    assert.throws(() => normalizeExtraction([{...extracted,names:[item]}], [source]));
+  // A doubtful name no longer fails the batch: it is dropped or corrected and the order goes to review.
+  const one = item => normalizeExtraction([{...extracted,names:[item]}], [source])[0];
+  const invented = one({name:'Inventado',quantity:null,evidence:source.text});
+  assert.equal(invented.status, 'review'); assert.deepEqual(invented.names, []); assert.match(invented.reason, /Inventado" não aparece na conversa/u);
+  for (const item of [{name:'Abimmael',quantity:null,evidence:'nome é Abimmael.'}, {name:'Abimmael',quantity:null,evidence:''}]) {
+    const fixed = one(item);
+    assert.equal(fixed.status, 'review'); assert.equal(fixed.names[0].evidence, source.text, 'quoted from the conversation itself');
   }
-  assert.throws(() => normalizeExtraction([{...extracted,names:[{name:'Ana',quantity:null,evidence:'Banana'}]}], [{...source,text:'Banana'}]));
+  const wrongQty = one({name:'Abimmael',quantity:50,evidence:source.text});
+  assert.equal(wrongQty.names[0].quantity, null); assert.match(wrongQty.reason, /quantidade 50/u);
+  assert.equal(one({name:'Abimmael',quantity:0,evidence:source.text}).names[0].quantity, null);
+  assert.deepEqual(normalizeExtraction([{...extracted,names:[{name:'Ana',quantity:null,evidence:'Banana'}]}], [{...source,text:'Banana'}])[0].names, [], 'a name inside another word is not evidence');
+  const broken = normalizeExtraction([{...extracted,names:[{name:'Abimmael',quantity:75,evidence:'Bom dia, o nome é\n Abimmael'}]}], [{...source,text:'Bom dia, o nome é\nAbimmael e abinaelle 75 cada'}])[0];
+  assert.equal(broken.names[0].name, 'Abimmael', 'a quote with joined line breaks still counts');
 });
 test('preserves hyphens and accents from literal source', () => {
   const text = 'Nome para etiquetas: ANA-CLARA D’ÁVILA';

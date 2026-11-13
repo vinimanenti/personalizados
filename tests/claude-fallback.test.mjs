@@ -77,7 +77,9 @@ test('Claude results pass the same literal-evidence check', quiet(async () => {
   const handler = createGeminiHandler({ env, claudeClient: fakeClaude(claudeMessage(invented)), consumeQuota: async () => true,
     fetchImpl: async () => { throw new TypeError('fetch failed'); } });
   const response = await handler(request());
-  assert.equal(response.status, 502); assert.match((await response.json()).error, /inválida ou incompleta/);
+  assert.equal(response.status, 200);
+  const [order] = (await response.json()).orders;
+  assert.equal(order.status, 'review'); assert.deepEqual(order.names, [], 'a name that is not in the conversation is never applied');
 }));
 
 test('Claude refusals and errors report that both providers failed', quiet(async () => {

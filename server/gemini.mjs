@@ -48,6 +48,14 @@ function claudeSchemaFor(ids) {
   } };
 }
 
+// Why a provider answer was refused, for the server log. Our own messages only: a JSON
+// SyntaxError can quote the model output (conversation text), so it is never logged as is.
+const SAFE_REASONS = /^(Resultado de extração inválido|ID inesperado ou duplicado|Pedido ausente na resposta|Extração retornou um pedido sem conversa|Pedido duplicado|Código de pedido inválido|Resposta de extração inválida|Incomplete output|Invalid output)/u;
+function refusal(error, extra = '') {
+  const reason = error instanceof SyntaxError ? 'JSON inválido' : SAFE_REASONS.test(String(error?.message)) ? String(error.message).slice(0, 120) : 'formato inesperado';
+  return `${reason}${extra}`;
+}
+
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
@@ -232,8 +240,9 @@ export function createGeminiHandler({ env = {}, fetchImpl = globalThis.fetch, co
           const parts = candidate.content?.parts;
           if (!Array.isArray(parts) || !parts.length || parts.some(part => typeof part.text !== 'string' || part.thought)) throw new Error('Invalid output');
           return normalizeExtraction(JSON.parse(parts.map(part => part.text).join('')), orders);
-        } catch {
+        } catch (error) {
           if (signal.aborted) throw upstreamFailure(timeout());
+          console.warn(`[lapis-extract] Resposta do Gemini recusada (${model}): ${refusal(error)}`);
           throw upstreamFailure(new HttpError(502, 'Resposta de extração inválida ou incompleta. Revise e tente novamente.'));
         }
       };
@@ -255,7 +264,8 @@ export function createGeminiHandler({ env = {}, fetchImpl = globalThis.fetch, co
           if (response?.stop_reason !== 'end_turn') throw new Error('Incomplete output');
           const text = response.content.filter(block => block.type === 'text').map(block => block.text).join('');
           return normalizeExtraction(JSON.parse(text), orders);
-        } catch {
+        } catch (error) {
+          console.warn(`[lapis-extract] Resposta do Claude recusada (${claudeModel}): ${refusal(error, response?.stop_reason && response.stop_reason !== 'end_turn' ? `, stop_reason=${String(response.stop_reason).slice(0, 30)}` : '')}`);
           throw new HttpError(502, 'Resposta de extração inválida ou incompleta. Revise e tente novamente.');
         }
       };

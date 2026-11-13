@@ -21,6 +21,8 @@ function validQuantity(quantity) {
 function titleCase(name) {
   return name.toLocaleLowerCase('pt-BR').replace(/(^|[^\p{L}\p{M}])\p{L}/gu, s => s.toLocaleUpperCase('pt-BR'));
 }
+// Same text with line breaks and repeated spaces collapsed (models often quote that way).
+const squash = value => String(value).replace(/[\s\u00a0]+/gu, ' ').trim();
 function containsName(evidence, name) {
   const escaped = fold(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(^|[^\\p{L}\\p{M}\\p{N}])${escaped}($|[^\\p{L}\\p{M}\\p{N}])`, 'u').test(fold(evidence));
@@ -109,29 +111,50 @@ export function normalizeExtraction(raw, orders) {
       found.set(result.id, result);
       continue;
     }
-    if (!['found', 'not_found', 'review'].includes(result.status) || !Array.isArray(result.names) || result.names.length > 30) {
+    if (!['found', 'not_found', 'review'].includes(result.status) || !Array.isArray(result.names)) {
       throw new Error('Resultado de extração inválido.');
     }
-    if (typeof result.reason !== 'string' || result.reason.length > 500) throw new Error('Motivo de extração inválido.');
-    if ((result.status === 'not_found' && result.names.length) || (result.status === 'found' && !result.names.length)) {
-      throw new Error('Estado de extração incompatível com os nomes.');
-    }
+    // One doubtful name no longer sinks the whole batch: it is fixed when the conversation
+    // proves it, dropped when it does not, and the order goes to review with the reason.
+    // Nothing reaches the print queue without the operator's Conferi.
+    const notes = [];
     const uniqueNames = new Set();
-    const names = result.names.map(item => {
-      const name = validName(item?.name);
-      if (missingName(name) || uniqueNames.has(fold(name))) throw new Error('Nome ausente ou duplicado na extração.');
-      uniqueNames.add(fold(name));
-      const evidence = item.evidence;
-      if (typeof evidence !== 'string' || !evidence.trim() || evidence.length > 2000 ||
-          !source.text.includes(evidence) || !containsName(evidence, name)) throw new Error('Nome sem evidência literal na conversa.');
-      const quantity = validQuantity(item.quantity);
-      if (quantity !== null && !new RegExp(`(^|[^0-9])${quantity}($|[^0-9])`).test(evidence)) {
-        throw new Error('Quantidade sem evidência literal.');
+    const flatText = squash(source.text);
+    const names = [];
+    for (const item of result.names.slice(0, 30)) {
+      let name;
+      try { name = validName(item?.name); } catch { notes.push('Um nome inválido foi descartado.'); continue; }
+      if (missingName(name)) continue;
+      if (uniqueNames.has(fold(name))) continue;
+      let evidence = typeof item.evidence === 'string' && item.evidence.length <= 2000 ? item.evidence : '';
+      const literal = evidence.trim() && (source.text.includes(evidence) || flatText.includes(squash(evidence))) && containsName(evidence, name);
+      if (!literal) {
+        // The name itself is in the conversation, only the quote was off: quote the line that has it.
+        const line = source.text.split(/\r?\n/u).find(row => containsName(row, name));
+        if (!line) { notes.push(`"${name.slice(0, 40)}" não aparece na conversa e foi descartado.`); continue; }
+        evidence = line.trim().slice(0, 2000);
+        notes.push(`Confira "${name.slice(0, 40)}" na conversa.`);
       }
-      return { name: titleCase(name), quantity, evidence };
-    });
-    let reason = result.reason.trim();
+      uniqueNames.add(fold(name));
+      let quantity = null;
+      try { quantity = validQuantity(item.quantity); } catch { notes.push(`Quantidade inválida para "${name.slice(0, 40)}"; ficou automática.`); }
+      const hasNumber = (text, n) => new RegExp(`(^|[^0-9])${n}($|[^0-9])`).test(text);
+      if (quantity !== null && !hasNumber(evidence, quantity)) {
+        // Quote the stretch of conversation that has both the number and the name, when they are close.
+        const at = flatText.search(new RegExp(`(^|[^0-9])${quantity}($|[^0-9])`));
+        const nameAt = fold(flatText).indexOf(fold(name));
+        if (at >= 0 && nameAt >= 0 && Math.abs(nameAt - at) <= 400) {
+          evidence = flatText.slice(Math.max(0, Math.min(at, nameAt)), Math.max(at + String(quantity).length + 1, nameAt + name.length)).trim();
+          notes.push(`Confira a quantidade ${quantity} de "${name.slice(0, 40)}".`);
+        } else { notes.push(`A quantidade ${quantity} de "${name.slice(0, 40)}" não aparece perto do nome na conversa; ficou automática.`); quantity = null; }
+      }
+      names.push({ name: titleCase(name), quantity, evidence });
+    }
+    let reason = typeof result.reason === 'string' ? result.reason.trim().slice(0, 500) : '';
     let status = result.status;
+    if (status === 'found' && !names.length) { status = 'review'; notes.push('A IA marcou como encontrado, mas sem nome válido.'); }
+    if (status === 'not_found' && names.length) status = 'review';
+    if (notes.length) { status = names.length || status !== 'not_found' ? 'review' : status; reason = [reason, ...notes].filter(Boolean).join(' ').slice(0, 500); }
     try { if (names.length) toLabelFields({ names, status: 'found' }); }
     catch (error) { status = 'review'; reason = reason ? `${reason} ${error.message}` : error.message; }
     found.set(result.id, { id: result.id, names, status, reason, text: source.text });

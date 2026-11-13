@@ -157,11 +157,15 @@ test('timeout bounds mocks ignoring abort as well as upstream body reads',async(
   assert.equal((await streaming(request())).status,504);
 });
 test('invalid model output never becomes not_found or reaches labels',async()=>{
-  for(const payload of [{orders:[]},{orders:[{...result.orders[0],id:'OTHER'}]},{orders:[{...result.orders[0],names:[{name:'Inventado',quantity:null,evidence:source.text}]}]},
-    {orders:[{...result.orders[0],names:[{name:'João',quantity:null,evidence:'not literal'}]}]}]){
+  for(const payload of [{orders:[]},{orders:[{...result.orders[0],id:'OTHER'}]}]){
     const handler=createGeminiHandler({env,fetchImpl:async()=>upstream(payload)});
     assert.equal((await handler(request())).status,502);
   }
+  // Invented names are dropped and quotes are fixed from the conversation; the order waits for review.
+  const invented=await (await createGeminiHandler({env,fetchImpl:async()=>upstream({orders:[{...result.orders[0],names:[{name:'Inventado',quantity:null,evidence:source.text}]}]})})(request())).json();
+  assert.equal(invented.orders[0].status,'review'); assert.deepEqual(invented.orders[0].names,[]);
+  const loose=await (await createGeminiHandler({env,fetchImpl:async()=>upstream({orders:[{...result.orders[0],names:[{name:'João',quantity:null,evidence:'not literal'}]}]})})(request())).json();
+  assert.equal(loose.orders[0].status,'review'); assert.equal(loose.orders[0].names[0].evidence,source.text);
   for(const response of [new Response('not JSON'),new Response(' '.repeat(256001)),new Response(JSON.stringify({candidates:[{finishReason:'MAX_TOKENS',content:{parts:[{text:JSON.stringify(result)}]}}]}))]){
     const handler=createGeminiHandler({env,fetchImpl:async()=>response});assert.equal((await handler(request())).status,502);
   }

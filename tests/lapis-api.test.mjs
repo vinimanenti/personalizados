@@ -48,10 +48,13 @@ test('cancelling after first batch retains it and prevents subsequent request', 
 });
 
 test('invalid IDs and fabricated evidence never become applied extraction results', () => {
-  for (const mutate of [body => { body.orders[0].id = 'UNKNOWN'; }, body => { body.orders = []; }, body => { body.orders[0].names[0].evidence = 'Fabricated name'; }]) {
+  for (const mutate of [body => { body.orders[0].id = 'UNKNOWN'; }, body => { body.orders = []; }]) {
     const body = payload(orders.slice(0, 1)); mutate(body);
     assert.throws(() => validateExtractionResponse(body, orders.slice(0, 1)));
   }
+  const fabricated = payload(orders.slice(0, 1)); fabricated.orders[0].names[0] = { name: 'Fabricado', quantity: null, evidence: 'Fabricado' };
+  const [result] = validateExtractionResponse(fabricated, orders.slice(0, 1));
+  assert.equal(result.status, 'review'); assert.deepEqual(result.names, []);
 });
 
 test('only the failed chunk is flagged; completed and unattempted chunks remain distinct', async () => {
