@@ -31,7 +31,8 @@ export function createAutopilotClient({ endpoint, accessCode, fetchImpl = (...ar
       if (!Array.isArray(data?.entries)) throw new Error('O piloto automático retornou um estado inválido.');
       return data.entries;
     },
-    save: (entries, remove = []) => call({ action: 'save', entries, remove }),
+    // clientNow lets the server correct for this computer's clock.
+    save: (entries, remove = []) => call({ action: 'save', entries, remove, clientNow: Date.now() }),
     notify: text => call({ action: 'notify', text }),
   };
 }

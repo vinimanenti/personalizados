@@ -243,3 +243,4 @@
   .lapis-batch-actions { grid-column: 1 / -1; justify-self: start; }
 }
 
+.lapis-import .lapis-danger { border: 1px solid rgba(250,146,133,.6); background: rgba(250,146,133,.12); color: #fa9285; border-radius: 8px; padding: 8px 12px; font-weight: 600; }

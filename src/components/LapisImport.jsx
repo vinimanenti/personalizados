@@ -315,6 +315,12 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [batchStore] = useState(batchesKey);
   const [batches, setBatches] = useState(() => readBatches(batchStore));
   const [batchFilter, setBatchFilter] = useState('');
+  const [confirmReset, setConfirmReset] = useState(false);
+  useEffect(() => {
+    if (!confirmReset) return;
+    const timer = setTimeout(() => setConfirmReset(false), 6000);
+    return () => clearTimeout(timer);
+  }, [confirmReset]);
   const runningBatch = useRef('');
   const updateBatch = (id, patch) => setBatches(current => current.map(batch => batch.id === id ? { ...batch, ...patch } : batch));
   // Adds a list to the processing queue; returns how many codes it took.
@@ -378,7 +384,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     if (pilotState === null) return;
     clearTimeout(pilotSaveTimer.current);
     pilotSaveTimer.current = setTimeout(() => {
-      const entries = stateList(pilotState);
+      const entries = stateList(expireState(pilotState));
       const ids = new Set(entries.map(entry => entry.id));
       const remove = [...pilotSaved.current].filter(id => !ids.has(id));
       pilotClient.save(entries, remove).then(() => {
@@ -1038,7 +1044,18 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     {uploading ? <p className="lapis-notice" role="status">Lendo arquivo…</p> : null}
     {notice ? <p className="lapis-notice" role="status">{notice}</p> : null}
     {!saved && draft.collected.length > 0 ? <p className="lapis-alert lapis-error" role="alert">O rascunho não pôde ser salvo neste navegador. Baixe o TXT completo e o CSV dos nomes antes de fechar a tela.</p> : null}
-    <div className="lapis-review-heading"><div className="lapis-section-title"><span>02</span><h3>Pedidos <small>{unified.length}</small></h3></div><div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !selectedOrders.length} onClick={() => runExtraction()}>Extrair selecionados{selectedOrders.length ? ` · ${selectedOrders.length}` : ''}</button><button type="button" disabled={!draft.collected.length} onClick={() => downloadText()}>Baixar TXT completo</button><button type="button" disabled={busy || !draft.collected.length} onClick={exportCsv}>Exportar CSV</button><button type="button" className="lapis-link-button" disabled={busy || !draft.collected.length} onClick={() => { setDraft(EMPTY); setFilter('all'); setReviewPage(0); setError(''); setNotice('Revisão limpa. As cartelas adicionadas continuam na fila.'); }}>Limpar revisão</button></div></div>
+    <div className="lapis-review-heading"><div className="lapis-section-title"><span>02</span><h3>Pedidos <small>{unified.length}</small></h3></div><div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !selectedOrders.length} onClick={() => runExtraction()}>Extrair selecionados{selectedOrders.length ? ` · ${selectedOrders.length}` : ''}</button><button type="button" disabled={!draft.collected.length} onClick={() => downloadText()}>Baixar TXT completo</button><button type="button" disabled={busy || !draft.collected.length} onClick={exportCsv}>Exportar CSV</button><button type="button" className={confirmReset ? 'lapis-danger' : 'lapis-link-button'} disabled={busy || !unified.length} onClick={() => {
+          if (!confirmReset) { setConfirmReset(true); return; }
+          // Clears everything this list shows: the review, the pilot's orders and the awaiting customers.
+          // The print queue and the processing queue are not touched.
+          const ids = stateList(pilotStateRef.current || {}).map(entry => entry.id);
+          setDraft(current => ({ ...EMPTY, codes: current.codes }));
+          if (ids.length) setPilotState(current => removeFromState(current, ids));
+          setAwaiting({}); setSendStatus(dict()); setExpandedIds(new Set()); setBatchFilter('');
+          setFilter('all'); setReviewPage(0); setConfirmReset(false); setError('');
+          setPilotInfo(current => ({ ...current, summary: '', error: '' }));
+          setNotice(`Lista zerada: ${plural(unified.length, 'pedido removido', 'pedidos removidos')}. As cartelas que já estão na fila de impressão continuam lá.`);
+        }} title="Apaga os pedidos desta lista (revisão, piloto e clientes aguardando). A fila de impressão não muda.">{confirmReset ? `Confirmar: apagar ${plural(unified.length, 'pedido', 'pedidos')}` : 'Zerar lista'}</button>{confirmReset ? <button type="button" className="lapis-link-button" onClick={() => setConfirmReset(false)}>Cancelar</button> : null}</div></div>
     <div className={`lapis-pilot-bar${pilot.enabled ? ' is-on' : ''}`} aria-label="Piloto contínuo">
       <label className="lapis-switch"><input type="checkbox" checked={pilot.enabled} onChange={event => setPilot(current => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" />Piloto {pilot.enabled ? 'ligado' : 'desligado'}</label>
       <span className="lapis-pilot-meta">{pilot.enabled ? <>a cada {pilot.minutes} min · último {pilotInfo.lastRun ? timeText(pilotInfo.lastRun) : '—'} · {!connected ? 'Duoke desconectado' : `próximo ${busy ? 'agora' : nextCycle ? timeText(Math.max(nextCycle, Date.now())) : 'em instantes'}`}</> : 'Ligue para ler os pedidos sozinho a cada ciclo. Nada vai para a fila sem o seu Conferi.'}</span>

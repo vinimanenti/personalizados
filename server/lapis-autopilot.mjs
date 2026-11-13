@@ -1,4 +1,4 @@
-import { MAX_NOTIFY_CHARS, MAX_STATE_ENTRIES, normalizeEntry } from '../shared/lapis-continuous.mjs';
+import { MAX_NOTIFY_CHARS, MAX_STATE_ENTRIES, normalizeEntry, entryProblem, shiftEntryTimes, ENTRY_TTL } from '../shared/lapis-continuous.mjs';
 
 // Continuous-autopilot backend shared by the Vite dev server and the Supabase Edge
 // Function: stores the pilot state and relays the summary to Telegram. Same access
@@ -125,8 +125,17 @@ export function createAutopilotHandler({ env = {}, store = null, fetchImpl = glo
         const remove = Array.isArray(body.remove) ? body.remove : [];
         if (entries.length > MAX_STATE_ENTRIES || remove.length > MAX_STATE_ENTRIES) throw new HttpError(400, 'Estado do piloto acima do limite.');
         const at = now();
-        const clean = entries.map(entry => normalizeEntry(entry, at));
-        if (clean.some(entry => !entry)) throw new HttpError(400, 'Estado do piloto inválido.');
+        // The browser stamps entries with its own clock; a computer running ahead of the
+        // server would otherwise see every new entry rejected as "in the future".
+        const skew = Number.isFinite(body.clientNow) ? at - body.clientNow : 0;
+        const offset = Math.abs(skew) > 60000 && Math.abs(skew) < ENTRY_TTL ? skew : 0;
+        const shifted = entries.map(entry => shiftEntryTimes(entry, offset));
+        const clean = shifted.map(entry => normalizeEntry(entry, at));
+        const bad = clean.findIndex(entry => !entry);
+        if (bad >= 0) {
+          const id = typeof shifted[bad]?.id === 'string' ? shifted[bad].id.slice(0, 40) : '?';
+          throw new HttpError(400, `Estado do piloto inválido: pedido ${id} — ${entryProblem(shifted[bad], at) || 'dados inválidos'}.`);
+        }
         if (remove.some(id => typeof id !== 'string' || !ID_PATTERN.test(id))) throw new HttpError(400, 'Pedido inválido na remoção.');
         try { await store.save(clean, [...new Set(remove)].filter(id => !clean.some(entry => entry.id === id))); }
         catch { throw new HttpError(502, 'Não foi possível gravar o estado do piloto.'); }

@@ -76,3 +76,18 @@ test('browser client resolves the endpoint and surfaces readable errors', async 
   await assert.rejects(denied.load(), /não autorizado/u);
   await assert.rejects(createAutopilotClient({ endpoint: '/x', accessCode: '' }).load(), /código de acesso/u);
 });
+
+test('a computer clock running ahead is corrected and a rejected save names the order and the reason', async () => {
+  const store = createMemoryStore([]);
+  const handler = createAutopilotHandler({ env, store, now: () => NOW });
+  const ahead = NOW + 10 * 60 * 1000;
+  const fresh = { ...entry('F1'), addedAt: ahead, updatedAt: ahead };
+  assert.equal((await handler(request({ action: 'save', entries: [fresh] }))).status, 400, 'without clientNow the future time is rejected');
+  const refused = await (await handler(request({ action: 'save', entries: [fresh] }))).json();
+  assert.match(refused.error, /pedido F1 — horário no futuro/u);
+  assert.equal((await handler(request({ action: 'save', entries: [fresh], clientNow: ahead }))).status, 200);
+  assert.equal(store.rows.get('F1').addedAt, NOW, 'stored in server time');
+  const old = await (await handler(request({ action: 'save', entries: [{ ...entry('O1'), addedAt: NOW - 8 * 24 * 3600000 }] }))).json();
+  assert.match(old.error, /pedido O1 — mais de 7 dias/u);
+});
+

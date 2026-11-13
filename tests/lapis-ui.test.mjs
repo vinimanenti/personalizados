@@ -34,6 +34,7 @@ test('300 restored orders render counters and only fifty compact rows, all colla
   assert.doesNotMatch(markup, /lapis-pilot-settings/, 'pilot settings start folded');
   assert.match(markup, /1–50 de 300 pedidos/);
   assert.match(markup, /Baixar TXT completo/);
+  assert.match(markup, />Zerar lista</);
   assert.match(markup, /Coletar e extrair/);
   assert.doesNotMatch(markup, /value="test-only"/);
 });

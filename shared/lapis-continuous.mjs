@@ -47,6 +47,26 @@ export function normalizeEntry(raw, now = Date.now()) {
   return entry;
 }
 
+/** Why normalizeEntry rejects an entry, in words the operator can act on ('' when it is valid). */
+export function entryProblem(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !ID_PATTERN.test(raw.id)) return 'código de pedido inválido';
+  if (!PHASES.has(raw.phase)) return 'fase desconhecida';
+  const future = value => Number.isFinite(value) && value > now + CLOCK_SKEW;
+  if (future(raw.addedAt) || future(raw.doneAt)) return 'horário no futuro (o relógio deste computador parece adiantado)';
+  if (!isTime(raw.addedAt, now)) return 'sem horário de entrada';
+  if (now - raw.addedAt >= ENTRY_TTL) return 'mais de 7 dias no piloto';
+  if (raw.phase === 'done' && (!isTime(raw.doneAt, now) || dayKey(raw.doneAt) !== dayKey(now))) return 'foi para a fila em outro dia';
+  return '';
+}
+
+/** Moves every time of an entry by offset ms (the difference between this computer's clock and the server's). */
+export function shiftEntryTimes(raw, offset) {
+  if (!offset || !raw || typeof raw !== 'object') return raw;
+  const next = { ...raw };
+  for (const key of ['addedAt', 'updatedAt', 'sentAt', 'doneAt']) if (Number.isFinite(next[key])) next[key] += offset;
+  return next;
+}
+
 const CONTROL = /[\u0000-\u001f\u007f]/gu;
 const cleanText = (value, size) => typeof value === 'string' ? value.replace(CONTROL, ' ').trim().slice(0, size) : '';
 /** Suggested names and reason of an order in review, so read-only tools (MCP) can explain it. Bounded and plain text. */
