@@ -7,7 +7,7 @@ A integração reúne coleta, extração, revisão e impressão. O computador pr
 1. Abra **Lápis** e baixe a extensão na área de importação.
 2. Extraia o ZIP para uma pasta permanente. Abra `chrome://extensions` ou `edge://extensions`, habilite o modo de desenvolvedor, escolha **Carregar sem compactação** e selecione a pasta que contém `manifest.json`.
 3. Na aba `https://vinimanenti.github.io/personalizados/`, abra o popup da extensão e conecte o Sticker Studio.
-4. Abra `https://web.duoke.com/?lang=pt#/dk/main/chat`, entre na sua conta e conecte essa aba pelo mesmo popup.
+4. Abra `https://ai.duoke.com/?lang=pt#/dk/main/chat`, entre na sua conta e conecte essa aba pelo mesmo popup.
 5. Volte à aba Lápis, atualize a conexão e cole os códigos (até 500 pedidos). Informe o **código de acesso à extração** fornecido pelo administrador; ele não é a chave de API do Gemini e fica guardado no navegador deste computador (apague o campo para esquecê-lo).
 6. Clique em **Coletar e extrair**. A coleta é dividida automaticamente em etapas de até 200 pedidos; ao terminar, começa a extração. Mantenha a conversa livre de alterações manuais durante a coleta. Cancelar preserva os pedidos concluídos; iniciar novamente reaproveita conversas disponíveis e preserva os pedidos que já têm nomes.
 7. Baixe o **TXT completo** como backup das conversas. Confira nomes e quantidades, marque os pedidos revisados e adicione-os à fila. **Exportar CSV** baixa `ID,Nome` somente dos pedidos com nomes; os demais ficam nas pendências.
@@ -78,7 +78,7 @@ Revise as migrações pendentes antes de `db push`. Alternativamente, execute so
 
 ## Limites e diagnóstico
 
-- **Desconectado:** conecte ambas as abas no popup. A coleta funciona no chat em `web.duoke.com/?lang=pt#/dk/main/chat`.
+- **Desconectado:** conecte ambas as abas no popup. A coleta funciona no chat em `ai.duoke.com/?lang=pt#/dk/main/chat` (o endereço antigo `web.duoke.com` continua aceito).
 - **Pesquisa por pedido:** a extensão 1.0.2 seleciona **Pedido**, preenche o código e clica na linha do resultado para abrir a conversa. Se o resultado não aparecer ao digitar, aciona Enter no campo de pesquisa. Após atualizar a extensão, recarregue-a em `chrome://extensions` ou `edge://extensions`, atualize as duas abas e reconecte-as.
 - **Conversa não confirmada:** a extensão interrompe aquele pedido quando não consegue confirmar a correspondência; não aproveita as mensagens que estavam abertas antes da busca.
 - **Tempo esgotado na coleta:** a versão 1.0.3 reconhece `.order_item_title`, verifica somente mensagens com texto do cliente e lê o conteúdo das notas do pedido correspondente. Rótulos fixos de observação, mensagens da loja e mídias vazias não impedem a confirmação. A conversa tem até 30 segundos para carregar; a mensagem de erro distingue identificação, carregamento, ausência de texto e atualização pendente.
@@ -98,7 +98,7 @@ Em 13/10/2026: 51 testes automatizados passaram; o build Vite, a renderização 
 
 Uma chamada ao Gemini com nomes fictícios revelou incompatibilidade no campo `responseFormat`; a integração foi corrigida para os campos documentados `responseMimeType` e `responseJsonSchema`. A tentativa seguinte chegou ao provedor e recebeu HTTP 503 por alta demanda. Portanto, ainda não há uma extração real concluída registrada nesta entrega. Não houve envio de conversas reais. O navegador não estava disponível para validar o Duoke autenticado.
 
-Após a configuração pelo usuário, a função Supabase respondeu ao teste de origem e recusou corretamente uma chamada sem código de acesso. O endereço correto do chat foi confirmado pelo usuário como `https://web.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.0.1 e o botão do frontend foram corrigidos; 55 testes e o build passaram. A publicação do frontend e do ZIP 1.0.1 foi verificada no site, inclusive pela comparação do pacote com o arquivo local. A coleta na sessão real e a extração autenticada continuam pendentes de validação.
+Após a configuração pelo usuário, a função Supabase respondeu ao teste de origem e recusou corretamente uma chamada sem código de acesso. O endereço correto do chat foi confirmado pelo usuário como `https://ai.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.0.1 e o botão do frontend foram corrigidos; 55 testes e o build passaram. A publicação do frontend e do ZIP 1.0.1 foi verificada no site, inclusive pela comparação do pacote com o arquivo local. A coleta na sessão real e a extração autenticada continuam pendentes de validação.
 
 Referências: [chaves Gemini](https://ai.google.dev/gemini-api/docs/api-key), [GenerateContent e GenerationConfig](https://ai.google.dev/api/generate-content), [saídas estruturadas](https://ai.google.dev/gemini-api/docs/generate-content/structured-output), [segredos de Edge Functions](https://supabase.com/docs/guides/functions/secrets), [permissão activeTab](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab).
 
@@ -162,3 +162,6 @@ supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
 ```
 
 Validação desta entrega: testes de `lapis-continuous` (planejamento, hash, falhas, cobrança única, mensagem) e do servidor (código de acesso, origem, validação do estado, Telegram sem eco de erro), além de um teste de ponta a ponta no Chromium com a Ponte Duoke simulada: lote manual, ciclo com reaproveitamento sem chamar a IA, cobrança automática, resposta do cliente extraída e enviada à fila, pedido sem leitura após 3 ciclos e estado preservado após recarregar. A sessão real do Duoke e o Telegram real ainda precisam ser confirmados pelo usuário.
+
+Mudança de domínio do Duoke (13/11/2026): o chat web passou para `https://ai.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.2.0 aceita o domínio novo e o antigo (`web.duoke.com`) e pede permissão para os dois. Os testes cobrem pareamento, status e o content script nos dois domínios; os seletores da conversa ainda precisam ser confirmados na interface nova pelo usuário.
+Ponte Duoke 1.2.1 (13/11/2026): o `ai.duoke.com` usa Element Plus com prefixo `dk-`. O diagnóstico do usuário mostrou que as classes próprias do Duoke continuam iguais; mudaram o seletor de pesquisa (`.chat_search_bar .dk-select`, rótulo como texto e abertura por `.dk-select__wrapper`), as opções (`.dk-select-dropdown__item`), a caixa de mensagem (`textarea.dk-textarea__inner`) e os indicadores de carregamento/vazio. Os seletores novos são consultados junto com os antigos.

@@ -3,7 +3,7 @@
 1. Baixe o ZIP no painel Lápis do Sticker Studio e extraia em uma pasta permanente.
 2. No Chrome, abra `chrome://extensions`; no Edge, `edge://extensions`. Ative **Modo do desenvolvedor**, escolha **Carregar sem compactação** e selecione a pasta que contém `manifest.json`.
 3. Abra `https://vinimanenti.github.io/personalizados/` (ou `http://localhost:3000/personalizados/`). Clique no ícone da extensão e em **Conectar esta aba**.
-4. Abra `https://web.duoke.com/?lang=pt#/dk/main/chat`, entre normalmente e conecte essa aba pelo mesmo popup.
+4. Abra `https://ai.duoke.com/?lang=pt#/dk/main/chat`, entre normalmente e conecte essa aba pelo mesmo popup.
 5. No painel Lápis, cole os códigos, colete e revise os resultados. Mantenha as duas abas abertas; reconecte após recarregar uma aba. Use **Cancelar coleta** para preservar os pedidos concluídos.
 
 A extensão só lê a conversa após confirmar o código e uma atualização das mensagens. Resultados antigos, conversas sem identificação, carregamento incompleto e layout incompatível geram erro para revisão. Ela não lê cookies, credenciais ou armazenamento do Duoke. Mensagens só são enviadas quando o operador confirma, no Lápis, a lista de pedidos e o texto (veja abaixo). Apenas web.duoke.com possui permissão permanente; a conexão ao Studio é concedida pelo clique no popup. Somente o Studio publicado acima e localhost/127.0.0.1:3000 em `/personalizados/` são aceitos.

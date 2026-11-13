@@ -89,6 +89,53 @@ test('selects Pedido before entering the code and clicks the automatic result wi
   assert.equal(f.mode.clicks, 1); assert.equal(f.input.focused, true);
 });
 
+function dkMode(f, label = 'Comprador', { teleported = false } = {}) {
+  // ai.duoke.com (11/2026): Element Plus "dk-" select, label as text, input empty, opened by the wrapper.
+  f.routes.set(S.mode, []);
+  const select = new Node(label); const wrapper = new Node(); const input = new Node(); input.value = '';
+  select.routes = new Map([['.dk-select__wrapper', [wrapper]], ['input', [input]]]);
+  const option = new Node('Pedido'); option.css.display = 'none';
+  const other = new Node('Comprador'); other.css.display = 'none';
+  wrapper.onClick = () => { option.css.display = 'block'; other.css.display = 'block'; };
+  option.onClick = () => { select.innerText = 'Pedido'; option.css.display = 'none'; other.css.display = 'none'; };
+  f.routes.set('.chat_search_bar .dk-select', [select]);
+  // Same Map backs the container and the document; a teleported popper is only found by the document-wide fallback.
+  f.routes.set('.dk-select-dropdown__item', [other, option]);
+  if (teleported) {
+    const container = f.routes.get('.chat_search_container')[0];
+    container.querySelectorAll = selector => selector === '.dk-select-dropdown__item' ? [] : f.routes.get(selector) || [];
+  }
+  return { select, wrapper, option, other };
+}
+
+test('ai.duoke.com: reads Pedido from the dk-select text, opens it by the wrapper and picks the dk option', async () => {
+  const f = fixture(); const m = dkMode(f);
+  f.search.onClick = () => f.result(f.input.value);
+  const order = await f.collector.collectOrder('260123ABC');
+  assert.equal(order.status, 'collected');
+  assert.equal(m.wrapper.clicks, 1); assert.equal(m.option.clicks, 1); assert.equal(m.other.clicks, 0);
+});
+
+test('ai.duoke.com: a dk-select already on Pedido is not touched', async () => {
+  const f = fixture(); const m = dkMode(f, 'Pedido');
+  f.search.onClick = () => f.result(f.input.value);
+  assert.equal((await f.collector.collectOrder('260123ABC')).status, 'collected');
+  assert.equal(m.wrapper.clicks, 0);
+});
+
+test('ai.duoke.com: a Pedido option rendered outside the search bar is still found', async () => {
+  const f = fixture(); const m = dkMode(f, 'Comprador', { teleported: true });
+  f.search.onClick = () => f.result(f.input.value);
+  assert.equal((await f.collector.collectOrder('260123ABC')).status, 'collected');
+  assert.equal(m.option.clicks, 1);
+});
+
+test('ai.duoke.com: without any search selector the error still asks to select Pedido', async () => {
+  const f = fixture(); f.routes.set(S.mode, []);
+  const summary = await f.collector.run(['260123ABC']);
+  assert.match(summary.orders[0].error, /Seletor de pesquisa Duoke não encontrado/);
+});
+
 test('already selected Pedido is preserved and Enter is scoped to the input when typing has no result', async () => {
   const f = fixture(); const events = [];
   f.input.onEvent = event => {
@@ -427,8 +474,21 @@ test('popup pairs the web Duoke chat with language query and injects the collect
   assert.deepEqual(plain(f.values.duoke), { tabId: 2, origin: 'https://web.duoke.com' });
 });
 
+test('popup pairs the new ai.duoke.com chat and keeps its own origin for later checks', async () => {
+  const f = workerFixture();
+  f.tabs.set(2, { id: 2, url: 'https://ai.duoke.com/?lang=pt#/dk/main/chat' });
+  assert.deepEqual(plain(await f.send({ channel: 'duoke-popup', type: 'PAIR', tabId: 2 }, f.popup)), { ok: true, role: 'duoke' });
+  assert.deepEqual(plain(f.injected[0]), { target: { tabId: 2 }, files: ['collector.js', 'duoke-content.js'] });
+  assert.deepEqual(plain(f.values.duoke), { tabId: 2, origin: 'https://ai.duoke.com' });
+  assert.equal((await f.send({ channel: 'duoke-studio', requestId: 'status-ai', type: 'STATUS' })).duokeConnected, true);
+});
+
 const rejectedDuokeUrls = [
   'https://classic.duoke.com/pt/index.html',
+  'https://ai.duoke.com/?lang=pt#/dk/main/orders',
+  'https://ai.duoke.com.example.org/?lang=pt#/dk/main/chat',
+  'http://ai.duoke.com/?lang=pt#/dk/main/chat',
+  'https://duoke.com/?lang=pt#/dk/main/chat',
   'https://web.duoke.com/?lang=pt#/dk/main/orders',
   'https://web.duoke.com/?lang=pt#/dk/main/chatting',
   'https://web.duoke.com/?lang=pt',
@@ -447,7 +507,7 @@ test('pairing and connection status reject other domains and non-chat routes', a
 
 test('content script accepts the web chat and stops responding after leaving its route', async () => {
   const contentSource = await readFile(new URL('../extension/duoke-bridge/duoke-content.js', import.meta.url), 'utf8');
-  for (const url of ['https://web.duoke.com/?lang=pt#/dk/main/chat', 'https://web.duoke.com/?lang=pt#/dk/main/chat/?shop=demo']) {
+  for (const url of ['https://ai.duoke.com/?lang=pt#/dk/main/chat', 'https://ai.duoke.com/?lang=pt#/dk/main/chat/?shop=demo', 'https://web.duoke.com/?lang=pt#/dk/main/chat', 'https://web.duoke.com/?lang=pt#/dk/main/chat/?shop=demo']) {
     let listener, reply;
     const location = new URL(url);
     const chrome = { runtime: { id: 'extension-id', onMessage: { addListener: fn => { listener = fn; } } } };
@@ -458,9 +518,9 @@ test('content script accepts the web chat and stops responding after leaving its
   }
 });
 
-test('extension permissions only grant persistent access to the corrected web domain', async () => {
+test('extension permissions only grant persistent access to the Duoke web domains (new ai and old web)', async () => {
   const manifest = JSON.parse(await readFile(new URL('../extension/duoke-bridge/manifest.json', import.meta.url), 'utf8'));
-  assert.deepEqual(manifest.host_permissions, ['https://web.duoke.com/*']);
+  assert.deepEqual(manifest.host_permissions, ['https://ai.duoke.com/*', 'https://web.duoke.com/*']);
 });
 
 test('content accepts the next batch while the previous COMPLETE acknowledgement is pending', async () => {
@@ -498,11 +558,11 @@ test('content accepts the next batch while the previous COMPLETE acknowledgement
 });
 
 const MSG = 'Olá! Qual nome vai nas etiquetas?';
-function composer(f, { translated = false, draft = '', onSend } = {}) {
+function composer(f, { translated = false, draft = '', onSend, dk = false } = {}) {
   const footer = new Node(); footer.routes = new Map(); footer.classList = { contains: () => false };
   const input = new Node(); input.value = draft;
   const icon = new Node(); const button = new Node(); icon.ancestors = new Map([['button', button]]);
-  footer.routes.set('textarea.el-textarea__inner', [input]);
+  footer.routes.set(dk ? 'textarea.dk-textarea__inner' : 'textarea.el-textarea__inner', [input]);
   footer.routes.set(translated ? '.icon_send02_chatbox' : '.icon_send_chatbox', [icon]);
   f.routes.set('.cont_footer', [footer]);
   const bubble = text => { const node = new Node(text); node.ancestors = new Map([['.message_main > li.rt', new Node()]]); f.set(S.message, [...(f.routes.get(S.message) || []), node]); };
@@ -517,6 +577,13 @@ function sendFixture(extra) {
 
 test('sends only after confirming the conversation and reports the shop bubble as sent', async () => {
   const { f, c } = sendFixture();
+  const order = await f.collector.sendToOrder('260123ABC', MSG);
+  assert.deepEqual(plain(order), { id: '260123ABC', status: 'sent' });
+  assert.equal(c.button.clicks, 1); assert.equal(c.input.value, MSG);
+});
+
+test('ai.duoke.com: sends through the dk-textarea composer', async () => {
+  const { f, c } = sendFixture({ dk: true });
   const order = await f.collector.sendToOrder('260123ABC', MSG);
   assert.deepEqual(plain(order), { id: '260123ABC', status: 'sent' });
   assert.equal(c.button.clicks, 1); assert.equal(c.input.value, MSG);

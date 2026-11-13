@@ -1,4 +1,5 @@
-const DUOKE_ORIGIN = 'https://web.duoke.com';
+// Duoke moved the web app to ai.duoke.com in November 2026; the old domain stays accepted while accounts migrate.
+const DUOKE_ORIGINS = ['https://ai.duoke.com', 'https://web.duoke.com'];
 let activeJob = null;
 const jobReady = chrome.storage.session.get('activeJob').then(({ activeJob: saved }) => {
   if (saved?.requestId && Array.isArray(saved.codes) && Number.isInteger(saved.studioTabId)) activeJob = { kind: 'collect', ...saved, seen: new Set(saved.seen || []) };
@@ -14,7 +15,7 @@ async function saveJob() {
 function roleForUrl(value) {
   try {
     const url = new URL(value);
-    if (url.origin === DUOKE_ORIGIN && url.pathname === '/' && /^#\/dk\/main\/chat(?:[/?]|$)/.test(url.hash)) return 'duoke';
+    if (DUOKE_ORIGINS.includes(url.origin) && url.pathname === '/' && /^#\/dk\/main\/chat(?:[/?]|$)/.test(url.hash)) return 'duoke';
     if ((url.origin === 'https://vinimanenti.github.io' || (url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname) && url.port === '3000')) && (url.pathname === '/personalizados' || url.pathname.startsWith('/personalizados/'))) return 'studio';
   } catch { /* Invalid URL. */ }
   return null;
@@ -58,7 +59,7 @@ async function handle(message, sender) {
     if (activeJob) return { ok: false, error: 'Cancele ou aguarde a coleta antes de conectar outra aba.' };
     const tab = await chrome.tabs.get(message.tabId);
     const role = roleForUrl(tab.url);
-    if (!role) return { ok: false, error: 'Abra o Sticker Studio em /personalizados/ ou o chat em https://web.duoke.com/?lang=pt#/dk/main/chat.' };
+    if (!role) return { ok: false, error: 'Abra o Sticker Studio em /personalizados/ ou o chat em https://ai.duoke.com/?lang=pt#/dk/main/chat.' };
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: [role === 'studio' ? 'studio-bridge.js' : 'collector.js', ...(role === 'duoke' ? ['duoke-content.js'] : [])] });
     await chrome.storage.session.set({ [role]: { tabId: tab.id, origin: new URL(tab.url).origin } });
     return { ok: true, role };

@@ -8,6 +8,18 @@
   const EMPTY = ".result_empty, .el-empty, .search_no_result, [class*='no_result'], .el-table__empty-text";
   const LOADING = '.el-loading-mask, [aria-busy="true"], .chat_search_bar .el-icon-loading';
   const MESSAGE_LOADING = '.message_main > .t_c .el-icon-loading';
+  // ai.duoke.com (11/2026) renders the same app classes with Element Plus under a
+  // "dk-" namespace. These are queried alongside the old Element UI selectors so
+  // both Duoke versions keep working.
+  const EMPTY_DK = '.dk-empty, .dk-table__empty-text';
+  const LOADING_DK = '.dk-loading-mask, .chat_search_bar .is-loading';
+  const MESSAGE_LOADING_DK = '.message_main .message_loading_indicator .is-loading';
+  const MODE_INPUT = '.chat_search_bar .el-select input';
+  const MODE_SELECT_DK = '.chat_search_bar .dk-select';
+  const MODE_TRIGGER_DK = '.dk-select__wrapper';
+  const OPTION = '.el-select-dropdown__item';
+  const OPTION_DK = '.dk-select-dropdown__item';
+  const COMPOSER_DK = 'textarea.dk-textarea__inner';
   // Composer of Duoke's InputAreaView (dk-web-vue2 bundle, 10/2026): an Element
   // el-autocomplete textarea and a split send button whose icon changes when
   // "send after translation" is selected.
@@ -108,13 +120,24 @@
       const containers = query('.chat_search_container').filter(visible);
       if (containers.length !== 1) throw new Error('Barra de pesquisa do chat Duoke não encontrada ou ambígua. Abra o chat da Shopee.');
       const container = containers[0];
-      const mode = () => within(container, '.chat_search_bar .el-select input').find(visible);
-      const isOrder = () => /^pedido$/i.test(String(mode()?.value || '').trim());
+      // Old Element UI: the chosen label is the input value. Element Plus (dk-):
+      // the label is text inside the select, its input stays empty, and the
+      // dropdown opens from the wrapper.
+      const mode = () => {
+        const input = within(container, MODE_INPUT).find(visible);
+        if (input) return { trigger: input, label: () => String(input.value || '').trim() };
+        const select = within(container, MODE_SELECT_DK).find(visible);
+        if (!select) return null;
+        return { trigger: within(select, MODE_TRIGGER_DK).find(visible) || select,
+          label: () => String(within(select, 'input').find(visible)?.value || '').trim() || nodeText(select) };
+      };
+      const isOrder = () => /^pedido$/i.test(mode()?.label() || '');
       const control = mode();
       if (!control) throw new Error('Seletor de pesquisa Duoke não encontrado. Selecione Pedido na barra do chat.');
       if (!isOrder()) {
-        control.click();
-        const option = await waitFor(() => within(container, '.el-select-dropdown__item').find(node => visible(node) && /^pedido$/i.test(nodeText(node))), signal, 'Opção Pedido não encontrada na barra de pesquisa Duoke.');
+        control.trigger.click();
+        const pick = node => visible(node) && /^pedido$/i.test(nodeText(node));
+        const option = await waitFor(() => [...within(container, OPTION), ...within(container, OPTION_DK)].find(pick) || query(OPTION_DK).find(pick), signal, 'Opção Pedido não encontrada na barra de pesquisa Duoke.');
         option.click();
         await waitFor(isOrder, signal, 'Não foi possível confirmar a pesquisa por Pedido no Duoke.');
       }
@@ -169,7 +192,7 @@
       assertRunning(signal);
       const { container, input, isOrder } = await orderSearch(signal);
       const beforeResults = snapshot(resultItems(container));
-      const beforeEmpty = snapshot(resultsOpen(container) ? within(container, EMPTY).filter(visible) : []);
+      const beforeEmpty = snapshot(resultsOpen(container) ? [...within(container, EMPTY), ...within(container, EMPTY_DK)].filter(visible) : []);
       // Pending records from the preceding order cannot certify a fresh search.
       observer?.takeRecords?.();
       mutations.length = 0;
@@ -194,10 +217,10 @@
       let submitted = false;
       const found = await waitFor(() => {
         if (!isOrder() || input.value !== code) throw new Error('A pesquisa Duoke mudou durante a coleta. Reinicie a coleta.');
-        if (query(LOADING).some(visible)) return null;
+        if (query(LOADING).some(visible) || query(LOADING_DK).some(visible)) return null;
         const candidate = resultItems(container).find(node => matchesOrder(node, code) && changed(node, beforeResults, searchSince));
         if (candidate) return { node: candidate };
-        const empty = resultsOpen(container) && within(container, EMPTY).find(node => visible(node) && /nenhum|não encontr|não existe|sem resultado|sem dados|no results?|not found|no data|does not exist/i.test(nodeText(node)) && changed(node, beforeEmpty, searchSince));
+        const empty = resultsOpen(container) && [...within(container, EMPTY), ...within(container, EMPTY_DK)].find(node => visible(node) && /nenhum|não encontr|não existe|sem resultado|sem dados|no results?|not found|no data|does not exist/i.test(nodeText(node)) && changed(node, beforeEmpty, searchSince));
         if (empty) return { notFound: true };
         // Some layouts search as the user types. The current Pedido component
         // also handles keyup.enter; use that only if no result has appeared.
@@ -222,7 +245,7 @@
       let empty = false;
       await waitFor(() => {
         const reset = reason => { waitingFor = reason; stableFingerprint = null; stableSince = clock(); return false; };
-        if (query(LOADING).some(visible) || query(MESSAGE_LOADING).some(visible)) return reset('o término do carregamento no Duoke');
+        if (query(LOADING).some(visible) || query(LOADING_DK).some(visible) || query(MESSAGE_LOADING).some(visible) || query(MESSAGE_LOADING_DK).some(visible)) return reset('o término do carregamento no Duoke');
         if (!headersFor(code).length) return reset('o código do pedido no painel da conversa');
         const nodes = customerMessages();
         // Only extracted text participates in freshness checks: seller bubbles,
@@ -286,7 +309,7 @@
       const footer = footers[0];
       if (footer.classList?.contains('has_attachments') || within(footer, QUOTE).some(visible)) return failed('A conversa tem anexo ou citação pendente. Envie ou remova no Duoke.');
       if (within(footer, TRANSLATED_SEND_ICON).some(visible)) return failed('Desative “Enviar após tradução” no Duoke e tente de novo.');
-      const composers = within(footer, COMPOSER).filter(visible);
+      const composers = [...within(footer, COMPOSER), ...within(footer, COMPOSER_DK)].filter(visible);
       if (composers.length !== 1) return failed('Campo de mensagem do Duoke não encontrado.');
       const composer = composers[0];
       if (composer.disabled || composer.readOnly) return failed('Esta conversa não aceita mensagens.');
