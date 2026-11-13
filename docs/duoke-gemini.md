@@ -165,3 +165,39 @@ Validação desta entrega: testes de `lapis-continuous` (planejamento, hash, fal
 
 Mudança de domínio do Duoke (13/11/2026): o chat web passou para `https://ai.duoke.com/?lang=pt#/dk/main/chat`. A extensão 1.2.0 aceita o domínio novo e o antigo (`web.duoke.com`) e pede permissão para os dois. Os testes cobrem pareamento, status e o content script nos dois domínios; os seletores da conversa ainda precisam ser confirmados na interface nova pelo usuário.
 Ponte Duoke 1.2.1 (13/11/2026): o `ai.duoke.com` usa Element Plus com prefixo `dk-`. O diagnóstico do usuário mostrou que as classes próprias do Duoke continuam iguais; mudaram o seletor de pesquisa (`.chat_search_bar .dk-select`, rótulo como texto e abertura por `.dk-select__wrapper`), as opções (`.dk-select-dropdown__item`), a caixa de mensagem (`textarea.dk-textarea__inner`) e os indicadores de carregamento/vazio. Os seletores novos são consultados junto com os antigos.
+
+## MCP do Lápis para agentes (Hermes)
+
+A função `lapis-mcp` expõe o estado do piloto contínuo para agentes de IA por MCP (Streamable HTTP, respostas JSON). É **somente leitura**: não altera pedidos, não envia mensagens e não mexe na fila. Usa um token próprio (`LAPIS_MCP_TOKEN`, mínimo de 32 caracteres), separado do código de acesso do Studio. Requisições com cabeçalho `Origin` de navegador são recusadas, a menos que a origem esteja em `LAPIS_MCP_ALLOWED_ORIGINS`.
+
+Ferramentas:
+
+- `resumo_piloto`: contagem por fase (a ler, aguardando cliente, para revisar, sem leitura), clientes cobrados há mais de 24 horas, pedido mais antigo e última atividade.
+- `listar_pedidos` (`fase`, `limite` até 100): pedidos começando pelos que precisam do operador; os de revisão trazem os nomes sugeridos e o motivo.
+- `consultar_pedido` (`codigo`): situação de um pedido ou o aviso de que ele já saiu do piloto.
+
+Para isso, o estado passa a guardar, só nos pedidos em revisão, os nomes sugeridos (até 10, com quantidade) e o motivo (até 200 caracteres). Pedidos que entraram em revisão antes desta versão aparecem sem detalhe até o próximo ciclo que os reclassificar.
+
+### Ativação
+
+1. Gere um token forte no PowerShell e guarde-o com segurança:
+   ```powershell
+   $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | % { $_.ToString('x2') })
+   ```
+2. Configure o segredo e publique as funções (a `lapis-autopilot` precisa ser publicada de novo para guardar os detalhes de revisão):
+   ```powershell
+   npx.cmd supabase secrets set LAPIS_MCP_TOKEN=COLE_O_TOKEN
+   npx.cmd supabase functions deploy lapis-mcp
+   npx.cmd supabase functions deploy lapis-autopilot
+   ```
+3. Publique o site (o navegador também precisa da versão nova para enviar os detalhes).
+4. No Hermes, cadastre o servidor MCP remoto com a URL `https://SEU_PROJECT_REF.supabase.co/functions/v1/lapis-mcp` e o cabeçalho `Authorization: Bearer ${LAPIS_MCP_TOKEN}`, com o token salvo nos segredos do Hermes. Em YAML:
+   ```yaml
+   mcp_servers:
+     lapis:
+       url: "https://SEU_PROJECT_REF.supabase.co/functions/v1/lapis-mcp"
+       headers:
+         Authorization: "Bearer ${LAPIS_MCP_TOKEN}"
+   ```
+
+Validação: testes do handler (token, origem, negociação de protocolo, notificações, lotes recusados, três ferramentas, erros de entrada e de armazenamento sem vazar detalhes) e um teste com o cliente oficial `@modelcontextprotocol/sdk` (Streamable HTTP) contra o handler em um servidor HTTP local. A conexão real do Hermes com o Supabase ainda precisa ser confirmada pelo usuário.

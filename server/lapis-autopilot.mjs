@@ -4,7 +4,8 @@ import { MAX_NOTIFY_CHARS, MAX_STATE_ENTRIES, normalizeEntry } from '../shared/l
 // Function: stores the pilot state and relays the summary to Telegram. Same access
 // code and Origin allowlist as lapis-extract; secrets never reach the browser.
 
-export const MAX_AUTOPILOT_BYTES = 400_000;
+// 1000 entries of up to ~1.5 KB each (review names included).
+export const MAX_AUTOPILOT_BYTES = 1_600_000;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/u;
 
 class HttpError extends Error {

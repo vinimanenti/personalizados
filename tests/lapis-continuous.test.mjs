@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, ENTRY_TTL, expireState, formatCycleMessage, isDue, MAX_CYCLE_ORDERS,
+import { normalizeReview, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, ENTRY_TTL, expireState, formatCycleMessage, isDue, MAX_CYCLE_ORDERS,
   MAX_FAILURES, normalizeEntry, normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../shared/lapis-continuous.mjs';
 
 const HOUR = 60 * 60 * 1000;
@@ -112,4 +112,20 @@ test('Telegram summary is plain text, bounded and lists what needs the operator'
   assert.match(text, /F1/u);
   const long = formatCycleMessage({ review: Array.from({ length: 60 }, (_, i) => ({ id: `R${i}`, names: [{ name: 'x'.repeat(300) }], reason: '' })) });
   assert.ok(long.length <= 3500); assert.match(long, /e mais 45/u);
+});
+
+test('orders in review keep their suggested names and reason, bounded and plain', () => {
+  const s = normalizeState([{ id: 'R1', phase: 'pending', addedAt: NOW - HOUR, updatedAt: NOW - HOUR, autoAsks: 0, failures: 0 }], NOW);
+  const results = new Map([['R1', { status: 'review', reason: 'Dois nomes\ncom quantidades', names: [{ name: 'Ana', quantity: 50, evidence: 'Ana 50' }, { name: 'Bia', quantity: 999 }] }]]);
+  const out = applyCycle(s, { ids: ['R1'], classified: { R1: 'review' }, results, now: NOW });
+  assert.deepEqual(out.state.R1.review, { names: [{ name: 'Ana', quantity: 50 }, { name: 'Bia', quantity: null }], reason: 'Dois nomes com quantidades' });
+  assert.deepEqual(normalizeEntry(out.state.R1, NOW).review, out.state.R1.review, 'survives the server validation');
+  const asked = applyCycle(out.state, { ids: ['R1'], classified: { R1: 'ask' }, now: NOW });
+  assert.equal(asked.state.R1.review, undefined, 'leaving review drops the details');
+  assert.equal(normalizeEntry({ ...out.state.R1, phase: 'pending' }, NOW).review, undefined, 'only review entries carry details');
+  assert.equal(normalizeReview({ names: Array.from({ length: 20 }, () => ({ name: 'x'.repeat(500) })) }).names.length, 10);
+  assert.equal(normalizeReview({ names: [{ name: 'x'.repeat(500) }] }).names[0].name.length, 120);
+  assert.equal(normalizeReview({ names: [], reason: '' }), null);
+  const failedQueue = applyCycle(s, { ids: ['R1'], classified: { R1: 'auto' }, results: new Map([['R1', { status: 'found', names: [{ name: 'Caio' }], reason: '' }]]), queueFailed: true, now: NOW });
+  assert.match(failedQueue.state.R1.review.reason, /não entrou na fila/u);
 });

@@ -5,3 +5,7 @@ verify_jwt = false
 [functions.lapis-autopilot]
 # Same protection as lapis-extract: access code and exact Origin allowlist.
 verify_jwt = false
+
+[functions.lapis-mcp]
+# Read-only MCP for agents; protected by its own bearer token (LAPIS_MCP_TOKEN).
+verify_jwt = false

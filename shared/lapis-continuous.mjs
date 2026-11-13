@@ -35,7 +35,22 @@ export function normalizeEntry(raw, now = Date.now()) {
   if (typeof raw.hash === 'string' && HASH_PATTERN.test(raw.hash)) entry.hash = raw.hash;
   if (LAST_STATUS.has(raw.lastStatus)) entry.lastStatus = raw.lastStatus;
   if (SENT_STATES.has(raw.sendStatus) && isTime(raw.sentAt, now)) { entry.sendStatus = raw.sendStatus; entry.sentAt = raw.sentAt; }
+  if (entry.phase === 'review') { const review = normalizeReview(raw.review); if (review) entry.review = review; }
   return entry;
+}
+
+const CONTROL = /[\u0000-\u001f\u007f]/gu;
+const cleanText = (value, size) => typeof value === 'string' ? value.replace(CONTROL, ' ').trim().slice(0, size) : '';
+/** Suggested names and reason of an order in review, so read-only tools (MCP) can explain it. Bounded and plain text. */
+export function normalizeReview(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const names = (Array.isArray(raw.names) ? raw.names : []).slice(0, 10).map(item => {
+    const name = cleanText(item?.name, 120);
+    const quantity = Number.isInteger(item?.quantity) && item.quantity >= 1 && item.quantity <= 150 ? item.quantity : null;
+    return name ? { name, quantity } : null;
+  }).filter(Boolean);
+  const reason = cleanText(raw.reason, 200);
+  return names.length || reason ? { names, reason } : null;
 }
 
 export function normalizeState(list, now = Date.now()) {
@@ -134,9 +149,14 @@ export function applyCycle(state, { ids, classified, results = new Map(), hashes
     if (hashes.has(id)) entry.hash = hashes.get(id);
     const status = results.get(id)?.status;
     if (LAST_STATUS.has(status)) entry.lastStatus = status;
+    delete entry.review;
     if (kind === 'review') {
       if (previous.phase !== 'review') newReview.push(id);
       Object.assign(entry, { phase: 'review', failures: 0 });
+      const result = results.get(id);
+      const review = normalizeReview({ names: result?.names, reason: result?.reason || (queueFailed ? 'Aprovado, mas não entrou na fila de impressão.' : '') });
+      if (review) entry.review = review;
+      else if (previous.review) entry.review = previous.review;
     } else if (kind === 'ask') {
       Object.assign(entry, { phase: awaiting[id] ? 'awaiting' : 'pending', failures: 0 });
       if (entry.autoAsks < MAX_AUTO_ASKS) askCandidates.push(id);
