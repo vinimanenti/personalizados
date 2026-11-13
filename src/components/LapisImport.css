@@ -94,7 +94,47 @@
 .lapis-pagination { padding: 0 24px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--lapis-muted); font-size: 11px; }
 .lapis-pagination > div { display: flex; align-items: center; gap: 10px; }
 .lapis-pagination > div > span { font: 10px monospace; }
-.lapis-orders { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; padding: 0 24px 24px; max-height: 680px; overflow-y: auto; }
+.lapis-orders { list-style: none; margin: 0 24px 24px; padding: 0; border: 1px solid var(--lapis-line); border-radius: 8px; overflow: hidden; }
+/* Compact order rows (GitHub-style list). */
+.lapis-row { border-top: 1px solid var(--lapis-line); content-visibility: auto; contain-intrinsic-size: auto 52px; }
+.lapis-row:first-child { border-top: 0; }
+.lapis-row:hover, .lapis-row.is-open { background: rgba(128,151,255,.035); }
+.lapis-row-main { display: grid; grid-template-columns: 18px 20px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 9px 14px; }
+.lapis-row-select { display: flex; justify-content: center; }
+.lapis-row-select input { margin: 0; }
+.lapis-row-icon { width: 18px; height: 18px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; border: 1px solid currentColor; color: var(--lapis-muted); }
+.lapis-row.is-ok .lapis-row-icon { color: #86dcb6; background: rgba(134,220,182,.1); }
+.lapis-row.is-names .lapis-row-icon { color: var(--lapis-blue); background: rgba(128,151,255,.1); }
+.lapis-row.is-alert .lapis-row-icon, .lapis-row.is-missing .lapis-row-icon { color: #f2c278; background: rgba(242,194,120,.08); }
+.lapis-row.is-error .lapis-row-icon { color: #fa9285; background: rgba(250,146,133,.08); }
+.lapis-row.is-wait .lapis-row-icon { color: var(--lapis-blue); }
+.lapis-import .lapis-row-title { all: unset; cursor: pointer; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.lapis-import .lapis-row-title:focus-visible { outline: 2px solid var(--lapis-blue); outline-offset: 3px; border-radius: 4px; }
+.lapis-row-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; }
+.lapis-row-code { font: 600 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1, #ededf1); }
+.lapis-row-status { font-size: 10.5px; color: var(--lapis-muted); }
+.lapis-row.is-ok .lapis-row-status { color: #86dcb6; }
+.lapis-row.is-error .lapis-row-status { color: #fa9285; }
+.lapis-row-summary { font-size: 11px; color: var(--lapis-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lapis-row.is-names .lapis-row-summary, .lapis-row.is-alert .lapis-row-summary { color: var(--t1, #ededf1); }
+.lapis-row-summary.is-error { color: #fa9285; }
+.lapis-row-summary em { font-style: normal; color: var(--lapis-muted); }
+.lapis-row-actions { display: inline-flex; align-items: center; gap: 12px; white-space: nowrap; }
+.lapis-row-actions .lapis-link-button { font-size: 11px; }
+.lapis-row-review { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--lapis-muted); cursor: pointer; }
+.lapis-row-review input { margin: 0; }
+.lapis-import .lapis-row-toggle { all: unset; cursor: pointer; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; color: var(--lapis-muted); font-size: 11px; }
+.lapis-import .lapis-row-toggle:hover { background: rgba(128,151,255,.1); color: var(--t1, #ededf1); }
+.lapis-import .lapis-row-toggle:focus-visible { outline: 2px solid var(--lapis-blue); }
+.lapis-row-body { padding: 4px 14px 14px 62px; border-top: 1px dashed var(--lapis-line); }
+.lapis-row-body > p:first-child { margin-top: 10px; }
+@media (max-width: 760px) {
+  .lapis-orders { margin: 0 16px 16px; }
+  .lapis-row-main { grid-template-columns: 18px 20px minmax(0, 1fr); padding: 10px 12px; }
+  .lapis-row-actions { grid-column: 3; gap: 10px; }
+  .lapis-row-actions .lapis-row-toggle { margin-left: auto; }
+  .lapis-row-body { padding: 4px 12px 12px; }
+}
 .lapis-order { border: 1px solid var(--lapis-line); border-radius: 11px; padding: 17px; background: var(--bg, #131319); content-visibility: auto; contain-intrinsic-size: auto 250px; }
 .lapis-order-accepted { border-color: rgba(134,220,182,.3); }
 .lapis-order-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }

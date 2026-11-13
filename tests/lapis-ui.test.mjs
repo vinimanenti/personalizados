@@ -11,7 +11,7 @@ import vm from 'node:vm';
 const compiled = await build({ entryPoints: ['src/components/LapisImport.jsx'], bundle: true, write: false, format: 'cjs', platform: 'node', jsx: 'automatic',
   external: ['react', 'react/jsx-runtime'], loader: { '.css': 'empty' }, define: { 'import.meta.env': '{}' }, logLevel: 'silent' });
 
-test('300 restored orders render counters and only thirty review cards', () => {
+test('300 restored orders render counters and only fifty compact rows, all collapsed', () => {
   const collected = Array.from({ length: 300 }, (_, i) => ({ id: `ORDER${i}`, status: i < 10 ? 'not_found' : i < 20 ? 'error' : 'collected', text: i < 20 ? '' : 'Nome: Ana Exemplo' }));
   const results = Object.fromEntries(collected.slice(20, 40).map(order => [order.id, { id: order.id, names: [{ name: 'Ana Exemplo', quantity: null, evidence: order.text }], status: 'found', reason: '' }]));
   const draft = { codes: collected.map(order => order.id).join('\n'), raw: '', collected, results, selected: {}, reviewed: {}, shipDates: {}, extractionErrors: { ORDER40: 'Falha temporária' } };
@@ -21,13 +21,15 @@ test('300 restored orders render counters and only thirty review cards', () => {
     sessionStorage: { getItem: () => JSON.stringify({ version: 1, ts: Date.now(), draft }) },
   });
   const markup = renderToStaticMarkup(React.createElement(module.exports.default));
-  assert.equal((markup.match(/<article/g) || []).length, 30);
+  assert.equal((markup.match(/<li class="lapis-row /g) || []).length, 50);
+  assert.equal((markup.match(/lapis-row-body/g) || []).length, 0, 'rows start collapsed');
+  assert.equal((markup.match(/>Conferi</g) || []).length, 20, 'orders with names can be approved from the row');
   assert.match(markup, /Com nomes<strong>20<\/strong>/);
   assert.match(markup, /Sem nomes<strong>10<\/strong>/);
   assert.match(markup, /Falhas<strong>11<\/strong>/);
   assert.match(markup, /A extrair<strong>259<\/strong>/);
   assert.match(markup, /280 pedidos pendentes/);
-  assert.match(markup, /1–30 de 300 pedidos/);
+  assert.match(markup, /1–50 de 300 pedidos/);
   assert.match(markup, /Baixar TXT completo/);
   assert.match(markup, /Refazer pendências · 21/);
   assert.match(markup, /Coletar e extrair/);

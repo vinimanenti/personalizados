@@ -15,7 +15,7 @@ const EMPTY = { codes: '', raw: '', collected: [], results: dict(), selected: di
 const SHIP_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
 const NO_REVISIONS = [];
 const MAX_DRAFT = 8000000;
-const PAGE_SIZE = 30;
+const PAGE_SIZE = 50;
 const FILTERS = [['all', 'Todos'], ['names', 'Com nomes'], ['missing', 'Sem nomes'], ['errors', 'Falhas'], ['waiting', 'A extrair'], ['ask', 'Cobrar nome'], ['awaiting', 'Aguardando cliente']];
 const ASK_MESSAGE_KEY = 'ss_lapis_ask_message_v1';
 const SEND_LABELS = { sent: 'Mensagem enviada', unconfirmed: 'Envio não confirmado — confira no Duoke', failed: 'Mensagem não enviada' };
@@ -139,43 +139,58 @@ function queueError(order) {
   catch (error) { return error.message; }
 }
 
-function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
+const ROW_ICONS = { ok: '✓', names: '●', alert: '!', error: '✕', missing: '?', muted: '○', wait: '…' };
+
+// One compact row per order (GitHub-style list). The row shows status, code and a
+// one-line summary with the quick actions; it expands to edit names and read the conversation.
+function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, expanded, onToggle, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
   const validation = queueError(result);
   const canExtract = source.status === 'collected' && source.text.trim() && source.text.length <= 12000;
-  const status = accepted ? 'Na fila' : hasNames(result) ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
+  const named = hasNames(result);
+  const status = accepted ? 'Na fila' : named ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
+  const tone = accepted ? 'ok' : named ? (validation ? 'alert' : 'names') : extractionError || source.status === 'error' || source.status === 'not_found' ? 'error'
+    : sendStatus?.status === 'sent' || waitingSince ? 'wait' : result ? 'missing' : 'muted';
+  const failure = source.error || extractionError || (source.text.length > 12000 ? `Conversa com ${source.text.length.toLocaleString('pt-BR')} caracteres (máximo 12.000).` : '');
+  const summary = named ? result.names.map(entry => entry.quantity ? `${entry.name || '(sem nome)'} (${entry.quantity})` : entry.name || '(sem nome)').join(', ')
+    : failure || (sendStatus ? `${SEND_LABELS[sendStatus.status]}${sendStatus.error ? `: ${sendStatus.error}` : ''}` : waitingSince ? `Cliente cobrado ${sinceText(waitingSince)}` : result?.reason || status);
   let quantities = [];
   if (!validation) quantities = toLabelFields({ ...result, status: 'found' }).map(field => field.qty);
-  return <article className={`lapis-order${accepted ? ' lapis-order-accepted' : ''}`}>
-    <header className="lapis-order-head">
-      <div><span className="lapis-kicker">PEDIDO</span><h4>{source.id}</h4></div>
-      <span className={`lapis-tag ${source.status === 'error' || extractionError ? 'lapis-tag-error' : ''}`}>{status}</span>
-      {canExtract && !accepted ? <label className="lapis-check"><input type="checkbox" checked={Boolean(selected)} disabled={busy} onChange={onSelect} />Extrair</label> : null}
-    </header>
-    {sendStatus ? <p className={sendStatus.status === 'sent' ? 'lapis-reason' : 'lapis-error'}>{SEND_LABELS[sendStatus.status]}{sendStatus.error ? `: ${sendStatus.error}` : '.'}
-      {sendStatus.status === 'failed' ? <> <button type="button" className="lapis-link-button" disabled={busy || !connected} onClick={onResend}>Tentar de novo</button></> : null}</p>
-      : waitingSince ? <p className="lapis-reason">Cliente cobrado {sinceText(waitingSince)}. Use Verificar respostas para buscar o nome.</p> : null}
-    {source.error ? <p className="lapis-error">{source.error}</p> : null}
-    {extractionError ? <p className="lapis-error">{extractionError}</p> : null}
-    {source.text.length > 12000 ? <p className="lapis-error">Esta conversa tem {source.text.length.toLocaleString('pt-BR')} caracteres. Importe uma versão de até 12.000 caracteres para extrair.</p> : null}
-    {result?.reason ? <p className="lapis-reason">{result.reason}</p> : null}
-    {result?.names.map((entry, index) => <div className="lapis-name" key={index}>
-      <label>Nome na etiqueta<input value={entry.name} maxLength={200} disabled={busy} onChange={event => onEdit(index, 'name', event.target.value)} /></label>
-      <label className="lapis-quantity">Quantidade<input type="number" min="1" max="150" step="1" value={entry.quantity ?? ''} placeholder={quantities[index] ? `Auto · ${quantities[index]}` : 'Auto'} disabled={busy} onChange={event => onEdit(index, 'quantity', event.target.value === '' ? null : Number(event.target.value))} /></label>
-      <button className="lapis-icon-button" disabled={busy} type="button" onClick={() => onRemoveName(index)} aria-label={`Remover nome ${index + 1}`} title="Remover nome">×</button>
-      {entry.evidence ? <p className="lapis-evidence">“{entry.evidence}”</p> : null}
-    </div>)}
-    <div className="lapis-order-footer">
-      <button type="button" className="lapis-link-button" disabled={busy} onClick={onAddName}>+ Adicionar nome</button>
-      <span className="lapis-order-actions">
-        <button type="button" className="lapis-open-button" disabled={!canOpen} onClick={onOpen} title="Abre a conversa deste pedido na aba do Duoke">{opening ? 'Abrindo…' : 'Conferir no Duoke'}</button>
-        {!hasNames(result) ? <button type="button" disabled={busy || !connected} onClick={onRetry}>Buscar novamente</button> : null}
+  return <li className={`lapis-row is-${tone}${expanded ? ' is-open' : ''}`}>
+    <div className="lapis-row-main">
+      <span className="lapis-row-select">{canExtract && !accepted ? <input type="checkbox" checked={Boolean(selected)} disabled={busy} onChange={onSelect} aria-label={`Extrair ${source.id}`} title="Marcar para extrair" /> : null}</span>
+      <span className="lapis-row-icon" aria-hidden="true">{ROW_ICONS[tone]}</span>
+      <button type="button" className="lapis-row-title" onClick={onToggle} aria-expanded={Boolean(expanded)} title={expanded ? 'Fechar detalhes' : 'Abrir detalhes'}>
+        <span className="lapis-row-line"><span className="lapis-row-code">{source.id}</span><span className="lapis-row-status">{status}</span></span>
+        <span className={`lapis-row-summary${failure && !named ? ' is-error' : ''}`}>{summary}{named && result.reason ? <em> · {result.reason}</em> : null}</span>
+      </button>
+      <span className="lapis-row-actions">
+        {named && !accepted ? <label className="lapis-row-review" title={validation || 'Conferi os nomes e as quantidades'}><input type="checkbox" disabled={busy || Boolean(validation)} checked={Boolean(reviewed)} onChange={onReview} />Conferi</label> : null}
+        <button type="button" className="lapis-link-button" disabled={!canOpen} onClick={onOpen} title="Abre a conversa deste pedido na aba do Duoke">{opening ? 'Abrindo…' : 'Conferir no Duoke'}</button>
+        {!named ? <button type="button" className="lapis-link-button" disabled={busy || !connected} onClick={onRetry}>Buscar de novo</button> : null}
+        <button type="button" className="lapis-row-toggle" onClick={onToggle} aria-label={expanded ? `Fechar ${source.id}` : `Abrir ${source.id}`}>{expanded ? '▴' : '▾'}</button>
       </span>
-      {result?.names.length ? <label className="lapis-check lapis-review-check"><input type="checkbox" disabled={busy || Boolean(validation) || accepted} checked={Boolean(reviewed)} onChange={onReview} />{accepted ? 'Revisão adicionada à fila' : 'Conferi os nomes e as quantidades'}</label> : null}
     </div>
-    {result?.names.length && validation ? <p className="lapis-error">{validation}</p> : null}
-    {!validation && !accepted ? <p className="lapis-allocation">Uma cartela · {quantities.reduce((sum, qty) => sum + qty, 0)} etiquetas{result.names.some(entry => entry.quantity === null) ? ' · quantidades em branco distribuídas automaticamente' : ''}</p> : null}
-    <details className="lapis-source"><summary>Ver conversa de origem{source.text ? ` · ${source.text.length.toLocaleString('pt-BR')} caracteres` : ''}</summary><pre>{source.text || 'Nenhuma conversa foi coletada para este pedido.'}</pre></details>
-  </article>;
+    {expanded ? <div className="lapis-row-body">
+      {sendStatus ? <p className={sendStatus.status === 'sent' ? 'lapis-reason' : 'lapis-error'}>{SEND_LABELS[sendStatus.status]}{sendStatus.error ? `: ${sendStatus.error}` : '.'}
+        {sendStatus.status === 'failed' ? <> <button type="button" className="lapis-link-button" disabled={busy || !connected} onClick={onResend}>Tentar de novo</button></> : null}</p>
+        : waitingSince ? <p className="lapis-reason">Cliente cobrado {sinceText(waitingSince)}. Use Verificar respostas para buscar o nome.</p> : null}
+      {failure ? <p className="lapis-error">{failure}</p> : null}
+      {result?.reason ? <p className="lapis-reason">{result.reason}</p> : null}
+      {result?.names.map((entry, index) => <div className="lapis-name" key={index}>
+        <label>Nome na etiqueta<input value={entry.name} maxLength={200} disabled={busy} onChange={event => onEdit(index, 'name', event.target.value)} /></label>
+        <label className="lapis-quantity">Quantidade<input type="number" min="1" max="150" step="1" value={entry.quantity ?? ''} placeholder={quantities[index] ? `Auto · ${quantities[index]}` : 'Auto'} disabled={busy} onChange={event => onEdit(index, 'quantity', event.target.value === '' ? null : Number(event.target.value))} /></label>
+        <button className="lapis-icon-button" disabled={busy} type="button" onClick={() => onRemoveName(index)} aria-label={`Remover nome ${index + 1}`} title="Remover nome">×</button>
+        {entry.evidence ? <p className="lapis-evidence">“{entry.evidence}”</p> : null}
+      </div>)}
+      <div className="lapis-order-footer">
+        <button type="button" className="lapis-link-button" disabled={busy || accepted} onClick={onAddName}>+ Adicionar nome</button>
+        {accepted ? <span className="lapis-reason">Revisão adicionada à fila.</span> : null}
+      </div>
+      {result?.names.length && validation ? <p className="lapis-error">{validation}</p> : null}
+      {!validation && !accepted ? <p className="lapis-allocation">Uma cartela · {quantities.reduce((sum, qty) => sum + qty, 0)} etiquetas{result.names.some(entry => entry.quantity === null) ? ' · quantidades em branco distribuídas automaticamente' : ''}</p> : null}
+      <details className="lapis-source"><summary>Ver conversa de origem{source.text ? ` · ${source.text.length.toLocaleString('pt-BR')} caracteres` : ''}</summary><pre>{source.text || 'Nenhuma conversa foi coletada para este pedido.'}</pre></details>
+    </div> : null}
+  </li>;
 }
 
 export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISIONS }) {
@@ -204,6 +219,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [pilotState, setPilotStateValue] = useState(null);
   const [pilotInfo, setPilotInfo] = useState({ lastRun: 0, summary: '', error: '', loading: false });
   const [openingId, setOpeningId] = useState('');
+  const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const toggleExpanded = id => setExpandedIds(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const [pilotFilter, setPilotFilter] = useState('all');
   const [pilotRows, setPilotRows] = useState(PILOT_ROWS);
   const pilotStateRef = useRef(null), pilotSaved = useRef(new Set()), pilotSaveTimer = useRef(null), lastCycle = useRef(NaN),
@@ -860,13 +877,14 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       </div> : null}
       <div className="lapis-pagination"><span>{filteredOrders.length ? `${currentPage * PAGE_SIZE + 1}–${Math.min((currentPage + 1) * PAGE_SIZE, filteredOrders.length)} de ${filteredOrders.length} pedidos` : 'Nenhum pedido neste filtro'}</span><div><button type="button" disabled={currentPage === 0} onClick={() => setReviewPage(currentPage - 1)}>Anterior</button><span>{currentPage + 1} / {pageCount}</span><button type="button" disabled={currentPage + 1 >= pageCount} onClick={() => setReviewPage(currentPage + 1)}>Próxima</button></div></div>
     </> : null}
-    {draft.collected.length ? <div className="lapis-orders">{visibleOrders.map(source => {
+    {draft.collected.length ? <ul className="lapis-orders">{visibleOrders.map(source => {
       const result = draft.results[source.id];
       const fingerprint = result ? revision(result) : '';
       return <OrderReview key={source.id} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={acceptedSet.has(fingerprint)} busy={busy} connected={connected && !connection.busy}
         sendStatus={sendStatus[source.id]} waitingSince={awaiting[source.id]?.sentAt} onResend={() => sendAsk([source.id])}
         onRetry={() => startCollection({ codes: [source.id], retry: true })}
         onOpen={() => openInDuoke(source.id)} opening={openingId === source.id} canOpen={canOpen}
+        expanded={expandedIds.has(source.id)} onToggle={() => toggleExpanded(source.id)}
         onSelect={() => setDraft(current => ({ ...current, selected: dict({ ...current.selected, [source.id]: !current.selected[source.id] }) }))}
         onEdit={(index, field, value) => editOrder(source, names => names.map((entry, i) => i === index ? { ...entry, [field]: value } : entry))}
         onAddName={() => {
@@ -877,7 +895,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         }}
         onRemoveName={index => editOrder(source, names => names.filter((_, i) => i !== index))}
         onReview={() => setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, [source.id]: current.reviewed[source.id] === fingerprint ? '' : fingerprint }) }))} />;
-    })}</div> : <div className="lapis-empty"><span aria-hidden="true">✎</span><strong>As conversas começam aqui</strong><p>Cole os códigos dos pedidos ou importe um arquivo para preparar a revisão.</p></div>}
+    })}</ul> : <div className="lapis-empty"><span aria-hidden="true">✎</span><strong>As conversas começam aqui</strong><p>Cole os códigos dos pedidos ou importe um arquivo para preparar a revisão.</p></div>}
     <footer className="lapis-bottom-bar"><p>{saved ? 'Rascunho mantido nesta sessão por até 8 horas.' : 'Rascunho disponível apenas enquanto esta tela estiver aberta.'}<br /><span>Confira cada pedido para liberar sua cartela.</span></p><button type="button" className="lapis-primary" disabled={busy || !readyOrders.length || typeof onAddOrders !== 'function'} onClick={addToQueue}>Adicionar à fila{readyOrders.length ? ` · ${readyOrders.length} cartela${readyOrders.length > 1 ? 's' : ''}` : ''} <span aria-hidden="true">→</span></button></footer>
   </section>;
 }
