@@ -221,7 +221,7 @@ export function formatCycleMessage({ at = Date.now(), queued = 0, review = [], a
   const time = new Date(at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
   const lines = [`Lápis · piloto automático · ${time}`];
   if (note) lines.push(clip(note, 300));
-  lines.push(`Na fila: ${queued} · cobrados agora: ${asked} · aguardando cliente: ${awaitingCount}`);
+  lines.push(`${queued ? `Na fila: ${queued} · ` : ''}cobrados agora: ${asked} · aguardando cliente: ${awaitingCount}`);
   if (review.length) {
     lines.push('', `Para revisar (${review.length}):`);
     // 15 lines of up to 160 characters keep the message far below Telegram's limit,

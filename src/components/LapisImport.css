@@ -85,9 +85,9 @@
 .lapis-import .lapis-filter { display: flex; align-items: center; gap: 12px; }
 .lapis-filter strong { font: 12px monospace; padding: 2px 6px; border-radius: 4px; background: rgba(128,151,255,.09); }
 .lapis-import .lapis-filter[aria-pressed=true] { border-color: var(--lapis-blue); color: var(--t1, #ededf1); background: rgba(128,151,255,.12); }
-.lapis-filter-names strong { color: #86dcb6; }
-.lapis-filter-missing strong { color: #f2c278; }
-.lapis-filter-errors strong { color: #fa9285; }
+.lapis-filter-conferir strong, .lapis-filter-fila strong { color: #86dcb6; }
+.lapis-filter-duvida strong, .lapis-filter-aguardando strong { color: #f2c278; }
+.lapis-filter-falha strong { color: #fa9285; }
 .lapis-pending { margin: 0 24px 16px; padding: 16px; border: 1px solid rgba(242,194,120,.25); border-left: 3px solid #d9ad69; border-radius: 8px; background: rgba(242,194,120,.04); display: flex; flex-direction: column; gap: 12px; }
 .lapis-pending strong { font-size: 13px; color: #f2c278; }
 .lapis-pending p { margin-top: 5px !important; font-size: 11px; line-height: 1.7; color: var(--lapis-muted); }
@@ -171,10 +171,6 @@
 @media (prefers-reduced-motion: reduce) { .lapis-import { animation: none; } .lapis-import * { transition: none !important; } }
 .lapis-ask-codes { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.7; color: var(--lapis-muted); word-break: break-word; max-height: 96px; overflow: auto; }
 .lapis-awaiting { margin-top: 16px; }
-.lapis-pilot { margin: 16px 24px; padding: 16px; border: 1px solid var(--lapis-line); border-radius: 8px; display: flex; flex-direction: column; gap: 10px; }
-.lapis-pilot.is-on { border-color: rgba(128,151,255,.35); background: linear-gradient(100deg, rgba(67,97,238,.06), transparent 70%); }
-.lapis-pilot-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.lapis-pilot-head .lapis-section-title { margin: 0; }
 .lapis-pilot-lead { font-size: 11px; line-height: 1.7; color: var(--lapis-muted); max-width: 72ch; }
 .lapis-pilot-options { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px 20px; }
 .lapis-pilot-options .lapis-field { margin: 0; min-width: 140px; }
@@ -187,36 +183,16 @@
 .lapis-switch input:checked + span { background: rgba(128,151,255,.25); border-color: var(--lapis-blue); }
 .lapis-switch input:checked + span::after { transform: translateX(15px); background: var(--lapis-blue); }
 .lapis-switch input:focus-visible + span { outline: 2px solid var(--lapis-blue); outline-offset: 3px; }
-.lapis-pilot-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 1px; border: 1px solid var(--lapis-line); border-radius: 8px; overflow: hidden; background: var(--lapis-line); }
-.lapis-pilot-stats span { background: var(--bg, #131319); padding: 9px 11px; font-size: 10px; color: var(--lapis-muted); display: flex; flex-direction: column; gap: 3px; }
-.lapis-pilot-stats strong { font: 600 15px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1, #ededf1); }
-.lapis-pilot-stats .is-alert strong { color: #f2c278; }
-@media (max-width: 640px) { .lapis-pilot { margin: 12px 16px; } }
 .lapis-order-actions { display: inline-flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
 .lapis-import .lapis-open-button { border-color: rgba(128,151,255,.35); color: var(--lapis-blue); }
-.lapis-pilot-stats .is-ok strong { color: #86dcb6; }
-.lapis-pilot-list { display: flex; flex-direction: column; gap: 8px; }
-.lapis-pilot-filters { display: flex; flex-wrap: wrap; gap: 6px; }
-.lapis-import .lapis-pilot-filters button { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 11px; }
-.lapis-pilot-filters button span { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5px; border-radius: 4px; background: rgba(128,151,255,.09); }
-.lapis-import .lapis-pilot-filters button.is-active { border-color: var(--lapis-blue); color: var(--t1, #ededf1); background: rgba(128,151,255,.12); }
-.lapis-pilot-rows { list-style: none; margin: 0; padding: 0; border: 1px solid var(--lapis-line); border-radius: 8px; overflow: hidden; }
-.lapis-pilot-row { display: grid; grid-template-columns: minmax(130px, auto) auto auto minmax(0, 1fr) auto; align-items: center; gap: 4px 12px; padding: 8px 12px; font-size: 11px; border-top: 1px solid var(--lapis-line); }
-.lapis-pilot-row:first-child { border-top: 0; }
-.lapis-pilot-row.is-ok { opacity: .72; }
-.lapis-pilot-code { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1, #ededf1); }
-.lapis-pilot-badge { font-size: 9px; border-radius: 4px; padding: 3px 6px; border: 1px solid currentColor; white-space: nowrap; }
-.lapis-pilot-badge.is-alert { color: #f2c278; }
-.lapis-pilot-badge.is-error { color: #fa9285; }
-.lapis-pilot-badge.is-wait { color: var(--lapis-blue); }
-.lapis-pilot-badge.is-muted { color: var(--lapis-muted); }
-.lapis-pilot-badge.is-ok { color: #86dcb6; }
-.lapis-pilot-when { color: var(--lapis-muted); white-space: nowrap; }
-.lapis-pilot-detail { color: var(--lapis-muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lapis-pilot-row .lapis-link-button { white-space: nowrap; font-size: 11px; }
-.lapis-pilot-more { align-self: flex-start; }
-@media (max-width: 760px) {
-  .lapis-pilot-row { grid-template-columns: 1fr auto; }
-  .lapis-pilot-when, .lapis-pilot-detail { grid-column: 1 / -1; white-space: normal; }
-  .lapis-pilot-row .lapis-link-button { grid-column: 1 / -1; justify-self: start; }
-}
+
+/* Pilot settings folded into one bar above the unified list. */
+.lapis-pilot-bar { margin: 0 24px 12px; padding: 10px 14px; border: 1px solid var(--lapis-line); border-radius: 8px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
+.lapis-pilot-bar.is-on { border-color: rgba(128,151,255,.35); background: linear-gradient(100deg, rgba(67,97,238,.06), transparent 70%); }
+.lapis-pilot-meta { flex: 1 1 260px; min-width: 0; font-size: 11px; color: var(--lapis-muted); }
+.lapis-pilot-bar .lapis-actions { margin: 0; }
+.lapis-pilot-settings { margin: 0 24px 12px; padding: 14px; border: 1px dashed var(--lapis-line); border-radius: 8px; display: flex; flex-direction: column; gap: 10px; }
+.lapis-pilot-summary { margin: 0 24px 12px; }
+.lapis-import .lapis-row-title.is-static { cursor: default; }
+@media (max-width: 640px) { .lapis-pilot-bar, .lapis-pilot-settings, .lapis-pilot-summary { margin-left: 16px; margin-right: 16px; } }
+

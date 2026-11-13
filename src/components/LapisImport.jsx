@@ -16,7 +16,22 @@ const SHIP_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
 const NO_REVISIONS = [];
 const MAX_DRAFT = 8000000;
 const PAGE_SIZE = 50;
-const FILTERS = [['all', 'Todos'], ['names', 'Com nomes'], ['missing', 'Sem nomes'], ['errors', 'Falhas'], ['waiting', 'A extrair'], ['ask', 'Cobrar nome'], ['awaiting', 'Aguardando cliente']];
+// One list for the review and the pilot: every order lands in exactly one of these tabs.
+const TABS = [['all', 'Todos'], ['conferir', 'Para conferir'], ['duvida', 'Com dúvida'], ['aguardando', 'Aguardando cliente'], ['ler', 'A ler'], ['falha', 'Sem leitura'], ['fila', 'Na fila hoje']];
+const TAB_KEY = 'ss_lapis_tab_v1';
+function readTab() {
+  try { const saved = localStorage.getItem(TAB_KEY); return TABS.some(([key]) => key === saved) ? saved : 'all'; } catch { return 'all'; }
+}
+const PILOT_BUCKET = { pending: 'ler', awaiting: 'aguardando', review: 'duvida', failed: 'falha', done: 'fila' };
+// Review rows: what the operator sees decides the tab; the pilot only fills in what this screen does not know.
+function rowBucket(source, result, extractionError, accepted, waiting) {
+  if (accepted) return 'fila';
+  if (hasNames(result)) return classifyForAutopilot(source, result) === 'auto' ? 'conferir' : 'duvida';
+  if (waiting) return 'aguardando';
+  const bucket = orderBucket(source, result, extractionError);
+  if (bucket === 'errors' || source.status === 'not_found') return 'falha';
+  return bucket === 'missing' ? 'aguardando' : 'ler';
+}
 const ASK_MESSAGE_KEY = 'ss_lapis_ask_message_v1';
 const SEND_LABELS = { sent: 'Mensagem enviada', unconfirmed: 'Envio não confirmado — confira no Duoke', failed: 'Mensagem não enviada' };
 const EXPIRY = 8 * 60 * 60 * 1000;
@@ -41,20 +56,14 @@ const timeText = at => new Date(at).toLocaleTimeString('pt-BR', { hour: '2-digit
 // Today shows the time; other days show the date too.
 const whenText = at => new Date(at).toDateString() === new Date().toDateString() ? timeText(at)
   : new Date(at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-const PILOT_ROWS = 30;
-const PILOT_PHASES = [
-  { key: 'all', label: 'Todos' },
-  { key: 'review', label: 'Para revisar', badge: 'Para revisar', tone: 'alert' },
-  { key: 'failed', label: 'Sem leitura', badge: 'Sem leitura', tone: 'error' },
-  { key: 'awaiting', label: 'Aguardando cliente', badge: 'Aguardando cliente', tone: 'wait' },
-  { key: 'pending', label: 'A ler', badge: 'A ler', tone: 'muted' },
-  { key: 'done', label: 'Na fila hoje', badge: 'Na fila', tone: 'ok' },
-];
+const READY_REASON = 'Nome encontrado, aguardando sua conferência.';
+const PILOT_TONE = { pending: 'muted', awaiting: 'wait', review: 'alert', failed: 'error', done: 'ok' };
+const PILOT_STATUS = { pending: 'A ler', awaiting: 'Aguardando cliente', review: 'Com dúvida', failed: 'Sem leitura', done: 'Na fila' };
 const PHASE_RANK = { review: 0, failed: 1, awaiting: 2, pending: 3, done: 4 };
 const namesText = names => (names || []).map(entry => entry.quantity ? `${entry.name} (${entry.quantity})` : entry.name).join(', ');
 function pilotDetail(entry) {
   if (entry.phase === 'done') return namesText(entry.review?.names) || 'Cartela enviada à fila de impressão.';
-  if (entry.phase === 'review') return [namesText(entry.review?.names), entry.review?.reason].filter(Boolean).join(' · ') || 'Use Trazer para revisão para ver a conversa.';
+  if (entry.phase === 'review') return [namesText(entry.review?.names), entry.review?.reason].filter(Boolean).join(' · ') || 'Use Buscar de novo para ver a conversa.';
   if (entry.phase === 'failed') return 'Conversa não encontrada no Duoke em 3 ciclos seguidos.';
   if (entry.phase === 'awaiting') return entry.sentAt ? `Cobrado às ${whenText(entry.sentAt)}${entry.sendStatus === 'unconfirmed' ? ' (envio não confirmado)' : ''}.` : 'Aguardando o cliente mandar o nome.';
   if (entry.lastStatus === 'not_found') return 'Conversa lida, cliente ainda sem nome.';
@@ -143,12 +152,13 @@ const ROW_ICONS = { ok: '✓', names: '●', alert: '!', error: '✕', missing: 
 
 // One compact row per order (GitHub-style list). The row shows status, code and a
 // one-line summary with the quick actions; it expands to edit names and read the conversation.
-function OrderReview({ source, result, extractionError, selected, reviewed, accepted, busy, expanded, onToggle, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
+function OrderReview({ bucket, source, result, extractionError, selected, reviewed, accepted, busy, expanded, onToggle, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
   const validation = queueError(result);
   const canExtract = source.status === 'collected' && source.text.trim() && source.text.length <= 12000;
   const named = hasNames(result);
-  const status = accepted ? 'Na fila' : named ? 'Revisar nomes' : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
-  const tone = accepted ? 'ok' : named ? (validation ? 'alert' : 'names') : extractionError || source.status === 'error' || source.status === 'not_found' ? 'error'
+  const doubt = named && (validation || bucket === 'duvida');
+  const status = accepted ? 'Na fila' : named ? (doubt ? 'Com dúvida' : 'Para conferir') : extractionError ? 'Falha na extração' : source.status === 'error' ? 'Falha na coleta' : source.status === 'not_found' ? 'Pedido não encontrado' : result ? 'Nome não encontrado' : source.status === 'collected' && !source.text.trim() ? 'Cliente ainda não escreveu' : 'Conversa pronta';
+  const tone = accepted ? 'ok' : named ? (doubt ? 'alert' : 'names') : extractionError || source.status === 'error' || source.status === 'not_found' ? 'error'
     : sendStatus?.status === 'sent' || waitingSince ? 'wait' : result ? 'missing' : 'muted';
   const failure = source.error || extractionError || (source.text.length > 12000 ? `Conversa com ${source.text.length.toLocaleString('pt-BR')} caracteres (máximo 12.000).` : '');
   const summary = named ? result.names.map(entry => entry.quantity ? `${entry.name || '(sem nome)'} (${entry.quantity})` : entry.name || '(sem nome)').join(', ')
@@ -193,6 +203,26 @@ function OrderReview({ source, result, extractionError, selected, reviewed, acce
   </li>;
 }
 
+// Orders the pilot follows that this screen has not loaded: status, last activity and quick actions.
+function PilotRow({ entry, busy, connected, canOpen, opening, onOpen, onRetry }) {
+  const tone = PILOT_TONE[entry.phase];
+  const when = entry.phase === 'done' && entry.doneAt ? `às ${whenText(entry.doneAt)}` : entry.addedAt ? `desde ${whenText(entry.addedAt)}` : '';
+  return <li className={`lapis-row is-${tone}`}>
+    <div className="lapis-row-main">
+      <span className="lapis-row-select" />
+      <span className="lapis-row-icon" aria-hidden="true">{ROW_ICONS[tone]}</span>
+      <div className="lapis-row-title is-static">
+        <span className="lapis-row-line"><span className="lapis-row-code">{entry.id}</span><span className="lapis-row-status">{PILOT_STATUS[entry.phase]}{when ? ` · ${when}` : ''}</span></span>
+        <span className="lapis-row-summary">{pilotDetail(entry)}</span>
+      </div>
+      <span className="lapis-row-actions">
+        <button type="button" className="lapis-link-button" disabled={!canOpen} onClick={onOpen} title="Abre a conversa deste pedido na aba do Duoke">{opening ? 'Abrindo…' : 'Conferir no Duoke'}</button>
+        {entry.phase !== 'done' ? <button type="button" className="lapis-link-button" disabled={busy || !connected} onClick={onRetry} title="Coleta e lê este pedido agora">Buscar de novo</button> : null}
+      </span>
+    </div>
+  </li>;
+}
+
 export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISIONS }) {
   const [storageKey] = useState(draftKey);
   const [draft, setDraft] = useState(() => readDraft(storageKey));
@@ -205,7 +235,8 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [saved, setSaved] = useState(Boolean(storageKey));
   const [queueBusy, setQueueBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [filter, setFilter] = useState('all');
+  const [filter, setFilterValue] = useState(readTab);
+  const setFilter = key => { setFilterValue(key); try { localStorage.setItem(TAB_KEY, key); } catch { /* Storage unavailable. */ } };
   const [reviewPage, setReviewPage] = useState(0);
   const [awaitingStore] = useState(awaitingKey);
   const [awaiting, setAwaiting] = useState(() => { try { return loadAwaiting(localStorage, awaitingStore); } catch { return {}; } });
@@ -221,8 +252,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [openingId, setOpeningId] = useState('');
   const [expandedIds, setExpandedIds] = useState(() => new Set());
   const toggleExpanded = id => setExpandedIds(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
-  const [pilotFilter, setPilotFilter] = useState('all');
-  const [pilotRows, setPilotRows] = useState(PILOT_ROWS);
+  const [pilotSettingsOpen, setPilotSettingsOpen] = useState(false);
   const pilotStateRef = useRef(null), pilotSaved = useRef(new Set()), pilotSaveTimer = useRef(null), lastCycle = useRef(NaN),
     pendingAsk = useRef(null), disconnectedSince = useRef(0), disconnectAlerted = useRef(false), cycleFailureAlerted = useRef(false), tickRef = useRef(null);
   const pilotActive = pilot.enabled && pilotState !== null;
@@ -281,6 +311,23 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     }, 1000);
     return () => clearTimeout(pilotSaveTimer.current);
   }, [pilotState, pilotClient]);
+
+  useEffect(() => {
+    const ready = stateList(pilotState || {}).filter(entry => entry.phase === 'review' && entry.review?.names?.length);
+    if (!ready.length) return;
+    setDraft(current => {
+      const known = new Set(current.collected.map(order => order.id));
+      const fresh = ready.filter(entry => !known.has(entry.id));
+      if (!fresh.length) return current;
+      const next = mergeCollected(current, fresh.map(entry => ({ id: entry.id, status: 'collected', text: '' })));
+      next.results = dict({ ...next.results, ...Object.fromEntries(fresh.map(entry => {
+        const ok = entry.review.reason === READY_REASON;
+        return [entry.id, { id: entry.id, names: entry.review.names.map(item => ({ name: item.name, quantity: item.quantity ?? null, evidence: '' })), status: ok ? 'found' : 'review', reason: ok ? '' : entry.review.reason || '' }];
+      })) });
+      for (const entry of fresh) next.selected[entry.id] = false;
+      return next;
+    });
+  }, [pilotState]);
 
   useEffect(() => {
     if (!storageKey) return;
@@ -514,7 +561,28 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const retryOrders = [...groups.missing, ...groups.errors];
   const pendingOrders = draft.collected.filter(source => !hasNames(draft.results[source.id]));
   const pendingExtraction = pendingOrders.filter(canExtract);
-  const filteredOrders = groups[filter];
+  // The single list: review orders in the order they arrived, then orders only the pilot (or the
+  // awaiting list) knows. Expanded rows stay visible while edited, even if their tab changes.
+  const unified = useMemo(() => {
+    const rows = [], known = new Set();
+    const pilotEntries = pilotState || {};
+    for (const source of draft.collected) {
+      known.add(source.id);
+      const result = draft.results[source.id];
+      const accepted = Boolean(result && acceptedSet.has(revision(result))) || pilotEntries[source.id]?.phase === 'done';
+      rows.push({ id: source.id, source, bucket: rowBucket(source, result, draft.extractionErrors[source.id], accepted, Boolean(awaiting[source.id])) });
+    }
+    const extra = new Map();
+    for (const entry of stateList(pilotEntries)) if (!known.has(entry.id)) extra.set(entry.id, entry);
+    for (const [id, value] of Object.entries(awaiting)) if (!known.has(id) && !extra.has(id)) extra.set(id, { id, phase: 'awaiting', sentAt: value.sentAt, sendStatus: value.status });
+    const pilotOnly = [...extra.values()].sort((a, b) => PHASE_RANK[a.phase] - PHASE_RANK[b.phase] || (a.phase === 'done' ? (b.doneAt || 0) - (a.doneAt || 0) : (a.addedAt || 0) - (b.addedAt || 0)));
+    for (const entry of pilotOnly) rows.push({ id: entry.id, entry, bucket: PILOT_BUCKET[entry.phase] });
+    return rows;
+  }, [draft.collected, draft.results, draft.extractionErrors, acceptedSet, awaiting, pilotState]);
+  const tabCounts = Object.fromEntries(TABS.map(([key]) => [key, 0]));
+  for (const row of unified) tabCounts[row.bucket]++;
+  tabCounts.all = unified.length;
+  const filteredOrders = filter === 'all' ? unified : unified.filter(row => row.bucket === filter || expandedIds.has(row.id));
   const pageCount = Math.max(1, Math.ceil(filteredOrders.length / PAGE_SIZE));
   const currentPage = Math.min(reviewPage, pageCount - 1);
   const visibleOrders = filteredOrders.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
@@ -571,40 +639,44 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     const plan = planAutopilot({ ids, sources, results: extracted.results, extractionErrors: extracted.errors,
       isQueued: order => acceptedSet.has(revision(order)), awaiting, shipDates: draft.shipDates });
     setAwaiting(plan.awaiting);
-    let queued = 0, queueFailure = '';
-    if (plan.autoOrders.length && typeof onAddOrders === 'function') {
-      setPhase('queueing');
-      try {
-        await onAddOrders(plan.autoOrders);
-        queued = plan.autoOrders.length;
-        if (mounted.current) setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, ...Object.fromEntries(plan.autoOrders.map(order => [order.id, revision(order)])) }) }));
-      } catch (failure) { queueFailure = failure.message || 'Não foi possível adicionar os pedidos à fila.'; }
+    // Nothing goes to the print queue on its own: orders with clear names wait in the
+    // review list until the operator ticks Conferi (which queues that order at once).
+    const readyIds = new Set(plan.autoOrders.map(order => order.id));
+    const classified = { ...plan.classified };
+    const results = new Map(extracted.results);
+    for (const id of readyIds) {
+      classified[id] = 'review';
+      const result = results.get(id);
+      if (result && !result.reason) results.set(id, { ...result, reason: READY_REASON });
     }
     let pilotOut = null;
     if (pilotStateRef.current && pilot.enabled) {
-      pilotOut = applyCycle(addToInbox(pilotStateRef.current, ids).state, { ids, classified: plan.classified, results: extracted.results, hashes,
-        awaiting: plan.awaiting, queueFailed: Boolean(queueFailure), autoAsk: cycle && pilot.autoAsk });
+      pilotOut = applyCycle(addToInbox(pilotStateRef.current, ids).state, { ids, classified, results, hashes,
+        awaiting: plan.awaiting, autoAsk: cycle && pilot.autoAsk });
       setPilotState(pilotOut.state);
       // Sent by the idle effect below, after this workflow releases the Duoke tab.
       if (pilotOut.askIds.length) pendingAsk.current = pilotOut.askIds;
     }
     if (!mounted.current) return;
     const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-    const summary = [`${cycle ? 'Ciclo do piloto' : 'Lote processado'}: ${plural(queued, 'cartela enviada', 'cartelas enviadas')} à fila automaticamente`,
-      `${plan.counts.review + plan.autoOrders.length - queued} para revisar`,
+    const summary = [`${cycle ? 'Ciclo do piloto' : 'Lote processado'}: ${plural(readyIds.size, 'nome pronto', 'nomes prontos')} para conferir`,
+      `${plan.counts.review} com dúvida`,
       plural(plan.askable.length, 'cliente para cobrar', 'clientes para cobrar'),
       `${Object.keys(plan.awaiting).length} aguardando resposta`,
       plural(plan.counts.failed, 'falha', 'falhas')].join(' · ') + (plan.answered.length ? `. ${plural(plan.answered.length, 'cliente respondeu', 'clientes responderam')}.` : '.');
     setNotice(summary);
-    if (queueFailure) setError(`As cartelas aprovadas não foram para a fila: ${queueFailure} Confira e adicione manualmente.`);
     if (cycle) {
       cycleFailureAlerted.current = false;
       setPilotInfo(current => ({ ...current, lastRun: Date.now(), summary, error: current.error.startsWith('Ciclo:') ? '' : current.error }));
     } else { setFilter(plan.askable.length ? 'ask' : 'all'); setReviewPage(0); }
     // Telegram only when something needs the operator; quiet cycles stay quiet.
-    if (pilotOut && (pilotOut.newReview.length || pilotOut.newFailed.length)) {
-      const review = pilotOut.newReview.map(id => ({ id, names: extracted.results.get(id)?.names || [], reason: extracted.results.get(id)?.reason || (queueFailure ? 'não entrou na fila' : '') }));
-      notifyTelegram(formatCycleMessage({ queued, review, asked: pilotOut.askIds.length, failed: pilotOut.newFailed,
+    // Only orders with doubts are listed by name; ready ones are a count, so the chat is not flooded.
+    const doubtful = pilotOut ? pilotOut.newReview.filter(id => !readyIds.has(id)) : [];
+    const newReady = pilotOut ? pilotOut.newReview.filter(id => readyIds.has(id)).length : 0;
+    if (pilotOut && (doubtful.length || newReady || pilotOut.newFailed.length)) {
+      const review = doubtful.map(id => ({ id, names: extracted.results.get(id)?.names || [], reason: extracted.results.get(id)?.reason || '' }));
+      notifyTelegram(formatCycleMessage({ queued: 0, review, asked: pilotOut.askIds.length, failed: pilotOut.newFailed,
+        note: newReady ? `${plural(newReady, 'pedido novo pronto', 'pedidos novos prontos')} para conferir no Studio.` : '',
         awaitingCount: stateList(pilotOut.state).filter(entry => entry.phase === 'awaiting').length }));
     }
   };
@@ -667,6 +739,27 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       }
       setNotice(`${orders.length} cartela${orders.length === 1 ? '' : 's'} adicionada${orders.length === 1 ? '' : 's'} à fila de impressão.`);
     } catch (failure) { setError(failure.message || 'Não foi possível adicionar os pedidos à fila.'); }
+    finally { enqueuing.current = false; if (mounted.current) setQueueBusy(false); }
+  };
+
+  // Ticking Conferi approves the order and sends it to the print queue at once.
+  // On failure it stays ticked, so the bottom button can retry.
+  const queueOne = async id => {
+    const result = draft.results[id];
+    if (!result || queueError(result) || enqueuing.current || typeof onAddOrders !== 'function') return;
+    const fingerprint = revision(result);
+    setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, [id]: fingerprint }) }));
+    enqueuing.current = true; setQueueBusy(true); setError('');
+    try {
+      const order = { ...result, status: 'found', names: result.names.map(entry => ({ ...entry })), shipDate: draft.shipDates[id] || '' };
+      toLabelFields(order);
+      await onAddOrders([order]);
+      if (pilotStateRef.current && pilot.enabled) {
+        setAwaiting(current => { const next = { ...current }; delete next[id]; return next; });
+        setPilotState(current => markDone(current, [id], { namesById: new Map([[id, order.names]]) }));
+      }
+      if (mounted.current) setNotice(`Pedido ${id} conferido e adicionado à fila de impressão.`);
+    } catch (failure) { if (mounted.current) setError(`O pedido ${id} foi conferido, mas não entrou na fila: ${failure.message || 'erro desconhecido'}. Use Adicionar à fila para tentar de novo.`); }
     finally { enqueuing.current = false; if (mounted.current) setQueueBusy(false); }
   };
 
@@ -752,8 +845,6 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
 
   const pilotCounts = { pending: 0, awaiting: 0, review: 0, failed: 0, done: 0 };
   for (const entry of stateList(pilotState || {})) pilotCounts[entry.phase]++;
-  const pilotList = stateList(pilotState || {}).filter(entry => pilotFilter === 'all' || entry.phase === pilotFilter)
-    .sort((a, b) => PHASE_RANK[a.phase] - PHASE_RANK[b.phase] || (a.phase === 'done' ? (b.doneAt || 0) - (a.doneAt || 0) : a.addedAt - b.addedAt));
   const pilotIds = phaseName => stateList(pilotState || {}).filter(entry => entry.phase === phaseName).map(entry => entry.id);
   const nextCycle = pilotActive && Number.isFinite(lastCycle.current) ? lastCycle.current + pilot.minutes * 60000 : 0;
   const testTelegram = async () => {
@@ -773,7 +864,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         <div className="lapis-section-title"><span>01</span><h3>Buscar no Duoke</h3></div>
         <label className="lapis-field">Códigos dos pedidos<textarea value={draft.codes} disabled={busy} maxLength={100000} rows={4} placeholder={'Cole os códigos, um por linha\n323265626\n323265627'} onChange={event => setDraft(current => ({ ...current, codes: event.target.value }))} /></label>
         <p className="lapis-batch-hint">Até 500 pedidos por lote. Coleta em etapas automáticas, com TXT completo para download.</p>
-        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !draft.codes.trim()} onClick={() => startCollection({ autopilot: true })} title="Coleta, extrai, envia à fila os pedidos seguros e separa os clientes para cobrar">Processar lote <span aria-hidden="true">→</span></button><button type="button" disabled={busy || !draft.codes.trim()} onClick={() => startCollection()}>Coletar e extrair</button><label className={`lapis-label-upload${busy ? ' is-disabled' : ''}`} title="Lê o código do pedido e o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={busy} onChange={uploadLabels} /></label><a href="https://ai.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
+        <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !draft.codes.trim()} onClick={() => startCollection({ autopilot: true })} title="Coleta, extrai, deixa os nomes prontos para você conferir e separa os clientes para cobrar">Processar lote <span aria-hidden="true">→</span></button><button type="button" disabled={busy || !draft.codes.trim()} onClick={() => startCollection()}>Coletar e extrair</button><label className={`lapis-label-upload${busy ? ' is-disabled' : ''}`} title="Lê o código do pedido e o envio previsto de cada etiqueta">📄 Etiquetas Shopee (PDF)<input type="file" accept=".pdf,application/pdf" multiple disabled={busy} onChange={uploadLabels} /></label><a href="https://ai.duoke.com/?lang=pt#/dk/main/chat" target="_blank" rel="noreferrer" className="lapis-link-button">Abrir Duoke ↗</a></div>
         <label className="lapis-field">Código de acesso à extração<input type="password" value={accessCode} maxLength={256} autoComplete="off" disabled={busy} placeholder="Informe uma vez neste computador" onChange={event => { setAccessCode(event.target.value); saveAccessCode(event.target.value); }} /></label>
         <details className="lapis-help"><summary>Conectar as abas pela primeira vez</summary><ol><li><a href={`${import.meta.env.BASE_URL}downloads/duoke-bridge.zip`} download>Baixe a extensão Duoke</a> e extraia o ZIP.</li><li>Em chrome://extensions ou edge://extensions, ative o modo de desenvolvedor e escolha “Carregar sem compactação”. Selecione a pasta extraída.</li><li>Abra a extensão na aba do Sticker Studio e clique em conectar. Faça o mesmo na aba do Duoke com sua conta aberta.</li><li>Volte aqui e clique em ↻ para verificar a conexão.</li></ol><p>A extensão lê as conversas dos pedidos informados e só envia mensagens quando você confirma a cobrança.</p></details>
       </div>
@@ -784,90 +875,63 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         <p className="lapis-batch-hint">O código de acesso fica guardado neste navegador. Apague o campo para esquecê-lo.</p>
       </div>
     </div>
-    <div className={`lapis-pilot${pilot.enabled ? ' is-on' : ''}`} aria-label="Piloto contínuo">
-      <div className="lapis-pilot-head">
-        <div className="lapis-section-title"><span>24H</span><h3>Piloto contínuo</h3></div>
-        <label className="lapis-switch"><input type="checkbox" checked={pilot.enabled} onChange={event => setPilot(current => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" />{pilot.enabled ? 'Ligado' : 'Desligado'}</label>
-      </div>
-      <p className="lapis-pilot-lead">Repete o Processar lote sozinho para os pedidos do piloto: coleta as conversas, extrai só o que tem mensagem nova, manda à fila os pedidos seguros e separa o resto para você. Mantenha esta aba e a do Duoke abertas neste computador.</p>
-      {pilot.enabled ? <>
-        <div className="lapis-pilot-options">
-          <label className="lapis-field">A cada<select value={pilot.minutes} onChange={event => setPilot(current => ({ ...current, minutes: Number(event.target.value) }))}>{CYCLE_MINUTES.map(value => <option key={value} value={value}>{value} minutos</option>)}</select></label>
-          <label className="lapis-check"><input type="checkbox" checked={pilot.autoAsk} onChange={event => setPilot(current => ({ ...current, autoAsk: event.target.checked }))} />Cobrar automaticamente quem não mandou o nome (uma vez por pedido, com a mensagem de cobrança salva)</label>
-          <label className="lapis-check"><input type="checkbox" checked={pilot.telegram} onChange={event => setPilot(current => ({ ...current, telegram: event.target.checked }))} />Avisar no Telegram o que precisar de revisão</label>
-        </div>
-        {pilotInfo.loading ? <p className="lapis-notice" role="status">Carregando o estado do piloto…</p> : null}
-        {!accessCode.trim() ? <p className="lapis-error">Informe o código de acesso à extração acima para ligar o piloto.</p> : null}
-        {pilotState ? <div className="lapis-pilot-stats" role="status">
-          <span><strong>{pilotCounts.pending}</strong>a ler</span>
-          <span><strong>{pilotCounts.awaiting}</strong>aguardando cliente</span>
-          <span className={pilotCounts.review ? 'is-alert' : ''}><strong>{pilotCounts.review}</strong>para revisar</span>
-          <span className={pilotCounts.failed ? 'is-alert' : ''}><strong>{pilotCounts.failed}</strong>sem leitura</span>
-          <span className={pilotCounts.done ? 'is-ok' : ''}><strong>{pilotCounts.done}</strong>na fila hoje</span>
-          <span><strong>{pilotInfo.lastRun ? timeText(pilotInfo.lastRun) : '—'}</strong>último ciclo</span>
-          <span><strong>{busy ? 'agora' : nextCycle ? timeText(Math.max(nextCycle, Date.now())) : connected ? 'em instantes' : 'parado'}</strong>{connected ? 'próximo ciclo' : 'Duoke desconectado'}</span>
-        </div> : null}
-        {pilotState && stateList(pilotState).length ? <div className="lapis-pilot-list">
-          <div className="lapis-pilot-filters" role="tablist" aria-label="Filtrar pedidos do piloto">
-            {PILOT_PHASES.map(item => {
-              const total = item.key === 'all' ? stateList(pilotState).length : pilotCounts[item.key];
-              return item.key === 'all' || total ? <button key={item.key} type="button" role="tab" aria-selected={pilotFilter === item.key}
-                className={pilotFilter === item.key ? 'is-active' : ''} onClick={() => { setPilotFilter(item.key); setPilotRows(PILOT_ROWS); }}>{item.label}<span>{total}</span></button> : null;
-            })}
-          </div>
-          {pilotList.length ? <ul className="lapis-pilot-rows">
-            {pilotList.slice(0, pilotRows).map(entry => {
-              const meta = PILOT_PHASES.find(item => item.key === entry.phase);
-              return <li key={entry.id} className={`lapis-pilot-row is-${meta.tone}`}>
-                <code className="lapis-pilot-code">{entry.id}</code>
-                <span className={`lapis-pilot-badge is-${meta.tone}`}>{meta.badge}</span>
-                <span className="lapis-pilot-when" title="Entrou no piloto">{entry.phase === 'done' && entry.doneAt ? `às ${whenText(entry.doneAt)}` : `desde ${whenText(entry.addedAt)}`}</span>
-                <span className="lapis-pilot-detail">{pilotDetail(entry)}</span>
-                <button type="button" className="lapis-link-button" disabled={!canOpen} onClick={() => openInDuoke(entry.id)}>{openingId === entry.id ? 'Abrindo…' : 'Conferir no Duoke'}</button>
-              </li>;
-            })}
-          </ul> : <p className="lapis-batch-hint">Nenhum pedido neste filtro.</p>}
-          {pilotList.length > pilotRows ? <button type="button" className="lapis-link-button lapis-pilot-more" onClick={() => setPilotRows(rows => rows + PILOT_ROWS)}>Mostrar mais {Math.min(PILOT_ROWS, pilotList.length - pilotRows)} de {pilotList.length - pilotRows}</button> : null}
-        </div> : null}
-        {pilotInfo.summary ? <p className="lapis-reason">{pilotInfo.summary}</p> : null}
-        {pilotInfo.error ? <p className="lapis-error" role="alert">{pilotInfo.error}</p> : null}
-        <div className="lapis-actions">
-          <button type="button" className="lapis-primary" disabled={!pilotActive || busy || !connected || connection.busy} onClick={() => tickRef.current?.({ force: true })}>Rodar agora</button>
-          <button type="button" disabled={!pilotActive || busy || !draft.codes.trim()} onClick={() => {
-            const { state, added } = addToInbox(pilotStateRef.current, parseOrderCodes(draft.codes));
-            setPilotState(state); setPilotInfo(current => ({ ...current, summary: `${added} pedido${added === 1 ? '' : 's'} novo${added === 1 ? '' : 's'} no piloto.` }));
-          }}>Incluir códigos colados</button>
-          {pilotCounts.review ? <button type="button" disabled={busy || !connected || connection.busy} onClick={() => startCollection({ codes: pilotIds('review').slice(0, 200), retry: true })} title="Coleta e extrai estes pedidos aqui embaixo para você revisar e mandar à fila">Trazer para revisão · {pilotCounts.review}</button> : null}
-          {pilotCounts.failed ? <button type="button" disabled={busy} onClick={() => setPilotState(current => Object.assign(Object.create(null), current, Object.fromEntries(pilotIds('failed').map(id => [id, { ...current[id], phase: 'pending', failures: 0 }]))))}>Tentar sem leitura de novo · {pilotCounts.failed}</button> : null}
-          {pilotCounts.failed ? <button type="button" className="lapis-link-button" disabled={busy} onClick={() => setPilotState(current => removeFromState(current, pilotIds('failed')))}>Descartar sem leitura</button> : null}
-          {pilot.telegram ? <button type="button" className="lapis-link-button" disabled={!accessCode.trim()} onClick={testTelegram}>Testar Telegram</button> : null}
-        </div>
-        <p className="lapis-batch-hint">Pedidos entram no piloto pelo Processar lote, pelas etiquetas em PDF + Incluir códigos colados, ou cobrados por aqui. Os que vão para a fila aparecem como Na fila até a meia-noite; os outros ficam no máximo 7 dias. Para revisar e sem leitura esperam você.</p>
-      </> : null}
-    </div>
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : phase === 'sending' ? 'Enviando mensagens no Duoke' : phase === 'queueing' ? 'Adicionando à fila' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}
     {error ? <p className="lapis-alert lapis-error" role="alert">{error}</p> : null}
     {uploading ? <p className="lapis-notice" role="status">Lendo arquivo…</p> : null}
     {notice ? <p className="lapis-notice" role="status">{notice}</p> : null}
     {!saved && draft.collected.length > 0 ? <p className="lapis-alert lapis-error" role="alert">O rascunho não pôde ser salvo neste navegador. Baixe o TXT completo e o CSV dos nomes antes de fechar a tela.</p> : null}
-    {awaitingIds.length > 0 ? <div className="lapis-pending lapis-awaiting">
-      <div><strong>{awaitingIds.length} cliente{awaitingIds.length === 1 ? '' : 's'} aguardando resposta</strong><p>Cobrados neste computador nos últimos 7 dias. Verificar respostas coleta só esses pedidos, extrai os nomes e envia à fila os que responderam.</p></div>
+    <div className="lapis-review-heading"><div className="lapis-section-title"><span>02</span><h3>Pedidos <small>{unified.length}</small></h3></div><div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !selectedOrders.length} onClick={() => runExtraction()}>Extrair selecionados{selectedOrders.length ? ` · ${selectedOrders.length}` : ''}</button><button type="button" disabled={!draft.collected.length} onClick={() => downloadText()}>Baixar TXT completo</button><button type="button" disabled={busy || !draft.collected.length} onClick={exportCsv}>Exportar CSV</button><button type="button" className="lapis-link-button" disabled={busy || !draft.collected.length} onClick={() => { setDraft(EMPTY); setFilter('all'); setReviewPage(0); setError(''); setNotice('Revisão limpa. As cartelas adicionadas continuam na fila.'); }}>Limpar revisão</button></div></div>
+    <div className={`lapis-pilot-bar${pilot.enabled ? ' is-on' : ''}`} aria-label="Piloto contínuo">
+      <label className="lapis-switch"><input type="checkbox" checked={pilot.enabled} onChange={event => setPilot(current => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" />Piloto {pilot.enabled ? 'ligado' : 'desligado'}</label>
+      <span className="lapis-pilot-meta">{pilot.enabled ? <>a cada {pilot.minutes} min · último {pilotInfo.lastRun ? timeText(pilotInfo.lastRun) : '—'} · {!connected ? 'Duoke desconectado' : `próximo ${busy ? 'agora' : nextCycle ? timeText(Math.max(nextCycle, Date.now())) : 'em instantes'}`}</> : 'Ligue para ler os pedidos sozinho a cada ciclo. Nada vai para a fila sem o seu Conferi.'}</span>
+      <span className="lapis-actions">
+        {pilot.enabled ? <button type="button" disabled={!pilotActive || busy || !connected || connection.busy} onClick={() => tickRef.current?.({ force: true })}>Rodar agora</button> : null}
+        <button type="button" className="lapis-link-button" aria-expanded={pilotSettingsOpen} onClick={() => setPilotSettingsOpen(open => !open)}>⚙ Ajustes</button>
+      </span>
+    </div>
+    {pilotSettingsOpen ? <div className="lapis-pilot-settings">
+      <p className="lapis-pilot-lead">O piloto repete o Processar lote sozinho: coleta as conversas, extrai só o que tem mensagem nova e deixa os nomes em Para conferir. Mantenha esta aba e a do Duoke abertas neste computador. Pedidos entram pelo Processar lote, pelas etiquetas em PDF + Incluir códigos colados, ou cobrados por aqui; os que vão para a fila aparecem em Na fila hoje até a meia-noite, os outros ficam no máximo 7 dias.</p>
+      <div className="lapis-pilot-options">
+        <label className="lapis-field">A cada<select value={pilot.minutes} onChange={event => setPilot(current => ({ ...current, minutes: Number(event.target.value) }))}>{CYCLE_MINUTES.map(value => <option key={value} value={value}>{value} minutos</option>)}</select></label>
+        <label className="lapis-check"><input type="checkbox" checked={pilot.autoAsk} onChange={event => setPilot(current => ({ ...current, autoAsk: event.target.checked }))} />Cobrar automaticamente quem não mandou o nome (uma vez por pedido, com a mensagem de cobrança salva)</label>
+        <label className="lapis-check"><input type="checkbox" checked={pilot.telegram} onChange={event => setPilot(current => ({ ...current, telegram: event.target.checked }))} />Avisar no Telegram o que precisar de revisão</label>
+      </div>
+      <div className="lapis-actions">
+        <button type="button" disabled={!pilotActive || busy || !draft.codes.trim()} onClick={() => {
+          const { state, added } = addToInbox(pilotStateRef.current, parseOrderCodes(draft.codes));
+          setPilotState(state); setPilotInfo(current => ({ ...current, summary: `${added} pedido${added === 1 ? '' : 's'} novo${added === 1 ? '' : 's'} no piloto.` }));
+        }}>Incluir códigos colados</button>
+        {pilot.telegram ? <button type="button" className="lapis-link-button" disabled={!accessCode.trim()} onClick={testTelegram}>Testar Telegram</button> : null}
+      </div>
+    </div> : null}
+    {pilot.enabled && pilotInfo.loading ? <p className="lapis-notice" role="status">Carregando o estado do piloto…</p> : null}
+    {pilot.enabled && !accessCode.trim() ? <p className="lapis-alert lapis-error">Informe o código de acesso à extração acima para ligar o piloto.</p> : null}
+    {pilot.enabled && pilotInfo.summary ? <p className="lapis-notice lapis-pilot-summary">{pilotInfo.summary}</p> : null}
+    {pilot.enabled && pilotInfo.error ? <p className="lapis-alert lapis-error" role="alert">{pilotInfo.error}</p> : null}
+    {unified.length > 0 ? <>
+      <div className="lapis-filters" role="tablist" aria-label="Filtrar pedidos">
+        {TABS.map(([key, label]) => key === 'all' || tabCounts[key] || filter === key ? <button type="button" role="tab" key={key} aria-selected={filter === key} aria-pressed={filter === key} className={`lapis-filter lapis-filter-${key}`} onClick={() => { setFilter(key); setReviewPage(0); }}>{label}<strong>{tabCounts[key]}</strong></button> : null)}
+      </div>
+    {awaitingIds.length > 0 && filter === 'aguardando' ? <div className="lapis-pending lapis-awaiting">
+        <div><strong>{awaitingIds.length} cliente{awaitingIds.length === 1 ? '' : 's'} aguardando resposta</strong><p>Cobrados neste computador nos últimos 7 dias. Verificar respostas coleta só esses pedidos, extrai os nomes e envia à fila os que responderam.</p></div>
       <div className="lapis-actions"><button type="button" disabled={busy || !connected || connection.busy} onClick={() => startCollection({ codes: awaitingIds, retry: true, autopilot: true })}>Verificar respostas · {awaitingIds.length}</button></div>
       {!awaitingSaved ? <p className="lapis-error">Não foi possível guardar a lista neste navegador. Anote os códigos cobrados.</p> : null}
     </div> : null}
-    <div className="lapis-review-heading"><div className="lapis-section-title"><span>02</span><h3>Revisar pedidos <small>{draft.collected.length}</small></h3></div><div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !selectedOrders.length} onClick={() => runExtraction()}>Extrair selecionados{selectedOrders.length ? ` · ${selectedOrders.length}` : ''}</button><button type="button" disabled={!draft.collected.length} onClick={() => downloadText()}>Baixar TXT completo</button><button type="button" disabled={busy || !draft.collected.length} onClick={exportCsv}>Exportar CSV</button><button type="button" className="lapis-link-button" disabled={busy || !draft.collected.length} onClick={() => { setDraft(EMPTY); setFilter('all'); setReviewPage(0); setError(''); setNotice('Revisão limpa. As cartelas adicionadas continuam na fila.'); }}>Limpar revisão</button></div></div>
-    {draft.collected.length > 0 ? <>
-      <div className="lapis-filters" role="group" aria-label="Filtrar pedidos">
-        {FILTERS.map(([key, label]) => <button type="button" key={key} aria-pressed={filter === key} className={`lapis-filter lapis-filter-${key}`} onClick={() => { setFilter(key); setReviewPage(0); }}>{label}<strong>{groups[key].length}</strong></button>)}
-      </div>
-      {groups.ask.length > 0 || filter === 'ask' ? <div className="lapis-pending lapis-ask">
+      {filter === 'aguardando' && groups.ask.length > 0 ? <div className="lapis-pending lapis-ask">
         <div><strong>{askable.length} cliente{askable.length === 1 ? '' : 's'} sem nome para cobrar</strong><p>A conversa foi lida e nenhum nome foi encontrado. A mensagem abaixo é enviada no chat de cada pedido somente quando você clicar em enviar.{askable.length > MAX_SEND_ORDERS ? ` Serão enviados os primeiros ${MAX_SEND_ORDERS}; repita para os demais.` : ''}{groups.ask.length > askable.length ? ` ${groups.ask.length - askable.length} já foram cobrados nas últimas 24 horas.` : ''}</p></div>
         <label className="lapis-field">Mensagem para o cliente<textarea rows={3} value={askMessage} maxLength={MAX_ASK_MESSAGE} disabled={busy} onChange={event => setAskMessage(event.target.value)} /></label>
         <p className="lapis-batch-hint">{askMessage.trim().length} / {MAX_ASK_MESSAGE} caracteres{askError ? ` · ${askError}` : ''}</p>
         {askQueue.length ? <p className="lapis-ask-codes" aria-label="Pedidos que receberão a mensagem">{askQueue.join(' · ')}</p> : null}
         <div className="lapis-actions"><button type="button" className="lapis-primary" disabled={busy || !connected || connection.busy || !askQueue.length || Boolean(askError)} onClick={() => sendAsk(askQueue)}>Enviar para {askQueue.length} cliente{askQueue.length === 1 ? '' : 's'}</button></div>
       </div> : null}
-      {pendingOrders.length > 0 ? <div className="lapis-pending">
+      {filter === 'falha' && pilotCounts.failed ? <div className="lapis-pending">
+        <div><strong>{pilotCounts.failed} pedido{pilotCounts.failed === 1 ? '' : 's'} que o piloto não conseguiu ler</strong><p>A conversa não foi encontrada no Duoke em 3 ciclos seguidos. Confira o código no Duoke, tente de novo ou descarte.</p></div>
+        <div className="lapis-actions">
+          <button type="button" disabled={busy} onClick={() => setPilotState(current => Object.assign(Object.create(null), current, Object.fromEntries(pilotIds('failed').map(id => [id, { ...current[id], phase: 'pending', failures: 0 }]))))}>Tentar de novo no piloto · {pilotCounts.failed}</button>
+          <button type="button" className="lapis-link-button" disabled={busy} onClick={() => setPilotState(current => removeFromState(current, pilotIds('failed')))}>Descartar do piloto</button>
+        </div>
+      </div> : null}
+      {['falha', 'ler'].includes(filter) && pendingOrders.length > 0 ? <div className="lapis-pending">
         <div><strong>{pendingOrders.length} pedido{pendingOrders.length === 1 ? '' : 's'} pendente{pendingOrders.length === 1 ? '' : 's'}</strong><p>Sem nomes: confira a conversa ou busque novamente após a resposta do cliente. Falhas e pedidos a extrair ficam separados.</p></div>
         <div className="lapis-actions">
           <button type="button" disabled={busy || !connected || connection.busy || !retryOrders.length} onClick={() => startCollection({ codes: retryOrders.map(order => order.id), retry: true })}>Refazer pendências{retryOrders.length ? ` · ${retryOrders.length}` : ''}</button>
@@ -877,25 +941,23 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       </div> : null}
       <div className="lapis-pagination"><span>{filteredOrders.length ? `${currentPage * PAGE_SIZE + 1}–${Math.min((currentPage + 1) * PAGE_SIZE, filteredOrders.length)} de ${filteredOrders.length} pedidos` : 'Nenhum pedido neste filtro'}</span><div><button type="button" disabled={currentPage === 0} onClick={() => setReviewPage(currentPage - 1)}>Anterior</button><span>{currentPage + 1} / {pageCount}</span><button type="button" disabled={currentPage + 1 >= pageCount} onClick={() => setReviewPage(currentPage + 1)}>Próxima</button></div></div>
     </> : null}
-    {draft.collected.length ? <ul className="lapis-orders">{visibleOrders.map(source => {
+    {unified.length ? <ul className="lapis-orders">{visibleOrders.map(({ id, source, entry, bucket }) => {
+      if (!source) return <PilotRow key={id} entry={entry} busy={busy} connected={connected && !connection.busy} canOpen={canOpen} opening={openingId === id}
+        onOpen={() => openInDuoke(id)} onRetry={() => startCollection({ codes: [id], retry: true })} />;
       const result = draft.results[source.id];
       const fingerprint = result ? revision(result) : '';
-      return <OrderReview key={source.id} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={acceptedSet.has(fingerprint)} busy={busy} connected={connected && !connection.busy}
+      return <OrderReview key={source.id} bucket={bucket} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={acceptedSet.has(fingerprint) || pilotState?.[source.id]?.phase === 'done'} busy={busy} connected={connected && !connection.busy}
         sendStatus={sendStatus[source.id]} waitingSince={awaiting[source.id]?.sentAt} onResend={() => sendAsk([source.id])}
         onRetry={() => startCollection({ codes: [source.id], retry: true })}
         onOpen={() => openInDuoke(source.id)} opening={openingId === source.id} canOpen={canOpen}
         expanded={expandedIds.has(source.id)} onToggle={() => toggleExpanded(source.id)}
         onSelect={() => setDraft(current => ({ ...current, selected: dict({ ...current.selected, [source.id]: !current.selected[source.id] }) }))}
         onEdit={(index, field, value) => editOrder(source, names => names.map((entry, i) => i === index ? { ...entry, [field]: value } : entry))}
-        onAddName={() => {
-          // Keep the card mounted when the first typed character moves an order
-          // from Sem nomes/Falhas into Com nomes.
-          setFilter('all'); setReviewPage(Math.floor(draft.collected.findIndex(order => order.id === source.id) / PAGE_SIZE));
-          editOrder(source, names => [...names, { name: '', quantity: null, evidence: '' }]);
-        }}
+        // The row is expanded, so it stays in view even when the new name moves it to another tab.
+        onAddName={() => editOrder(source, names => [...names, { name: '', quantity: null, evidence: '' }])}
         onRemoveName={index => editOrder(source, names => names.filter((_, i) => i !== index))}
-        onReview={() => setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, [source.id]: current.reviewed[source.id] === fingerprint ? '' : fingerprint }) }))} />;
-    })}</ul> : <div className="lapis-empty"><span aria-hidden="true">✎</span><strong>As conversas começam aqui</strong><p>Cole os códigos dos pedidos ou importe um arquivo para preparar a revisão.</p></div>}
-    <footer className="lapis-bottom-bar"><p>{saved ? 'Rascunho mantido nesta sessão por até 8 horas.' : 'Rascunho disponível apenas enquanto esta tela estiver aberta.'}<br /><span>Confira cada pedido para liberar sua cartela.</span></p><button type="button" className="lapis-primary" disabled={busy || !readyOrders.length || typeof onAddOrders !== 'function'} onClick={addToQueue}>Adicionar à fila{readyOrders.length ? ` · ${readyOrders.length} cartela${readyOrders.length > 1 ? 's' : ''}` : ''} <span aria-hidden="true">→</span></button></footer>
+        onReview={() => { if (draft.reviewed[source.id] === fingerprint) setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, [source.id]: '' }) })); else queueOne(source.id); }} />;
+    })}</ul> : <div className="lapis-empty"><span aria-hidden="true">✎</span><strong>As conversas começam aqui</strong><p>Cole os códigos dos pedidos ou importe um arquivo. Com o piloto ligado, os pedidos que ele acompanha aparecem aqui também.</p></div>}
+    <footer className="lapis-bottom-bar"><p>{saved ? 'Rascunho mantido nesta sessão por até 8 horas.' : 'Rascunho disponível apenas enquanto esta tela estiver aberta.'}<br /><span>Marque Conferi para mandar o pedido à fila de impressão.</span></p><button type="button" className="lapis-primary" disabled={busy || !readyOrders.length || typeof onAddOrders !== 'function'} onClick={addToQueue}>Adicionar à fila{readyOrders.length ? ` · ${readyOrders.length} cartela${readyOrders.length > 1 ? 's' : ''}` : ''} <span aria-hidden="true">→</span></button></footer>
   </section>;
 }

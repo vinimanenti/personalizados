@@ -158,3 +158,10 @@ test('orders queued by hand become done with their names', () => {
   assert.equal(byHand.missing, undefined);
   assert.deepEqual(markDone(s, ['R'], { now: NOW }).R.review, { names: [{ name: 'Ana', quantity: 50 }], reason: '' }, 'keeps the suggested names without a correction');
 });
+
+test('Telegram summary leaves out the queue count when nothing was queued and carries the note', () => {
+  const text = formatCycleMessage({ at: NOW, asked: 1, awaitingCount: 2, note: '3 pedidos novos prontos para conferir no Studio.' });
+  assert.doesNotMatch(text, /Na fila/u);
+  assert.match(text, /3 pedidos novos prontos para conferir/u);
+  assert.match(text, /cobrados agora: 1 · aguardando cliente: 2/u);
+});
