@@ -1,5 +1,6 @@
 import { parseOrderCodes } from '../../shared/lapis.mjs';
 import { MAX_SEND_ORDERS, validateAskMessage } from '../../shared/lapis-autopilot.mjs';
+import { cleanItems } from '../../shared/lapis-cartelas.mjs';
 
 // One extension job at a time. The UI owns the encompassing batch and keeps
 // partial results even if this coordinator is cancelled or loses its connection.
@@ -51,7 +52,8 @@ export function createCollectionRun({ codes, send, makeId, onOrder = () => {}, o
         if (!order || !active.codes.has(order.id) || active.seen.has(order.id) ||
           !['collected', 'not_found', 'error'].includes(order.status) || typeof order.text !== 'string' || order.text.length > 12000 ||
           (order.error !== undefined && typeof order.error !== 'string')) return;
-        const safeOrder = { id: order.id, status: order.status, text: order.text, ...(order.error ? { error: order.error.slice(0, 300) } : {}) };
+        const items = order.status === 'collected' ? cleanItems(order.items) : undefined;
+        const safeOrder = { id: order.id, status: order.status, text: order.text, ...(order.error ? { error: order.error.slice(0, 300) } : {}), ...(items ? { items } : {}) };
         active.seen.add(order.id); received.set(order.id, safeOrder);
         onOrder(safeOrder); onProgress({ completed: received.size, total: ids.length });
         if (!cancelling) arm();

@@ -30,6 +30,16 @@
   const QUOTE = '.quote_content_front_block';
   const SHOP_MESSAGE = '.message_main > li.rt';
   const MAX_MESSAGE = 500;
+  // Order card in the Duoke side panel (ai.duoke.com, 11/2026): one block per product
+  // with title, variation, SKU and "x 1". Read only, so the Studio can count cartelas.
+  const ORDER_CARD = '.order_item';
+  const ORDER_CARD_TITLE = '.order_item_title';
+  const PRODUCT = '.order_item_products_item';
+  const PRODUCT_TITLE = '.product_url';
+  const PRODUCT_VARIATION = '.order_item_products_item_info_variation_name span';
+  const PRODUCT_SKU = '.order_item_products_item_info_sku span';
+  const PRODUCT_QTY = '.product_other_info .clr_gy';
+  const MAX_ITEMS = 20;
   const CANCELLED = 'Coleta cancelada.';
   function deepQuery(root, selector, onRoot = () => {}) {
     const results = [];
@@ -275,7 +285,23 @@
       assertRunning(signal);
       if (!headersFor(code).length) throw new Error('A conversa mudou durante a coleta.');
       // Collected with no text: the buyer has not written yet, so there is no name to extract.
-      return { id: code, status: 'collected', text: empty ? '' : extractText(code) };
+      const items = itemsFor(code);
+      return { id: code, status: 'collected', text: empty ? '' : extractText(code), ...(items ? { items } : {}) };
+    }
+    // Products of this exact order, or null when the order card is not on screen.
+    function itemsFor(code) {
+      const card = query(ORDER_CARD).find(node => visible(node) && within(node, ORDER_CARD_TITLE).some(title => hasExactCode(nodeText(title), code)));
+      if (!card) return null;
+      const value = (root, selector, label) => {
+        const node = within(root, selector)[0];
+        if (!node) return '';
+        const raw = node.getAttribute?.('title') || nodeText(node).replace(label, '');
+        return String(raw).replace(/\s+/g, ' ').trim().slice(0, 200);
+      };
+      return within(card, PRODUCT).slice(0, MAX_ITEMS).map(node => {
+        const qty = /x\s*(\d{1,2})\b/i.exec(within(node, PRODUCT_QTY).map(nodeText).join(' '));
+        return { title: value(node, PRODUCT_TITLE, ''), variation: value(node, PRODUCT_VARIATION, /^[^：:]*[：:]/), sku: value(node, PRODUCT_SKU, /^[^：:]*[：:]/), quantity: qty ? Number(qty[1]) : 1 };
+      }).filter(item => item.title || item.sku);
     }
     async function run(codes, { signal, onProgress = async () => {} } = {}) {
       const uniqueCodes = [...new Set(codes)];

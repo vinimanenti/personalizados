@@ -212,6 +212,33 @@ test('fresh result waits for exact conversation and delayed messages, deduplicat
   assert.equal(summary.orders[0].text.match(/Observação:/g).length, 1);
   assert.ok(f.time() >= 80); assert.equal(progress[0].completed, 1);
 });
+test('reads the products of the exact order card (ai.duoke.com) so the Studio can count cartelas', async () => {
+  const f = fixture();
+  const product = (title, variation, sku, qty) => { const node = new Node(title); node.routes = new Map([
+    ['.product_url', [new Node(` ${title}`, { title })]],
+    ['.order_item_products_item_info_variation_name span', [new Node(`Variação：${variation}`, { title: variation })]],
+    ['.order_item_products_item_info_sku span', [new Node(`SKU：${sku}`)]],
+    ['.product_other_info .clr_gy', [new Node(`x ${qty}`)]]]); return node; };
+  const card = (code, products) => { const node = new Node(code); node.routes = new Map([['.order_item_title', [new Node(code)]], ['.order_item_products_item', products]]); return node; };
+  f.search.onClick = () => f.after(10, () => f.result('260123ABC', () => {
+    f.conversation('260123ABC', 'Nome: Ana');
+    f.set('.order_item', [card('OTHER99999', [product('Caneca', 'Azul', 'CANECA', 1)]), card('260123ABC', [
+      product('150 Etiquetas Escolares Personalizadas para Lápis', 'Adesivo Transparente', 'LAPIS-TRANSPARENTE', 1),
+      product('150 Etiquetas Escolares Personalizadas para Lápis', 'Adesivo DTF UV PRETO', 'DTF-UV-LAPIS-PRETO', 2)])]);
+  }));
+  const [order] = (await f.collector.run(['260123ABC'])).orders;
+  assert.deepEqual(plain(order.items), [
+    { title: '150 Etiquetas Escolares Personalizadas para Lápis', variation: 'Adesivo Transparente', sku: 'LAPIS-TRANSPARENTE', quantity: 1 },
+    { title: '150 Etiquetas Escolares Personalizadas para Lápis', variation: 'Adesivo DTF UV PRETO', sku: 'DTF-UV-LAPIS-PRETO', quantity: 2 }]);
+});
+
+test('without the order card the collection still works and carries no items', async () => {
+  const f = fixture();
+  f.search.onClick = () => f.after(10, () => f.result('260123ABC', () => f.conversation('260123ABC', 'Nome: Ana')));
+  const [order] = (await f.collector.run(['260123ABC'])).orders;
+  assert.equal(order.status, 'collected'); assert.equal(order.items, undefined);
+});
+
 test('matching header with unchanged messages cannot validate the previous conversation', async () => {
   const f = fixture(); f.conversation('OLD99999', 'Nome antigo');
   f.search.onClick = () => f.result('260123ABC', () => f.set(S.header, [new Node('Pedido 260123ABC')]));

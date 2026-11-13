@@ -8,6 +8,8 @@ import { mergeLabelCodes } from '../../shared/shopee-label.mjs';
 import { CYCLE_MINUTES, DEFAULT_CYCLE_MINUTES, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, expireState, formatCycleMessage, isDue,
   markDone, normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../../shared/lapis-continuous.mjs';
 import { createAutopilotClient, resolveAutopilotEndpoint } from '../lib/lapis-autopilot-api.mjs';
+import { orderRevision } from '../lib/lapis-queue.mjs';
+import { MAX_CARTELAS, assignCartelas, cartelaError, cartelaOrders, cleanItems, itemPlan, unassign } from '../../shared/lapis-cartelas.mjs';
 import './LapisImport.css';
 
 const dict = value => Object.assign(Object.create(null), value);
@@ -71,7 +73,13 @@ function pilotDetail(entry) {
   return 'Será lido no próximo ciclo.';
 }
 const requestId = () => globalThis.crypto?.randomUUID?.() || `lapis-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const revision = order => JSON.stringify([order.id, order.names.map(({ name, quantity }) => [name, quantity])]);
+// Fingerprint of what the operator approved, including how the names are split in cartelas.
+const revision = order => JSON.stringify([order.id, order.names.map(({ name, quantity, cartela }) => [name, quantity, cartela ?? null]), order.cartelas ?? null]);
+// Cartelas of an order: the operator's choice, else what the Duoke items say.
+const cartelaOptions = (source, result, shipDate = '') => {
+  const plan = itemPlan(source?.items);
+  return { count: Math.min(MAX_CARTELAS, result?.cartelas || plan.cartelas), materials: plan.materials, shipDate, plan };
+};
 const post = (type, id, extra = {}) => window.postMessage({ source: 'sticker-studio', version: 1, requestId: id, type, ...extra }, window.location.origin);
 
 function draftKey() {
@@ -127,7 +135,13 @@ function readDraft(key) {
       if (!order || typeof order.id !== 'string' || typeof order.text !== 'string' || !['collected', 'not_found', 'error'].includes(order.status)) return EMPTY;
       const result = Object.hasOwn(d.results, order.id) ? d.results[order.id] : null;
       if (result && (result.id !== order.id || !['found', 'not_found', 'review'].includes(result.status) || typeof result.reason !== 'string' || !Array.isArray(result.names) || result.names.some(n => !n || typeof n.name !== 'string' || typeof n.evidence !== 'string' || (n.quantity !== null && !Number.isFinite(n.quantity))))) return EMPTY;
-      if (result) result.text = order.text;
+      if (result) {
+        result.text = order.text;
+        if (result.cartelas !== undefined && !(Number.isInteger(result.cartelas) && result.cartelas >= 1 && result.cartelas <= MAX_CARTELAS)) delete result.cartelas;
+        for (const entry of result.names) if (entry.cartela !== undefined && !Number.isInteger(entry.cartela)) delete entry.cartela;
+      }
+      const items = cleanItems(order.items);
+      if (items) order.items = items; else delete order.items;
     }
     const knownIds = new Set(d.collected.map(order => order.id));
     if (Object.keys(d.results).some(id => !knownIds.has(id))) return EMPTY;
@@ -142,18 +156,17 @@ function checkImportSize(draft, orders) {
   if (new Set([...draft.collected.map(order => order.id), ...orders.map(order => order.id)]).size > 500) throw new Error('O limite é de 500 pedidos por revisão. Exporte ou limpe os pedidos atuais antes de importar mais.');
 }
 
-function queueError(order) {
+function queueError(order, source) {
   if (!order || !order.names.length) return 'Adicione pelo menos um nome para montar a cartela.';
-  try { toLabelFields({ ...order, status: 'found' }); return ''; }
-  catch (error) { return error.message; }
+  return cartelaError({ ...order, status: 'found' }, cartelaOptions(source, order));
 }
 
 const ROW_ICONS = { ok: '✓', names: '●', alert: '!', error: '✕', missing: '?', muted: '○', wait: '…' };
 
 // One compact row per order (GitHub-style list). The row shows status, code and a
 // one-line summary with the quick actions; it expands to edit names and read the conversation.
-function OrderReview({ bucket, source, result, extractionError, selected, reviewed, accepted, busy, expanded, onToggle, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
-  const validation = queueError(result);
+function OrderReview({ bucket, plan, count, onCartelas, onCartela, source, result, extractionError, selected, reviewed, accepted, busy, expanded, onToggle, onSelect, onEdit, onAddName, onRemoveName, onReview, onRetry, onOpen, opening, canOpen, connected, sendStatus, waitingSince, onResend }) {
+  const validation = queueError(result, source);
   const canExtract = source.status === 'collected' && source.text.trim() && source.text.length <= 12000;
   const named = hasNames(result);
   const doubt = named && (validation || bucket === 'duvida');
@@ -163,14 +176,25 @@ function OrderReview({ bucket, source, result, extractionError, selected, review
   const failure = source.error || extractionError || (source.text.length > 12000 ? `Conversa com ${source.text.length.toLocaleString('pt-BR')} caracteres (máximo 12.000).` : '');
   const summary = named ? result.names.map(entry => entry.quantity ? `${entry.name || '(sem nome)'} (${entry.quantity})` : entry.name || '(sem nome)').join(', ')
     : failure || (sendStatus ? `${SEND_LABELS[sendStatus.status]}${sendStatus.error ? `: ${sendStatus.error}` : ''}` : waitingSince ? `Cliente cobrado ${sinceText(waitingSince)}` : result?.reason || status);
-  let quantities = [];
-  if (!validation) quantities = toLabelFields({ ...result, status: 'found' }).map(field => field.qty);
+  const multi = count > 1;
+  const shown = named && multi ? assignCartelas(result.names, count) : result?.names || [];
+  // Auto quantities per name, and one summary line per cartela.
+  let quantities = [], groups = [];
+  if (!validation && named) {
+    const orders = cartelaOrders({ ...result, status: 'found' }, { count, materials: plan.materials });
+    groups = orders.map(order => ({ order, fields: toLabelFields(order) }));
+    const queues = groups.map(group => group.fields.map(field => field.qty));
+    quantities = shown.map(entry => (multi ? queues[entry.cartela - 1] : queues[0])?.shift());
+  }
   return <li className={`lapis-row is-${tone}${expanded ? ' is-open' : ''}`}>
     <div className="lapis-row-main">
       <span className="lapis-row-select">{canExtract && !accepted ? <input type="checkbox" checked={Boolean(selected)} disabled={busy} onChange={onSelect} aria-label={`Extrair ${source.id}`} title="Marcar para extrair" /> : null}</span>
       <span className="lapis-row-icon" aria-hidden="true">{ROW_ICONS[tone]}</span>
       <button type="button" className="lapis-row-title" onClick={onToggle} aria-expanded={Boolean(expanded)} title={expanded ? 'Fechar detalhes' : 'Abrir detalhes'}>
-        <span className="lapis-row-line"><span className="lapis-row-code">{source.id}</span><span className="lapis-row-status">{status}</span></span>
+        <span className="lapis-row-line"><span className="lapis-row-code">{source.id}</span><span className="lapis-row-status">{status}</span>
+          {multi ? <span className="lapis-row-badge">{count} cartelas</span> : null}
+          {plan.others.length ? <span className="lapis-row-badge is-alert">+ outro produto</span> : null}
+          {plan.known && !plan.others.length && new Set(plan.materials).size > 1 ? <span className="lapis-row-badge is-alert">materiais diferentes</span> : null}</span>
         <span className={`lapis-row-summary${failure && !named ? ' is-error' : ''}`}>{summary}{named && result.reason ? <em> · {result.reason}</em> : null}</span>
       </button>
       <span className="lapis-row-actions">
@@ -185,10 +209,15 @@ function OrderReview({ bucket, source, result, extractionError, selected, review
         {sendStatus.status === 'failed' ? <> <button type="button" className="lapis-link-button" disabled={busy || !connected} onClick={onResend}>Tentar de novo</button></> : null}</p>
         : waitingSince ? <p className="lapis-reason">Cliente cobrado {sinceText(waitingSince)}. Use Verificar respostas para buscar o nome.</p> : null}
       {failure ? <p className="lapis-error">{failure}</p> : null}
+      {plan.alerts.map(alert => <p className="lapis-items-alert" key={alert}>⚠ {alert}</p>)}
+      {plan.known ? <ul className="lapis-items" aria-label="Itens do pedido na Shopee">{source.items.map((item, index) => <li key={index}><strong>x{item.quantity}</strong> {item.variation || item.title}{item.sku ? <code>{item.sku}</code> : null}</li>)}</ul> : null}
       {result?.reason ? <p className="lapis-reason">{result.reason}</p> : null}
-      {result?.names.map((entry, index) => <div className="lapis-name" key={index}>
+      {named && !accepted ? <label className="lapis-cartelas" title="Cada cartela tem até 150 etiquetas e 3 nomes">Cartelas<input type="number" min="1" max={MAX_CARTELAS} step="1" value={count} disabled={busy} onChange={event => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= MAX_CARTELAS) onCartelas(value); }} />
+        <small>{plan.known ? `${plan.cartelas} pelo pedido da Shopee` : 'até 150 etiquetas e 3 nomes cada'}</small></label> : null}
+      {shown.map((entry, index) => <div className={`lapis-name${multi ? ' has-cartela' : ''}`} key={index}>
         <label>Nome na etiqueta<input value={entry.name} maxLength={200} disabled={busy} onChange={event => onEdit(index, 'name', event.target.value)} /></label>
         <label className="lapis-quantity">Quantidade<input type="number" min="1" max="150" step="1" value={entry.quantity ?? ''} placeholder={quantities[index] ? `Auto · ${quantities[index]}` : 'Auto'} disabled={busy} onChange={event => onEdit(index, 'quantity', event.target.value === '' ? null : Number(event.target.value))} /></label>
+        {multi ? <label className="lapis-quantity">Cartela<select value={entry.cartela} disabled={busy} onChange={event => onCartela(index, Number(event.target.value))}>{Array.from({ length: count }, (_, i) => <option key={i} value={i + 1}>{i + 1}{plan.materials[i] ? ` · ${plan.materials[i]}` : ''}</option>)}</select></label> : null}
         <button className="lapis-icon-button" disabled={busy} type="button" onClick={() => onRemoveName(index)} aria-label={`Remover nome ${index + 1}`} title="Remover nome">×</button>
         {entry.evidence ? <p className="lapis-evidence">“{entry.evidence}”</p> : null}
       </div>)}
@@ -197,7 +226,8 @@ function OrderReview({ bucket, source, result, extractionError, selected, review
         {accepted ? <span className="lapis-reason">Revisão adicionada à fila.</span> : null}
       </div>
       {result?.names.length && validation ? <p className="lapis-error">{validation}</p> : null}
-      {!validation && !accepted ? <p className="lapis-allocation">Uma cartela · {quantities.reduce((sum, qty) => sum + qty, 0)} etiquetas{result.names.some(entry => entry.quantity === null) ? ' · quantidades em branco distribuídas automaticamente' : ''}</p> : null}
+      {!validation && !accepted && groups.length === 1 ? <p className="lapis-allocation">Uma cartela · {quantities.reduce((sum, qty) => sum + (qty || 0), 0)} etiquetas{result.names.some(entry => entry.quantity === null) ? ' · quantidades em branco distribuídas automaticamente' : ''}</p> : null}
+      {!validation && !accepted && groups.length > 1 ? <ul className="lapis-allocation lapis-cartela-list">{groups.map(({ order, fields }, i) => <li key={i}><strong>Cartela {order.id.slice(source.id.length + 3)}</strong> {fields.map(field => `${field.nome} (${field.qty})`).join(', ')}</li>)}</ul> : null}
       <details className="lapis-source"><summary>Ver conversa de origem{source.text ? ` · ${source.text.length.toLocaleString('pt-BR')} caracteres` : ''}</summary><pre>{source.text || 'Nenhuma conversa foi coletada para este pedido.'}</pre></details>
     </div> : null}
   </li>;
@@ -400,7 +430,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       const requested = codes || parseOrderCodes(draft.codes);
       if (cycle) {
         // Cycles run all day: drop orders already in the queue so the 500-order review limit is not reached.
-        const queuedIds = new Set(base.collected.filter(order => base.results[order.id] && acceptedSet.has(revision(base.results[order.id])) && !requested.includes(order.id)).map(order => order.id));
+        const queuedIds = new Set(base.collected.filter(order => base.results[order.id] && isAccepted(base.results[order.id], order) && !requested.includes(order.id)).map(order => order.id));
         if (queuedIds.size && base.collected.length + requested.length > 400) {
           base = { ...base, collected: base.collected.filter(order => !queuedIds.has(order.id)),
             results: dict(Object.fromEntries(Object.entries(base.results).filter(([id]) => !queuedIds.has(id)))) };
@@ -409,7 +439,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         // Orders the operator already named in this screen are theirs: out of the cycle.
         const named = requested.filter(id => hasNames(base.results[id]));
         if (named.length) setPilotState(current => applyCycle(current, { ids: named,
-          classified: Object.fromEntries(named.map(id => [id, acceptedSet.has(revision(base.results[id])) ? 'auto' : 'review'])) }).state);
+          classified: Object.fromEntries(named.map(id => [id, isAccepted(base.results[id]) ? 'auto' : 'review'])) }).state);
       }
       const plan = planBatch(base, requested, { retry });
       if (autopilot && !cycle && pilotActive) {
@@ -542,8 +572,11 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   };
 
   const acceptedSet = useMemo(() => new Set(queuedRevisions), [queuedRevisions]);
-  const selectedOrders = useMemo(() => draft.collected.filter(order => draft.selected[order.id] && canExtract(order) && !(draft.results[order.id] && acceptedSet.has(revision(draft.results[order.id])))), [draft.collected, draft.selected, draft.results, acceptedSet]);
-  const readyOrders = useMemo(() => Object.values(draft.results).filter(order => draft.reviewed[order.id] === revision(order) && !acceptedSet.has(revision(order)) && !queueError(order)), [draft.results, draft.reviewed, acceptedSet]);
+  const sourceById = useMemo(() => new Map(draft.collected.map(order => [order.id, order])), [draft.collected]);
+  // In the queue when every cartela of the order is there.
+  const isAccepted = (result, source = sourceById.get(result?.id)) => Boolean(result) && cartelaOrders(result, cartelaOptions(source, result)).every(order => acceptedSet.has(orderRevision(order)));
+  const selectedOrders = useMemo(() => draft.collected.filter(order => draft.selected[order.id] && canExtract(order) && !(draft.results[order.id] && isAccepted(draft.results[order.id], order))), [draft.collected, draft.selected, draft.results, acceptedSet, sourceById]);
+  const readyOrders = useMemo(() => Object.values(draft.results).filter(order => draft.reviewed[order.id] === revision(order) && !isAccepted(order) && !queueError(order, sourceById.get(order.id))), [draft.results, draft.reviewed, acceptedSet, sourceById]);
   const groups = useMemo(() => {
     const grouped = { all: draft.collected, names: [], missing: [], errors: [], waiting: [], ask: [], awaiting: [] };
     for (const source of draft.collected) {
@@ -569,7 +602,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     for (const source of draft.collected) {
       known.add(source.id);
       const result = draft.results[source.id];
-      const accepted = Boolean(result && acceptedSet.has(revision(result))) || pilotEntries[source.id]?.phase === 'done';
+      const accepted = isAccepted(result, source) || pilotEntries[source.id]?.phase === 'done';
       rows.push({ id: source.id, source, bucket: rowBucket(source, result, draft.extractionErrors[source.id], accepted, Boolean(awaiting[source.id])) });
     }
     const extra = new Map();
@@ -637,7 +670,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   // operator to confirm the ask message. Nothing is sent from here.
   const finishAutopilot = async (ids, sources, extracted, { cycle = false, hashes = new Map() } = {}) => {
     const plan = planAutopilot({ ids, sources, results: extracted.results, extractionErrors: extracted.errors,
-      isQueued: order => acceptedSet.has(revision(order)), awaiting, shipDates: draft.shipDates });
+      isQueued: order => isAccepted(order, sources.get(order.id)), awaiting, shipDates: draft.shipDates });
     setAwaiting(plan.awaiting);
     // Nothing goes to the print queue on its own: orders with clear names wait in the
     // review list until the operator ticks Conferi (which queues that order at once).
@@ -648,6 +681,11 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       classified[id] = 'review';
       const result = results.get(id);
       if (result && !result.reason) results.set(id, { ...result, reason: READY_REASON });
+    }
+    // Several cartelas or another product: the alert becomes the reason, so the pilot list and Telegram show it.
+    for (const [id, result] of results) {
+      const alerts = itemPlan(sources.get(id)?.items).alerts;
+      if (alerts.length && hasNames(result)) results.set(id, { ...result, reason: [...alerts, result.reason === READY_REASON ? '' : result.reason].filter(Boolean).join(' · ') });
     }
     let pilotOut = null;
     if (pilotStateRef.current && pilot.enabled) {
@@ -668,13 +706,13 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     if (cycle) {
       cycleFailureAlerted.current = false;
       setPilotInfo(current => ({ ...current, lastRun: Date.now(), summary, error: current.error.startsWith('Ciclo:') ? '' : current.error }));
-    } else { setFilter(plan.askable.length ? 'ask' : 'all'); setReviewPage(0); }
+    } else { setFilter(plan.askable.length ? 'aguardando' : 'all'); setReviewPage(0); }
     // Telegram only when something needs the operator; quiet cycles stay quiet.
     // Only orders with doubts are listed by name; ready ones are a count, so the chat is not flooded.
     const doubtful = pilotOut ? pilotOut.newReview.filter(id => !readyIds.has(id)) : [];
     const newReady = pilotOut ? pilotOut.newReview.filter(id => readyIds.has(id)).length : 0;
     if (pilotOut && (doubtful.length || newReady || pilotOut.newFailed.length)) {
-      const review = doubtful.map(id => ({ id, names: extracted.results.get(id)?.names || [], reason: extracted.results.get(id)?.reason || '' }));
+      const review = doubtful.map(id => ({ id, names: results.get(id)?.names || [], reason: results.get(id)?.reason || '' }));
       notifyTelegram(formatCycleMessage({ queued: 0, review, asked: pilotOut.askIds.length, failed: pilotOut.newFailed,
         note: newReady ? `${plural(newReady, 'pedido novo pronto', 'pedidos novos prontos')} para conferir no Studio.` : '',
         awaitingCount: stateList(pilotOut.state).filter(entry => entry.phase === 'awaiting').length }));
@@ -710,14 +748,16 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       setNotice(`Cobrança concluída: ${count('sent')} enviada${count('sent') === 1 ? '' : 's'}, ${count('unconfirmed')} sem confirmação, ${count('failed')} não enviada${count('failed') === 1 ? '' : 's'}` +
         (summary.notAttempted.length ? `, ${summary.notAttempted.length} não tentada${summary.notAttempted.length === 1 ? '' : 's'}` : '') + '. Use Verificar respostas quando os clientes responderem.');
       if (summary.error) setError(summary.error);
-      if (!automatic && count('sent') + count('unconfirmed')) setFilter('awaiting');
+      if (!automatic && count('sent') + count('unconfirmed')) setFilter('aguardando');
     } catch (failure) { reportFailure(failure); }
     finally { finishWorkflow(controller); }
   };
 
-  const editOrder = (source, transform) => setDraft(current => {
-    const original = current.results[source.id] || { id: source.id, names: [], status: 'review', reason: '', text: source.text };
-    const next = { ...original, names: transform(original.names), status: 'review' };
+  // Edits work on the names as shown: with several cartelas every name already has its cartela.
+  const editOrder = (source, transform, patch = {}) => setDraft(current => {
+    const original = { ...(current.results[source.id] || { id: source.id, names: [], status: 'review', reason: '', text: source.text }), ...patch };
+    const count = cartelaOptions(source, original).count;
+    const next = { ...original, names: transform(assignCartelas(original.names, count)), status: 'review' };
     const reviewed = dict(current.reviewed), extractionErrors = dict(current.extractionErrors);
     delete reviewed[source.id]; delete extractionErrors[source.id];
     return { ...current, results: dict({ ...current.results, [source.id]: next }), reviewed, extractionErrors };
@@ -727,14 +767,14 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     if (enqueuing.current || !readyOrders.length) return;
     enqueuing.current = true; setQueueBusy(true); setError('');
     try {
-      const orders = readyOrders.map(order => ({ ...order, status: 'found', names: order.names.map(entry => ({ ...entry })), shipDate: draft.shipDates[order.id] || '' }));
+      const orders = readyOrders.flatMap(order => cartelaOrders({ ...order, status: 'found' }, cartelaOptions(sourceById.get(order.id), order, draft.shipDates[order.id] || '')));
       orders.forEach(toLabelFields);
       await onAddOrders(orders);
       if (pilotStateRef.current && pilot.enabled) {
         // A queued order is answered: it leaves the pilot and the awaiting list, or the mirror would bring it back.
-        const ids = orders.map(order => order.id);
+        const ids = readyOrders.map(order => order.id);
         setAwaiting(current => Object.fromEntries(Object.entries(current).filter(([id]) => !ids.includes(id))));
-        const namesById = new Map(orders.map(order => [order.id, order.names]));
+        const namesById = new Map(readyOrders.map(order => [order.id, unassign(order.names)]));
         setPilotState(current => markDone(current, ids, { namesById }));
       }
       setNotice(`${orders.length} cartela${orders.length === 1 ? '' : 's'} adicionada${orders.length === 1 ? '' : 's'} à fila de impressão.`);
@@ -746,19 +786,20 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   // On failure it stays ticked, so the bottom button can retry.
   const queueOne = async id => {
     const result = draft.results[id];
-    if (!result || queueError(result) || enqueuing.current || typeof onAddOrders !== 'function') return;
+    const source = sourceById.get(id);
+    if (!result || queueError(result, source) || enqueuing.current || typeof onAddOrders !== 'function') return;
     const fingerprint = revision(result);
     setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, [id]: fingerprint }) }));
     enqueuing.current = true; setQueueBusy(true); setError('');
     try {
-      const order = { ...result, status: 'found', names: result.names.map(entry => ({ ...entry })), shipDate: draft.shipDates[id] || '' };
-      toLabelFields(order);
-      await onAddOrders([order]);
+      const orders = cartelaOrders({ ...result, status: 'found' }, cartelaOptions(source, result, draft.shipDates[id] || ''));
+      orders.forEach(toLabelFields);
+      await onAddOrders(orders);
       if (pilotStateRef.current && pilot.enabled) {
         setAwaiting(current => { const next = { ...current }; delete next[id]; return next; });
-        setPilotState(current => markDone(current, [id], { namesById: new Map([[id, order.names]]) }));
+        setPilotState(current => markDone(current, [id], { namesById: new Map([[id, unassign(result.names)]]) }));
       }
-      if (mounted.current) setNotice(`Pedido ${id} conferido e adicionado à fila de impressão.`);
+      if (mounted.current) setNotice(`Pedido ${id} conferido e adicionado à fila de impressão${orders.length > 1 ? ` (${orders.length} cartelas)` : ''}.`);
     } catch (failure) { if (mounted.current) setError(`O pedido ${id} foi conferido, mas não entrou na fila: ${failure.message || 'erro desconhecido'}. Use Adicionar à fila para tentar de novo.`); }
     finally { enqueuing.current = false; if (mounted.current) setQueueBusy(false); }
   };
@@ -946,7 +987,10 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         onOpen={() => openInDuoke(id)} onRetry={() => startCollection({ codes: [id], retry: true })} />;
       const result = draft.results[source.id];
       const fingerprint = result ? revision(result) : '';
-      return <OrderReview key={source.id} bucket={bucket} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={acceptedSet.has(fingerprint) || pilotState?.[source.id]?.phase === 'done'} busy={busy} connected={connected && !connection.busy}
+      const options = cartelaOptions(source, result);
+      return <OrderReview key={source.id} bucket={bucket} plan={options.plan} count={options.count} source={source} result={result} extractionError={draft.extractionErrors[source.id]} selected={draft.selected[source.id]} reviewed={draft.reviewed[source.id] === fingerprint} accepted={isAccepted(result, source) || pilotState?.[source.id]?.phase === 'done'}
+        onCartelas={value => editOrder(source, names => names, { cartelas: value, names: unassign(result.names) })}
+        onCartela={(index, value) => editOrder(source, names => names.map((entry, i) => i === index ? { ...entry, cartela: value } : entry))} busy={busy} connected={connected && !connection.busy}
         sendStatus={sendStatus[source.id]} waitingSince={awaiting[source.id]?.sentAt} onResend={() => sendAsk([source.id])}
         onRetry={() => startCollection({ codes: [source.id], retry: true })}
         onOpen={() => openInDuoke(source.id)} opening={openingId === source.id} canOpen={canOpen}

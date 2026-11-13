@@ -196,3 +196,19 @@
 .lapis-import .lapis-row-title.is-static { cursor: default; }
 @media (max-width: 640px) { .lapis-pilot-bar, .lapis-pilot-settings, .lapis-pilot-summary { margin-left: 16px; margin-right: 16px; } }
 
+
+/* Items read from the Duoke order panel and cartela split. */
+.lapis-row-badge { font-size: 9.5px; padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(128,151,255,.4); color: var(--lapis-blue); white-space: nowrap; }
+.lapis-row-badge.is-alert { border-color: rgba(242,194,120,.45); color: #f2c278; }
+.lapis-items-alert { font-size: 11px; line-height: 1.6; color: #f2c278; margin-bottom: 6px !important; }
+.lapis-items { list-style: none; margin: 0 0 10px; padding: 8px 10px; border: 1px solid var(--lapis-line); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--t1, #ededf1); }
+.lapis-items strong { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 6px; }
+.lapis-items code { margin-left: 8px; font-size: 10px; color: var(--lapis-muted); }
+.lapis-cartelas { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; color: var(--lapis-muted); margin-bottom: 4px; flex-wrap: wrap; }
+.lapis-import .lapis-cartelas input:not([type=checkbox]) { width: 64px; display: inline-block; padding: 6px 8px; margin: 0; }
+.lapis-cartelas small { font-size: 10px; }
+.lapis-name.has-cartela { grid-template-columns: minmax(0, 1fr) 96px 150px 22px; }
+.lapis-import .lapis-name select { margin-top: 5px; padding: 8px; }
+.lapis-cartela-list { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.lapis-cartela-list strong { color: var(--t1, #ededf1); font-weight: 600; margin-right: 6px; }
+@media (max-width: 680px) { .lapis-name.has-cartela { grid-template-columns: minmax(0, 1fr) 80px; } .lapis-name.has-cartela .lapis-icon-button { grid-column: 2; justify-self: end; } }

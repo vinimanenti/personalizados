@@ -78,7 +78,7 @@ async function handle(message, sender) {
       activeJob.completed = message.completed;
       activeJob.seen.add(order.id);
       await saveJob();
-      Object.assign(event, { completed: message.completed, total: activeJob.codes.length, order: { id: order.id, status: order.status, ...(sending ? {} : { text: order.text }), ...(typeof order.error === 'string' ? { error: order.error.slice(0, 300) } : {}) } });
+      Object.assign(event, { completed: message.completed, total: activeJob.codes.length, order: { id: order.id, status: order.status, ...(sending ? {} : { text: order.text }), ...(!sending && Array.isArray(order.items) && order.items.length <= 20 ? { items: order.items } : {}), ...(typeof order.error === 'string' ? { error: order.error.slice(0, 300) } : {}) } });
     } else if (message.type === 'COMPLETE') Object.assign(event, { completed: activeJob.completed, total: activeJob.codes.length, cancelled: Boolean(message.cancelled) });
     else event.error = activeJob.kind === 'send' ? 'O envio foi interrompido. Confira no Duoke os pedidos sem confirmação.' : 'A coleta foi interrompida. Conecte as abas novamente.';
     if (message.type !== 'PROGRESS') { activeJob = null; await saveJob(); }

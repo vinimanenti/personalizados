@@ -1,5 +1,6 @@
 import { toLabelFields } from './lapis.mjs';
 import { canExtract, hasNames } from './lapis-batch.mjs';
+import { itemPlan } from './lapis-cartelas.mjs';
 
 export const AUTOPILOT_DEFAULT_MESSAGE = 'Olá! Para personalizarmos seus lápis, pode nos enviar o nome que vai nas etiquetas? 😊';
 export const MAX_SEND_ORDERS = 100;
@@ -14,6 +15,8 @@ const SENT_STATES = new Set(['sent', 'unconfirmed']);
 export function classifyForAutopilot(source, result, { isQueued = () => false, extractionError } = {}) {
   if (hasNames(result)) {
     if (result.status !== 'found' || result.names.length > 3 || isQueued(result)) return 'review';
+    // Several cartelas, mixed materials or another product: the operator decides.
+    if (itemPlan(source?.items).alerts.length || result.cartelas > 1) return 'review';
     try { toLabelFields(result); } catch { return 'review'; }
     return 'auto';
   }
