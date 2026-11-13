@@ -25,6 +25,9 @@ A aba **Lápis** permite coletar conversas no Duoke por uma extensão de navegad
 extrair nomes pelo Gemini, revisar as quantidades e enviar os pedidos à fila de
 etiquetas ou exportar CSV. A API roda no servidor; a chave não vai para o site.
 
+O **Piloto contínuo** repete o processamento a cada ciclo, guarda o estado no
+Supabase e avisa no Telegram o que precisa de revisão.
+
 Veja [instalação e ativação](docs/duoke-gemini.md) e o
 [TXT de demonstração com dados fictícios](docs/examples/lapis-demo.txt).
 

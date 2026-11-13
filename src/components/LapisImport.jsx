@@ -5,6 +5,9 @@ import { extractOrders, resolveLapisEndpoint } from '../lib/lapis-api.mjs';
 import { createCollectionRun, createSendRun } from '../lib/lapis-collection.mjs';
 import { AUTOPILOT_DEFAULT_MESSAGE, MAX_ASK_MESSAGE, MAX_SEND_ORDERS, classifyForAutopilot, loadAwaiting, planAsk, planAutopilot, recordSends, saveAwaiting, validateAskMessage } from '../../shared/lapis-autopilot.mjs';
 import { mergeLabelCodes } from '../../shared/shopee-label.mjs';
+import { CYCLE_MINUTES, DEFAULT_CYCLE_MINUTES, addToInbox, applyCycle, awaitingFromState, conversationHash, cycleCodes, expireState, formatCycleMessage, isDue,
+  normalizeState, recordPilotSends, removeFromState, reusableResult, stateList, withAwaiting } from '../../shared/lapis-continuous.mjs';
+import { createAutopilotClient, resolveAutopilotEndpoint } from '../lib/lapis-autopilot-api.mjs';
 import './LapisImport.css';
 
 const dict = value => Object.assign(Object.create(null), value);
@@ -18,6 +21,23 @@ const ASK_MESSAGE_KEY = 'ss_lapis_ask_message_v1';
 const SEND_LABELS = { sent: 'Mensagem enviada', unconfirmed: 'Envio não confirmado — confira no Duoke', failed: 'Mensagem não enviada' };
 const EXPIRY = 8 * 60 * 60 * 1000;
 const endpoint = resolveLapisEndpoint(import.meta.env);
+const autopilotEndpoint = resolveAutopilotEndpoint(import.meta.env);
+const PILOT_KEY = 'ss_lapis_pilot_v1';
+const PILOT_TICK = 20000;
+// Duoke disconnected for this long while the pilot is on triggers one Telegram alert.
+const DISCONNECT_ALERT = 20 * 60 * 1000;
+const PILOT_OFF = { enabled: false, minutes: DEFAULT_CYCLE_MINUTES, autoAsk: false, telegram: false };
+
+// Per-computer switch: only the computer with the Duoke tab open should run cycles.
+function readPilotSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PILOT_KEY) || 'null');
+    if (!saved || typeof saved !== 'object') return PILOT_OFF;
+    return { enabled: saved.enabled === true, minutes: CYCLE_MINUTES.includes(saved.minutes) ? saved.minutes : DEFAULT_CYCLE_MINUTES,
+      autoAsk: saved.autoAsk === true, telegram: saved.telegram === true };
+  } catch { return PILOT_OFF; }
+}
+const timeText = at => new Date(at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 const requestId = () => globalThis.crypto?.randomUUID?.() || `lapis-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const revision = order => JSON.stringify([order.id, order.names.map(({ name, quantity }) => [name, quantity])]);
 const post = (type, id, extra = {}) => window.postMessage({ source: 'sticker-studio', version: 1, requestId: id, type, ...extra }, window.location.origin);
@@ -153,6 +173,68 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const [sendStatus, setSendStatus] = useState(dict);
   const job = useRef(null), extraction = useRef(null), workflow = useRef(null), mounted = useRef(false), pendingStatus = useRef(new Map()), statusDeadline = useRef(null), enqueuing = useRef(false);
   const busy = phase !== 'idle' || queueBusy || uploading;
+  const [pilot, setPilot] = useState(readPilotSettings);
+  // null while not loaded: no cycle runs without the shared state.
+  const [pilotState, setPilotStateValue] = useState(null);
+  const [pilotInfo, setPilotInfo] = useState({ lastRun: 0, summary: '', error: '', loading: false });
+  const pilotStateRef = useRef(null), pilotSaved = useRef(new Set()), pilotSaveTimer = useRef(null), lastCycle = useRef(NaN),
+    pendingAsk = useRef(null), disconnectedSince = useRef(0), disconnectAlerted = useRef(false), cycleFailureAlerted = useRef(false), tickRef = useRef(null);
+  const pilotActive = pilot.enabled && pilotState !== null;
+  const pilotClient = useMemo(() => createAutopilotClient({ endpoint: autopilotEndpoint, accessCode }), [accessCode]);
+  // The ref is read by cycle code that runs across renders; React state drives the UI.
+  const setPilotState = update => {
+    const next = typeof update === 'function' ? update(pilotStateRef.current) : update;
+    pilotStateRef.current = next; setPilotStateValue(next);
+    return next;
+  };
+  const notifyTelegram = async text => {
+    if (!pilot.telegram) return;
+    try { await pilotClient.notify(text); }
+    catch (failure) { if (mounted.current) setPilotInfo(current => ({ ...current, error: `Telegram: ${failure.message}` })); }
+  };
+
+  useEffect(() => {
+    try { localStorage.setItem(PILOT_KEY, JSON.stringify(pilot)); } catch { /* Storage unavailable. */ }
+  }, [pilot]);
+
+  // Loads the shared state once the pilot is on and the access code is known; the
+  // awaiting list of this computer is merged so nothing asked before is lost.
+  useEffect(() => {
+    if (!pilot.enabled || pilotStateRef.current || !accessCode.trim()) return;
+    let cancelled = false;
+    setPilotInfo(current => ({ ...current, loading: true, error: '' }));
+    pilotClient.load().then(entries => {
+      if (cancelled) return;
+      const loaded = normalizeState(entries);
+      pilotSaved.current = new Set(Object.keys(loaded));
+      const remote = awaitingFromState(loaded);
+      setPilotState(withAwaiting(loaded, { ...remote, ...awaiting }));
+      // The awaiting effect then mirrors any later local change into the state.
+      setAwaiting(current => ({ ...remote, ...current }));
+      setPilotInfo(current => ({ ...current, loading: false }));
+    }).catch(failure => { if (!cancelled) setPilotInfo(current => ({ ...current, loading: false, error: failure.message })); });
+    return () => { cancelled = true; };
+  }, [pilot.enabled, pilotClient]);
+
+  useEffect(() => {
+    if (pilotActive) setPilotState(current => current && withAwaiting(current, awaiting));
+  }, [awaiting, pilotActive]);
+
+  // Debounced write of the whole state; orders that left it are deleted remotely.
+  useEffect(() => {
+    if (pilotState === null) return;
+    clearTimeout(pilotSaveTimer.current);
+    pilotSaveTimer.current = setTimeout(() => {
+      const entries = stateList(pilotState);
+      const ids = new Set(entries.map(entry => entry.id));
+      const remove = [...pilotSaved.current].filter(id => !ids.has(id));
+      pilotClient.save(entries, remove).then(() => {
+        pilotSaved.current = ids;
+        if (mounted.current) setPilotInfo(current => current.error.startsWith('Estado:') ? { ...current, error: '' } : current);
+      }).catch(failure => { if (mounted.current) setPilotInfo(current => ({ ...current, error: `Estado: ${failure.message}` })); });
+    }, 1000);
+    return () => clearTimeout(pilotSaveTimer.current);
+  }, [pilotState, pilotClient]);
 
   useEffect(() => {
     if (!storageKey) return;
@@ -215,17 +297,38 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
     };
   }, []);
 
-  const startCollection = async ({ codes, retry = false, autopilot = false } = {}) => {
+  const startCollection = async ({ codes, retry = false, autopilot = false, cycle = false } = {}) => {
     if (workflow.current || busy) return;
     const controller = new AbortController();
     try {
-      const plan = planBatch(draft, codes || parseOrderCodes(draft.codes), { retry });
-      if (!plan.codes.length) { setNotice('Todos estes pedidos já têm nomes. Confira os resultados para adicionar à fila.'); return; }
+      let base = draft;
+      const requested = codes || parseOrderCodes(draft.codes);
+      if (cycle) {
+        // Cycles run all day: drop orders already in the queue so the 500-order review limit is not reached.
+        const queuedIds = new Set(base.collected.filter(order => base.results[order.id] && acceptedSet.has(revision(base.results[order.id])) && !requested.includes(order.id)).map(order => order.id));
+        if (queuedIds.size && base.collected.length + requested.length > 400) {
+          base = { ...base, collected: base.collected.filter(order => !queuedIds.has(order.id)),
+            results: dict(Object.fromEntries(Object.entries(base.results).filter(([id]) => !queuedIds.has(id)))) };
+          setDraft(base);
+        }
+        // Orders the operator already named in this screen are theirs: out of the cycle.
+        const named = requested.filter(id => hasNames(base.results[id]));
+        if (named.length) setPilotState(current => applyCycle(current, { ids: named,
+          classified: Object.fromEntries(named.map(id => [id, acceptedSet.has(revision(base.results[id])) ? 'auto' : 'review'])) }).state);
+      }
+      const plan = planBatch(base, requested, { retry });
+      if (autopilot && !cycle && pilotActive) {
+        const { added } = addToInbox(pilotStateRef.current, plan.codes);
+        setPilotState(current => addToInbox(current, plan.codes).state);
+        if (added) setPilotInfo(current => ({ ...current, summary: `${added} pedido${added === 1 ? ' entrou' : 's entraram'} no piloto contínuo.` }));
+      }
+      if (!plan.codes.length) { if (!cycle) setNotice('Todos estes pedidos já têm nomes. Confira os resultados para adicionar à fila.'); return; }
       if (!accessCode.trim()) throw new Error('Informe o código de acesso à extração antes de iniciar o lote.');
       if (plan.collect.length && (!connected || connection.busy)) throw new Error('Conecte as abas e aguarde a coleta atual antes de continuar.');
-      workflow.current = controller; setError(''); setReviewPage(0);
+      workflow.current = controller; setError('');
+      if (!cycle) setReviewPage(0);
       const sources = new Map(plan.sources.map(order => [order.id, order]));
-      const known = new Set(draft.collected.map(order => order.id));
+      const known = new Set(base.collected.map(order => order.id));
       setDraft(current => mergeCollected(current, plan.sources.filter(order => !known.has(order.id))));
       if (plan.collect.length) {
         setNotice('Coletando as conversas. A extração começa automaticamente ao concluir a coleta.');
@@ -241,12 +344,36 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         await run.start(); job.current = null;
       }
       if (controller.signal.aborted || !mounted.current) return;
-      const extractable = [...sources.values()].filter(canExtract);
+      let extractable = [...sources.values()].filter(canExtract);
       const extracted = { results: new Map(), errors: dict() };
+      const hashes = new Map();
+      if (pilotActive && autopilot) {
+        // Same conversation as the last no-name reading: reuse it instead of paying the AI again.
+        const reused = [];
+        for (const source of extractable) {
+          const hash = await conversationHash(source.text);
+          hashes.set(source.id, hash);
+          const result = cycle ? reusableResult(source, pilotStateRef.current?.[source.id], hash) : null;
+          if (result) { reused.push(result); extracted.results.set(source.id, result); }
+        }
+        if (reused.length) setDraft(current => {
+          const results = dict(current.results), selected = dict(current.selected);
+          for (const result of reused) { results[result.id] = result; selected[result.id] = false; }
+          return { ...current, results, selected };
+        });
+        extractable = extractable.filter(source => !extracted.results.has(source.id));
+      }
       if (extractable.length) await performExtraction(extractable, controller, extracted);
       else if (!autopilot) setNotice('Coleta concluída sem conversas disponíveis para extração. Veja Sem nomes e Falhas para refazer.');
-      if (autopilot && !controller.signal.aborted && mounted.current) await finishAutopilot(plan.codes, sources, extracted);
-    } catch (failure) { reportFailure(failure); }
+      if (autopilot && !controller.signal.aborted && mounted.current) await finishAutopilot(plan.codes, sources, extracted, { cycle, hashes });
+    } catch (failure) {
+      reportFailure(failure);
+      if (cycle && failure.name !== 'AbortError' && mounted.current) {
+        setPilotInfo(current => ({ ...current, error: `Ciclo: ${failure.message}` }));
+        // One alert per failure streak; a successful cycle re-arms it.
+        if (!cycleFailureAlerted.current) { cycleFailureAlerted.current = true; notifyTelegram(`Lápis · o ciclo do piloto falhou: ${failure.message}`); }
+      }
+    }
     finally { finishWorkflow(controller); }
   };
 
@@ -392,7 +519,7 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
 
   // Safe orders go straight to the queue; customers without names wait for the
   // operator to confirm the ask message. Nothing is sent from here.
-  const finishAutopilot = async (ids, sources, extracted) => {
+  const finishAutopilot = async (ids, sources, extracted, { cycle = false, hashes = new Map() } = {}) => {
     const plan = planAutopilot({ ids, sources, results: extracted.results, extractionErrors: extracted.errors,
       isQueued: order => acceptedSet.has(revision(order)), awaiting, shipDates: draft.shipDates });
     setAwaiting(plan.awaiting);
@@ -405,27 +532,45 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         if (mounted.current) setDraft(current => ({ ...current, reviewed: dict({ ...current.reviewed, ...Object.fromEntries(plan.autoOrders.map(order => [order.id, revision(order)])) }) }));
       } catch (failure) { queueFailure = failure.message || 'Não foi possível adicionar os pedidos à fila.'; }
     }
+    let pilotOut = null;
+    if (pilotStateRef.current && pilot.enabled) {
+      pilotOut = applyCycle(addToInbox(pilotStateRef.current, ids).state, { ids, classified: plan.classified, results: extracted.results, hashes,
+        awaiting: plan.awaiting, queueFailed: Boolean(queueFailure), autoAsk: cycle && pilot.autoAsk });
+      setPilotState(pilotOut.state);
+      // Sent by the idle effect below, after this workflow releases the Duoke tab.
+      if (pilotOut.askIds.length) pendingAsk.current = pilotOut.askIds;
+    }
     if (!mounted.current) return;
     const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-    setNotice([`Lote processado: ${plural(queued, 'cartela enviada', 'cartelas enviadas')} à fila automaticamente`,
+    const summary = [`${cycle ? 'Ciclo do piloto' : 'Lote processado'}: ${plural(queued, 'cartela enviada', 'cartelas enviadas')} à fila automaticamente`,
       `${plan.counts.review + plan.autoOrders.length - queued} para revisar`,
       plural(plan.askable.length, 'cliente para cobrar', 'clientes para cobrar'),
       `${Object.keys(plan.awaiting).length} aguardando resposta`,
-      plural(plan.counts.failed, 'falha', 'falhas')].join(' · ') + (plan.answered.length ? `. ${plural(plan.answered.length, 'cliente respondeu', 'clientes responderam')}.` : '.'));
+      plural(plan.counts.failed, 'falha', 'falhas')].join(' · ') + (plan.answered.length ? `. ${plural(plan.answered.length, 'cliente respondeu', 'clientes responderam')}.` : '.');
+    setNotice(summary);
     if (queueFailure) setError(`As cartelas aprovadas não foram para a fila: ${queueFailure} Confira e adicione manualmente.`);
-    setFilter(plan.askable.length ? 'ask' : 'all'); setReviewPage(0);
+    if (cycle) {
+      cycleFailureAlerted.current = false;
+      setPilotInfo(current => ({ ...current, lastRun: Date.now(), summary, error: current.error.startsWith('Ciclo:') ? '' : current.error }));
+    } else { setFilter(plan.askable.length ? 'ask' : 'all'); setReviewPage(0); }
+    // Telegram only when something needs the operator; quiet cycles stay quiet.
+    if (pilotOut && (pilotOut.newReview.length || pilotOut.newFailed.length)) {
+      const review = pilotOut.newReview.map(id => ({ id, names: extracted.results.get(id)?.names || [], reason: extracted.results.get(id)?.reason || (queueFailure ? 'não entrou na fila' : '') }));
+      notifyTelegram(formatCycleMessage({ queued, review, asked: pilotOut.askIds.length, failed: pilotOut.newFailed,
+        awaitingCount: stateList(pilotOut.state).filter(entry => entry.phase === 'awaiting').length }));
+    }
   };
 
-  const sendAsk = async ids => {
+  const sendAsk = async (ids, { automatic = false } = {}) => {
     if (workflow.current || busy) return;
     const controller = new AbortController();
     try {
       const message = validateAskMessage(askMessage);
       const codes = planAsk(ids, awaiting).slice(0, MAX_SEND_ORDERS);
-      if (!codes.length) throw new Error('Nenhum cliente para cobrar agora. Pedidos cobrados nas últimas 24 horas não recebem nova mensagem.');
+      if (!codes.length) { if (automatic) return; throw new Error('Nenhum cliente para cobrar agora. Pedidos cobrados nas últimas 24 horas não recebem nova mensagem.'); }
       if (!connected || connection.busy) throw new Error('Conecte as abas e aguarde a coleta atual antes de enviar.');
       workflow.current = controller; setError('');
-      setNotice('Enviando a mensagem no Duoke. Não use o chat do Duoke até terminar.');
+      setNotice(automatic ? 'Piloto: cobrando no Duoke os clientes sem nome. Não use o chat do Duoke até terminar.' : 'Enviando a mensagem no Duoke. Não use o chat do Duoke até terminar.');
       setPhase('sending'); setProgress({ completed: 0, total: codes.length });
       const run = createSendRun({ codes, message, send: post, makeId: requestId, signal: controller.signal,
         onOrder: order => { if (mounted.current) setSendStatus(current => dict({ ...current, [order.id]: order })); },
@@ -435,12 +580,17 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       const summary = await run.start(); job.current = null;
       // Possibly sent messages are recorded even if this screen closed meanwhile.
       setAwaiting(current => recordSends(current, summary.orders));
+      if (pilotStateRef.current && pilot.enabled) setPilotState(current => recordPilotSends(addToInbox(current, codes).state, summary.orders, { automatic }));
       if (!mounted.current) return;
+      if (automatic) {
+        const sent = summary.orders.filter(order => order.status !== 'failed').length;
+        setPilotInfo(current => ({ ...current, summary: `${current.summary} Cobrança automática: ${sent} de ${codes.length} enviada${codes.length === 1 ? '' : 's'}.`.trim() }));
+      }
       const count = status => summary.orders.filter(order => order.status === status).length;
       setNotice(`Cobrança concluída: ${count('sent')} enviada${count('sent') === 1 ? '' : 's'}, ${count('unconfirmed')} sem confirmação, ${count('failed')} não enviada${count('failed') === 1 ? '' : 's'}` +
         (summary.notAttempted.length ? `, ${summary.notAttempted.length} não tentada${summary.notAttempted.length === 1 ? '' : 's'}` : '') + '. Use Verificar respostas quando os clientes responderem.');
       if (summary.error) setError(summary.error);
-      if (count('sent') + count('unconfirmed')) setFilter('awaiting');
+      if (!automatic && count('sent') + count('unconfirmed')) setFilter('awaiting');
     } catch (failure) { reportFailure(failure); }
     finally { finishWorkflow(controller); }
   };
@@ -460,6 +610,12 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
       const orders = readyOrders.map(order => ({ ...order, status: 'found', names: order.names.map(entry => ({ ...entry })), shipDate: draft.shipDates[order.id] || '' }));
       orders.forEach(toLabelFields);
       await onAddOrders(orders);
+      if (pilotStateRef.current && pilot.enabled) {
+        // A queued order is answered: it leaves the pilot and the awaiting list, or the mirror would bring it back.
+        const ids = orders.map(order => order.id);
+        setAwaiting(current => Object.fromEntries(Object.entries(current).filter(([id]) => !ids.includes(id))));
+        setPilotState(current => removeFromState(current, ids));
+      }
       setNotice(`${orders.length} cartela${orders.length === 1 ? '' : 's'} adicionada${orders.length === 1 ? '' : 's'} à fila de impressão.`);
     } catch (failure) { setError(failure.message || 'Não foi possível adicionar os pedidos à fila.'); }
     finally { enqueuing.current = false; if (mounted.current) setQueueBusy(false); }
@@ -489,6 +645,53 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
   const connected = connection.connected && connection.duokeConnected;
   const connectionText = connection.checking && !connection.connected ? 'Verificando conexão…' : connected ? 'Duoke conectado' : connection.connected ? 'Conecte a aba do Duoke' : 'Conecte a extensão';
 
+  // Runs every PILOT_TICK from the latest render (via ref), so it always sees current state.
+  tickRef.current = ({ force = false } = {}) => {
+    if (!pilotActive) return;
+    const now = Date.now();
+    if (!connected) {
+      if (connection.checking) return;
+      if (!disconnectedSince.current) disconnectedSince.current = now;
+      if (!disconnectAlerted.current && now - disconnectedSince.current >= DISCONNECT_ALERT) {
+        disconnectAlerted.current = true;
+        notifyTelegram('Lápis · piloto parado: a Ponte Duoke está desconectada há mais de 20 minutos. Abra as abas do Studio e do Duoke e conecte de novo pela extensão.');
+      }
+      return;
+    }
+    disconnectedSince.current = 0; disconnectAlerted.current = false;
+    if (pendingAsk.current && !pilot.autoAsk) pendingAsk.current = null;
+    if (pendingAsk.current || workflow.current || busy || connection.busy) return;
+    if (!force && !isDue(lastCycle.current, pilot.minutes, now)) return;
+    lastCycle.current = now;
+    const current = expireState(pilotStateRef.current, now);
+    if (stateList(current).length !== stateList(pilotStateRef.current).length) setPilotState(current);
+    const codes = cycleCodes(current);
+    if (!codes.length) { setPilotInfo(info => ({ ...info, lastRun: now, summary: 'Nenhum pedido pendente no piloto. Novos lotes processados entram aqui automaticamente.' })); return; }
+    startCollection({ codes, retry: true, autopilot: true, cycle: true });
+  };
+
+  useEffect(() => {
+    const interval = setInterval(() => tickRef.current?.(), PILOT_TICK);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Automatic asks planned by a cycle go out as soon as the Duoke tab is free.
+  useEffect(() => {
+    if (phase !== 'idle' || !pendingAsk.current || !pilot.enabled || !pilot.autoAsk || !connected || connection.busy || workflow.current) return;
+    const ids = pendingAsk.current; pendingAsk.current = null;
+    sendAsk(ids, { automatic: true });
+  }, [phase, connected, connection.busy, pilot.enabled, pilot.autoAsk]);
+
+  const pilotCounts = { pending: 0, awaiting: 0, review: 0, failed: 0 };
+  for (const entry of stateList(pilotState || {})) pilotCounts[entry.phase]++;
+  const pilotIds = phaseName => stateList(pilotState || {}).filter(entry => entry.phase === phaseName).map(entry => entry.id);
+  const nextCycle = pilotActive && Number.isFinite(lastCycle.current) ? lastCycle.current + pilot.minutes * 60000 : 0;
+  const testTelegram = async () => {
+    setPilotInfo(current => ({ ...current, error: '' }));
+    try { await pilotClient.notify('Lápis · teste do piloto automático. Os avisos de revisão vão chegar aqui.'); setPilotInfo(current => ({ ...current, summary: 'Mensagem de teste enviada ao Telegram.' })); }
+    catch (failure) { setPilotInfo(current => ({ ...current, error: `Telegram: ${failure.message}` })); }
+  };
+
   return <section className="lapis-import" aria-label="Importar pedidos do Duoke">
     <header className="lapis-heading">
       <div className="lapis-monogram" aria-hidden="true">L</div>
@@ -510,6 +713,44 @@ export default function LapisImport({ onAddOrders, queuedRevisions = NO_REVISION
         <details className="lapis-help"><summary>Colar o texto do coletor</summary><label className="lapis-field">Pedidos e conversas<textarea rows={5} disabled={busy} value={draft.raw} maxLength={MAX_BATCH_FILE_BYTES} placeholder="Cole o relatório completo do coletor…" onChange={event => setDraft(current => ({ ...current, raw: event.target.value }))} /></label><button type="button" disabled={busy || !draft.raw.trim()} onClick={() => { try { importText(draft.raw); } catch (failure) { setError(failure.message); } }}>Importar texto</button></details>
         <p className="lapis-batch-hint">O código de acesso fica guardado neste navegador. Apague o campo para esquecê-lo.</p>
       </div>
+    </div>
+    <div className={`lapis-pilot${pilot.enabled ? ' is-on' : ''}`} aria-label="Piloto contínuo">
+      <div className="lapis-pilot-head">
+        <div className="lapis-section-title"><span>24H</span><h3>Piloto contínuo</h3></div>
+        <label className="lapis-switch"><input type="checkbox" checked={pilot.enabled} onChange={event => setPilot(current => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" />{pilot.enabled ? 'Ligado' : 'Desligado'}</label>
+      </div>
+      <p className="lapis-pilot-lead">Repete o Processar lote sozinho para os pedidos do piloto: coleta as conversas, extrai só o que tem mensagem nova, manda à fila os pedidos seguros e separa o resto para você. Mantenha esta aba e a do Duoke abertas neste computador.</p>
+      {pilot.enabled ? <>
+        <div className="lapis-pilot-options">
+          <label className="lapis-field">A cada<select value={pilot.minutes} onChange={event => setPilot(current => ({ ...current, minutes: Number(event.target.value) }))}>{CYCLE_MINUTES.map(value => <option key={value} value={value}>{value} minutos</option>)}</select></label>
+          <label className="lapis-check"><input type="checkbox" checked={pilot.autoAsk} onChange={event => setPilot(current => ({ ...current, autoAsk: event.target.checked }))} />Cobrar automaticamente quem não mandou o nome (uma vez por pedido, com a mensagem de cobrança salva)</label>
+          <label className="lapis-check"><input type="checkbox" checked={pilot.telegram} onChange={event => setPilot(current => ({ ...current, telegram: event.target.checked }))} />Avisar no Telegram o que precisar de revisão</label>
+        </div>
+        {pilotInfo.loading ? <p className="lapis-notice" role="status">Carregando o estado do piloto…</p> : null}
+        {!accessCode.trim() ? <p className="lapis-error">Informe o código de acesso à extração acima para ligar o piloto.</p> : null}
+        {pilotState ? <div className="lapis-pilot-stats" role="status">
+          <span><strong>{pilotCounts.pending}</strong>a ler</span>
+          <span><strong>{pilotCounts.awaiting}</strong>aguardando cliente</span>
+          <span className={pilotCounts.review ? 'is-alert' : ''}><strong>{pilotCounts.review}</strong>para revisar</span>
+          <span className={pilotCounts.failed ? 'is-alert' : ''}><strong>{pilotCounts.failed}</strong>sem leitura</span>
+          <span><strong>{pilotInfo.lastRun ? timeText(pilotInfo.lastRun) : '—'}</strong>último ciclo</span>
+          <span><strong>{busy ? 'agora' : nextCycle ? timeText(Math.max(nextCycle, Date.now())) : connected ? 'em instantes' : 'parado'}</strong>{connected ? 'próximo ciclo' : 'Duoke desconectado'}</span>
+        </div> : null}
+        {pilotInfo.summary ? <p className="lapis-reason">{pilotInfo.summary}</p> : null}
+        {pilotInfo.error ? <p className="lapis-error" role="alert">{pilotInfo.error}</p> : null}
+        <div className="lapis-actions">
+          <button type="button" className="lapis-primary" disabled={!pilotActive || busy || !connected || connection.busy} onClick={() => tickRef.current?.({ force: true })}>Rodar agora</button>
+          <button type="button" disabled={!pilotActive || busy || !draft.codes.trim()} onClick={() => {
+            const { state, added } = addToInbox(pilotStateRef.current, parseOrderCodes(draft.codes));
+            setPilotState(state); setPilotInfo(current => ({ ...current, summary: `${added} pedido${added === 1 ? '' : 's'} novo${added === 1 ? '' : 's'} no piloto.` }));
+          }}>Incluir códigos colados</button>
+          {pilotCounts.review ? <button type="button" disabled={busy || !connected || connection.busy} onClick={() => startCollection({ codes: pilotIds('review').slice(0, 200), retry: true })} title="Coleta e extrai estes pedidos aqui embaixo para você revisar e mandar à fila">Trazer para revisão · {pilotCounts.review}</button> : null}
+          {pilotCounts.failed ? <button type="button" disabled={busy} onClick={() => setPilotState(current => Object.assign(Object.create(null), current, Object.fromEntries(pilotIds('failed').map(id => [id, { ...current[id], phase: 'pending', failures: 0 }]))))}>Tentar sem leitura de novo · {pilotCounts.failed}</button> : null}
+          {pilotCounts.failed ? <button type="button" className="lapis-link-button" disabled={busy} onClick={() => setPilotState(current => removeFromState(current, pilotIds('failed')))}>Descartar sem leitura</button> : null}
+          {pilot.telegram ? <button type="button" className="lapis-link-button" disabled={!accessCode.trim()} onClick={testTelegram}>Testar Telegram</button> : null}
+        </div>
+        <p className="lapis-batch-hint">Pedidos entram no piloto pelo Processar lote, pelas etiquetas em PDF + Incluir códigos colados, ou cobrados por aqui. Saem quando vão para a fila; ficam no máximo 7 dias. Para revisar e sem leitura esperam você.</p>
+      </> : null}
     </div>
     {phase !== 'idle' ? <div className="lapis-progress" role="status"><div><strong>{phase === 'collecting' ? 'Coletando conversas' : phase === 'cancelling' ? 'Cancelando…' : phase === 'sending' ? 'Enviando mensagens no Duoke' : phase === 'queueing' ? 'Adicionando à fila' : 'Extraindo nomes'}</strong><span>{progress.completed} / {progress.total} pedidos</span></div><progress max={Math.max(1, progress.total)} value={progress.completed} /><button type="button" onClick={cancel} disabled={phase === 'cancelling'}>Cancelar</button></div> : null}
     {error ? <p className="lapis-alert lapis-error" role="alert">{error}</p> : null}

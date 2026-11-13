@@ -65,10 +65,11 @@ test('order code sits top-left of every sheet and pushes labels down by gap', ()
     assert.deepEqual([s.code.x + code.minX, s.code.y + code.minY], [0, 0]);
     assert.equal(s.placed[0].y + box.minY, 3.5 + 6); // altura do código + espaço
   }
-  // código em CMYK (sem gs, mesmo com letra branca) e também no Branco, mas não no Verniz
+  // código só no Branco: sem CMYK e sem Verniz
   const layers = [{ key: 'white', cs: 'CSWhite', spot: 'W' }, { key: 'varnish', cs: 'CSVarnish', spot: 'V' }];
   const c = sheetContent(sheets[0], layers, 100, 'GS0');
-  assert.match(c, /^q\n1 1 1 1 k\n[^Q]*f\nQ\nq\n\/GS0 gs\n\/CSWhite/);
+  assert.match(c, /^q\n\/GS0 gs\n\/CSWhite/);
+  assert.doesNotMatch(c, / k\n/);
   const fills = name => c.split(`/${name} cs 1 scn\n`)[1].split('Q\n')[0].split('f\n').length - 1;
   assert.equal(fills('CSWhite'), sheets[0].placed.length + 1);
   assert.equal(fills('CSVarnish'), sheets[0].placed.length);

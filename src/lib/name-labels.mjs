@@ -410,8 +410,7 @@ export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
 
 // Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
-// O código do pedido sai em CMYK 100/100/100/100 (sem sobreposição, mesmo com letra branca) e
-// também na camada Branco; não leva verniz.
+// O código do pedido sai só na camada Branco (sem tinta preta/CMYK e sem verniz).
 // `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
 // Emojis (`art`, ver sheetToSvg) saem nas cores originais logo depois da camada CMYK, sem sobreposição;
 // nas camadas Branco e Verniz entra a silhueta deles, como máscara.
@@ -420,7 +419,6 @@ export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
 // entra a máscara 1 bit do contorno (`mask`) ou, sem ela, o retângulo da cópia.
 export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRes = null) {
   const codePath = sheet.code ? svgPathToPdf(sheet.code.box.d, sheet.code.x, sheet.code.y + oy, pageH) + "f\n" : "";
-  const code = codePath && `q\n1 1 1 1 k\n${codePath}Q\n`;
   const paths = sheet.placed.filter(p => !p.box.art).map(p => svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n").join("");
   const arts = sheet.placed.filter(p => p.box.art && artRes?.get(p.box.artId)).map(p => {
     const MM = 72 / 25.4, r = artRes.get(p.box.artId), b = p.box;
@@ -453,7 +451,7 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
     byInk.set(k, (byInk.get(k) || "") + svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n");
   }
   const cmyk = [...byInk].map(([k, ps]) => `q\n${k} k\n${ps}Q\n`).join("");
-  return cmyk + color + artColor + code + spots.map(layer).join("");
+  return cmyk + color + artColor + spots.map(layer).join("");
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.

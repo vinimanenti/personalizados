@@ -133,3 +133,32 @@ Mapeamento do campo de mensagem em 28/10/2026, pelo código público do Duoke (s
 Quando `ANTHROPIC_API_KEY` está configurada no servidor, a extração usa o Claude (padrão `claude-haiku-5-5`, ajustável em `CLAUDE_MODEL`) uma vez se o Gemini falhar do lado dele: alta demanda após a nova tentativa, limite do Google, erro de rede ou certificado, demora acima de ~25 segundos, resposta inválida ou chave recusada. Código de acesso errado, origem não autorizada, limite do Lápis e pedidos inválidos nunca acionam o Claude. A resposta usa o mesmo esquema JSON e passa pela mesma conferência de evidência literal. Cada tentativa consome a quota do Lápis. Sem a chave, o comportamento é o anterior.
 
 O terminal (ou o log da função) registra `[lapis-extract] Gemini falhou (HTTP …); tentando o Claude` e `Extração concluída pelo Claude.`; nenhum segredo ou conversa é registrado. Para ativar: crie a chave no Console da Anthropic, coloque `ANTHROPIC_API_KEY` no `.env.local` (desenvolvimento) e nos segredos da Edge Function, e publique novamente `lapis-extract`.
+
+## Piloto contínuo (Fase 1)
+
+O painel **Piloto contínuo** da aba Lápis repete o **Processar lote** sozinho, a cada 10, 15, 30 ou 60 minutos, para os pedidos do piloto. Cada ciclo coleta as conversas pela Ponte Duoke, extrai só as conversas que mudaram desde a última leitura sem nome, manda à fila os pedidos aprovados automaticamente (mesmo critério do piloto automático) e separa o resto para o operador.
+
+- **Entram no piloto:** pedidos do **Processar lote** com o piloto ligado, códigos colados ou lidos das etiquetas em PDF pelo botão **Incluir códigos colados**, e pedidos cobrados pela tela.
+- **Saem:** quando vão para a fila, automaticamente ou pelo botão **Adicionar à fila**. Cada pedido fica no máximo 7 dias.
+- **Para revisar** e **sem leitura** (3 ciclos seguidos sem encontrar a conversa) saem do ciclo e esperam o operador. **Trazer para revisão** coleta e extrai esses pedidos na lista de revisão.
+- **Economia de IA:** o estado guarda um SHA-256 de cada conversa lida. Se o cliente não escreveu nada novo, o resultado anterior (sem nome) é reaproveitado e o Gemini não é chamado.
+- **Cobrança automática (opcional):** com a opção marcada, o ciclo cobra quem não mandou o nome com a mensagem de cobrança salva, **uma única vez por pedido** e respeitando o bloqueio de 24 horas. Novas cobranças continuam manuais.
+- **Telegram (opcional):** avisa quando surgem pedidos para revisar ou sem leitura, quando um ciclo falha e quando a Ponte Duoke fica desconectada por mais de 20 minutos. Ciclos sem novidade não geram mensagem.
+
+O ciclo roda no navegador: mantenha as abas do Studio e do Duoke abertas e conectadas no computador onde o piloto está ligado. O interruptor é guardado por computador; ligue em um só. O estado (pedidos, aguardando cliente, hashes) fica no Supabase e é compartilhado.
+
+### Ativação
+
+1. Aplique `supabase/migrations/202611120001_lapis_autopilot_state.sql`. A tabela só é acessível pelo servidor (service role).
+2. Publique a função: `supabase functions deploy lapis-autopilot`. Ela usa os mesmos segredos `STICKER_AI_ACCESS_CODE` e `STICKER_ALLOWED_ORIGINS` do `lapis-extract`.
+3. Telegram (opcional): crie um bot com o @BotFather e copie o token. Mande `/start` para o bot, abra `https://api.telegram.org/bot<TOKEN>/getUpdates` e copie o `chat.id`. Configure os segredos `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` no Supabase (e no `.env.local` para o `npm run dev`). Use **Testar Telegram** no painel.
+4. Confira `STICKER_AI_DAILY_LIMIT`: com o piloto ligado, a extração roda o dia todo. A economia por hash evita releituras, mas o limite precisa cobrir os pedidos novos do dia.
+5. No `npm run dev`, o estado vai para o Supabase quando `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` estiverem no `.env.local`; sem eles, fica no arquivo local ignorado pelo git `.lapis-autopilot.local`.
+
+```powershell
+supabase db push
+supabase functions deploy lapis-autopilot
+supabase secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
+```
+
+Validação desta entrega: testes de `lapis-continuous` (planejamento, hash, falhas, cobrança única, mensagem) e do servidor (código de acesso, origem, validação do estado, Telegram sem eco de erro), além de um teste de ponta a ponta no Chromium com a Ponte Duoke simulada: lote manual, ciclo com reaproveitamento sem chamar a IA, cobrança automática, resposta do cliente extraída e enviada à fila, pedido sem leitura após 3 ciclos e estado preservado após recarregar. A sessão real do Duoke e o Telegram real ainda precisam ser confirmados pelo usuário.

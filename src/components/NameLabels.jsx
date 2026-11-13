@@ -696,7 +696,7 @@ export default function NameLabels({ variant = "names" }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
             {sheets.map((s, i) => (
               <div key={i} style={{ background: mode === "art" ? "repeating-conic-gradient(#d6d6d6 0 25%, #f4f4f4 0 50%) 0 0/16px 16px" : opts.letter === "white" ? "#3a3d45" : isDtf && pencilEntries.some(e => e.color === "branca") ? "#9aa0aa" : "#fff", borderRadius: 4, boxShadow: "0 1px 6px rgba(0,0,0,.3)" }}
-                dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: letterFill(opts), codeFill: opts.letter === "white" ? "#b8bcc6" : "#000", art }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
+                dangerouslySetInnerHTML={{ __html: sheetToSvg(s, { fill: letterFill(opts), codeFill: "#b8bcc6", art }).replace(/width="[^"]+" height="[^"]+"/, 'width="100%" style="display:block"') }} />
             ))}
           </div>
         </div>

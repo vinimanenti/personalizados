@@ -14,7 +14,7 @@ Protocolo: mensagens `window.postMessage` usam `version: 1`, `source: 'sticker-s
 
 ## Cobrança de nomes (1.1.0)
 
-`SEND` contém `codes` (máximo 100) e `message` (1 a 500 caracteres) e só é emitido pelo botão **Enviar para N clientes** do Lápis. Para cada pedido, a extensão abre a conversa com a mesma confirmação da coleta, recusa conversas com anexo, citação ou rascunho pendente e o modo **Enviar após tradução**, preenche o campo de mensagem, confere de novo o pedido e clica em enviar. `PROGRESS` informa `sent` quando a mensagem aparece na conversa como mensagem da loja, `unconfirmed` quando o clique aconteceu sem essa confirmação e `failed` quando nada foi enviado. Pedidos `unconfirmed` nunca são reenviados automaticamente. Há um intervalo de 2 a 4 segundos entre envios.
+`SEND` contém `codes` (máximo 100) e `message` (1 a 500 caracteres) e é emitido pelo botão **Enviar para N clientes** do Lápis ou, quando o operador marca a cobrança automática do **Piloto contínuo**, uma única vez por pedido. Para cada pedido, a extensão abre a conversa com a mesma confirmação da coleta, recusa conversas com anexo, citação ou rascunho pendente e o modo **Enviar após tradução**, preenche o campo de mensagem, confere de novo o pedido e clica em enviar. `PROGRESS` informa `sent` quando a mensagem aparece na conversa como mensagem da loja, `unconfirmed` quando o clique aconteceu sem essa confirmação e `failed` quando nada foi enviado. Pedidos `unconfirmed` nunca são reenviados automaticamente. Há um intervalo de 2 a 4 segundos entre envios.
 
 ## Atualizar uma instalação existente
 
