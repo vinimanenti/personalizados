@@ -65,14 +65,15 @@ test('order code sits top-left of every sheet and pushes labels down by gap', ()
     assert.deepEqual([s.code.x + code.minX, s.code.y + code.minY], [0, 0]);
     assert.equal(s.placed[0].y + box.minY, 3.5 + 6); // altura do código + espaço
   }
-  // código só no Branco: sem CMYK e sem Verniz
+  // código em preto puro (só K), fora do Branco e do Verniz
   const layers = [{ key: 'white', cs: 'CSWhite', spot: 'W' }, { key: 'varnish', cs: 'CSVarnish', spot: 'V' }];
   const c = sheetContent(sheets[0], layers, 100, 'GS0');
-  assert.match(c, /^q\n\/GS0 gs\n\/CSWhite/);
-  assert.doesNotMatch(c, / k\n/);
+  assert.match(c, /^q\n0 0 0 1 k\n[^Q]*f\nQ\nq\n\/GS0 gs\n\/CSWhite/);
+  assert.equal(c.match(/ k\n/g).length, 1, 'no other CMYK ink');
   const fills = name => c.split(`/${name} cs 1 scn\n`)[1].split('Q\n')[0].split('f\n').length - 1;
-  assert.equal(fills('CSWhite'), sheets[0].placed.length + 1);
+  assert.equal(fills('CSWhite'), sheets[0].placed.length);
   assert.equal(fills('CSVarnish'), sheets[0].placed.length);
+  assert.doesNotMatch(sheetContent({ ...sheets[0], code: null }, layers, 100, 'GS0'), / k\n/, 'no code, no black');
 });
 
 import { stackSheets, letterCmyk } from '../src/lib/name-labels.mjs';

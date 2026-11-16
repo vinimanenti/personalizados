@@ -410,7 +410,7 @@ export function svgPathToPdf(d, tx, ty, pageH, scale = 1) {
 
 // Conteúdo da página: cada camada repete as mesmas letras, por cima da anterior.
 // Só as camadas spot (Branco, Verniz) levam sobreposição (gs); o CMYK fica sem.
-// O código do pedido sai só na camada Branco (sem tinta preta/CMYK e sem verniz).
+// O código do pedido sai em preto puro (só K) na camada CMYK, sem Branco e sem Verniz.
 // `oy` desloca a folha para baixo (mm), para empilhar várias numa página só.
 // Emojis (`art`, ver sheetToSvg) saem nas cores originais logo depois da camada CMYK, sem sobreposição;
 // nas camadas Branco e Verniz entra a silhueta deles, como máscara.
@@ -439,7 +439,7 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
   const masks = emojis.map(({ e, shapes }) => shapes.map(s => emojiPath(e, s)).join("")).join("");
   const color = emojis.length ? `q\n${emojis.map(({ e, shapes }) => shapes.map(s => `${hexToRgb(s.fill).map(fmt).join(" ")} rg\n${emojiPath(e, s)}`).join("")).join("")}Q\n` : "";
   const fill = l => l.cs ? `/${l.cs} cs 1 scn` : `${(l.cmyk || [1, 1, 1, 1]).map(fmt).join(" ")} k`;
-  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks + artMask : "") + (l.key === "white" ? codePath : "") + "Q\n";
+  const layer = l => ["q", gs && l.spot && `/${gs} gs`, fill(l)].filter(Boolean).join("\n") + "\n" + paths + (l.spot ? masks + artMask : "") + "Q\n";
   const spots = layers.filter(l => l.spot);
   // Camada CMYK: cada etiqueta na cor dela (`box.ink`) ou na do pedido; letra branca não tem CMYK.
   const def = layers.find(l => !l.spot)?.cmyk || null;
@@ -451,7 +451,8 @@ export function sheetContent(sheet, layers, pageH, gs, oy = 0, art = null, artRe
     byInk.set(k, (byInk.get(k) || "") + svgPathToPdf(p.box.d, p.x, p.y + oy, pageH) + "f\n");
   }
   const cmyk = [...byInk].map(([k, ps]) => `q\n${k} k\n${ps}Q\n`).join("");
-  return cmyk + color + artColor + spots.map(layer).join("");
+  const codeInk = codePath ? `q\n0 0 0 1 k\n${codePath}Q\n` : "";
+  return codeInk + cmyk + color + artColor + spots.map(layer).join("");
 }
 
 // Junta as folhas de vários pedidos uma embaixo da outra, com `gap` mm entre elas.
