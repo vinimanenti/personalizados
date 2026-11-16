@@ -104,3 +104,33 @@ test('3-line mode: "Cima - Nome - Baixo", defaults fill the missing lines', () =
   // com 2 linhas nada muda: a primeira parte é o nome
   assert.deepEqual(parseEntries('Ana - Madrinha - x'), [{ name: 'Ana', role: 'MADRINHA X' }]);
 });
+
+import { optimizeLabels, rotateBox } from '../src/lib/name-labels.mjs';
+
+test('optimizeLabels reorders and stands names up only when that saves material', () => {
+  const box = (w, h, tag) => ({ d: 'M0 0Z', minX: 0, maxX: w, minY: -h, maxY: 0, tag });
+  const opts = { sheetW: 100, gap: 5, margin: 0, maxSheetH: 0 };
+  const total = order => packLabels(order, opts).reduce((sum, s) => sum + s.contentH, 0);
+  // Wide + narrow alternated: the list order wastes the end of every row.
+  const list = [box(60, 10, 'a'), box(60, 10, 'b'), box(35, 10, 'c'), box(35, 10, 'd')];
+  const best = optimizeLabels(list, opts);
+  assert.equal(total(list), 10 + 5 + 10 + 5 + 10);
+  assert.equal(total(best), 10 + 5 + 10, 'each wide label shares its row with a narrow one');
+  assert.equal(best.filter(b => b.rot).length, 0);
+  assert.deepEqual(best.map(b => b.tag).sort(), ['a', 'b', 'c', 'd'], 'every label is still there');
+  // Standing up pays off: 3 labels of 90 × 20 lying use 3 rows (70 mm); standing they share one row of 90 mm...
+  const tall = [box(90, 20), box(90, 20), box(90, 20), box(90, 20), box(90, 20), box(90, 20), box(90, 20), box(90, 20)];
+  const stood = optimizeLabels(tall, opts);
+  assert.ok(total(stood) < total(tall), 'eight wide labels fit in fewer mm when four stand per row');
+  assert.ok(stood.some(b => b.rot));
+  // A label wider than the sheet stands up when it fits that way.
+  const [only] = optimizeLabels([box(140, 20)], opts);
+  assert.equal(only.rot, true); assert.equal(only.maxX - only.minX, 20);
+  // Already optimal: the list comes back untouched (same order, nothing rotated).
+  const fine = [box(40, 10), box(40, 10)];
+  assert.equal(optimizeLabels(fine, opts), fine);
+  // A sheet height limit is respected: a 140 mm label cannot stand on a 100 mm sheet.
+  assert.equal(optimizeLabels([box(140, 20), box(30, 10)], { ...opts, maxSheetH: 100 }).some(b => b.rot), false);
+  assert.equal(rotateBox(box(90, 20)).maxY - rotateBox(box(90, 20)).minY, 90);
+});
+

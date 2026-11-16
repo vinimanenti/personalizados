@@ -33,6 +33,7 @@ export const DEFAULT_OPTS = {
   orderCode: "",    // código do pedido, no canto superior esquerdo de cada folha
   codeSize: 10,     // pt (Times)
   emojiScale: 0.6,  // tamanho do emoji em relação ao texto
+  optimize: true,   // reordena e gira nomes (em pé) quando isso gasta menos material
 };
 
 // Separadores entre as partes de uma linha: " - ", ";", "|" ou tab.
@@ -313,6 +314,44 @@ export function packLabels(boxes, opts, code = null) {
     s.h = o.maxSheetH > 0 ? o.maxSheetH : Math.ceil((s.contentH + 2 * o.margin) * 10) / 10;
   }
   return sheets;
+}
+
+// Procura o encaixe que gasta menos material: testa a lista como veio e várias combinações de
+// "os k nomes mais largos em pé" (girados 90°), sempre agrupando por altura e completando as
+// sobras de cada linha. Devolve as caixas na ordem (e rotação) escolhida para packLabels.
+// Um nome mais largo que a folha vai em pé sempre que couber assim. Empate fica com a lista original.
+export function optimizeLabels(boxes, opts, code = null) {
+  const o = { ...DEFAULT_OPTS, ...opts };
+  const usable = o.sheetW - 2 * o.margin;
+  const limit = o.maxSheetH > 0 ? o.maxSheetH - 2 * o.margin - (code ? code.maxY - code.minY + o.gap : 0) : Infinity;
+  const W = b => b.maxX - b.minX, H = b => b.maxY - b.minY;
+  const rotated = new Map();
+  const rot = b => { if (!rotated.has(b)) rotated.set(b, rotateBox(b)); return rotated.get(b); };
+  const canRotate = b => H(b) <= usable + 1e-6 && W(b) <= limit + 1e-6;
+  // Linhas por "primeiro que couber", da etiqueta mais alta para a mais baixa; devolve a ordem das linhas.
+  const firstFit = list => {
+    const rows = [];
+    for (const b of [...list].sort((a, c) => H(c) - H(a) || W(c) - W(a))) {
+      const w = W(b);
+      const row = rows.find(r => r.w + o.gap + w <= usable + 1e-6);
+      if (row) { row.items.push(b); row.w += o.gap + w; } else rows.push({ items: [b], w });
+    }
+    return rows.flatMap(r => r.items);
+  };
+  const score = order => { const sheets = packLabels(order, o, code); return sheets.length * 1e7 + sheets.reduce((sum, s) => sum + s.contentH, 0); };
+  const forced = new Set(boxes.filter(b => W(b) > usable + 1e-6 && canRotate(b)));
+  const wide = boxes.filter(b => !forced.has(b) && canRotate(b) && W(b) !== H(b)).sort((a, c) => W(c) - W(a));
+  const steps = wide.length <= 48 ? wide.map((_, i) => i + 1) : Array.from({ length: 48 }, (_, i) => Math.round(((i + 1) * wide.length) / 48));
+  let best = forced.size ? null : { order: boxes, value: score(boxes), turned: 0 };
+  for (const k of [0, ...new Set(steps)]) {
+    const up = new Set([...forced, ...wide.slice(0, k)]);
+    const tall = boxes.filter(b => up.has(b)).map(rot), flat = boxes.filter(b => !up.has(b));
+    for (const order of [[...firstFit(tall), ...firstFit(flat)], firstFit([...tall, ...flat])]) {
+      const value = score(order);
+      if (!best || value < best.value - 1e-6 || (Math.abs(value - best.value) < 1e-6 && up.size < best.turned)) best = { order, value, turned: up.size };
+    }
+  }
+  return best.order;
 }
 
 const fmt = n => +n.toFixed(3);

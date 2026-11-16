@@ -72,3 +72,20 @@ test('fitArtBoxes marks rotated copies with swapped size', () => {
   const [sheet] = packLabels(boxes, { sheetW: 290, gap: 6 });
   assert.equal(sheet.h, 166);
 });
+
+test('recolorSvg paints fills, strokes, styles and gradients with one color and keeps none', async () => {
+  const { recolorSvg } = await import('../src/lib/art-upload.mjs');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"><style>.a{fill:#f00;stroke:none;fill-opacity:.5}</style>
+<linearGradient id="g"><stop stop-color="red"/><stop style="stop-color:blue"/></linearGradient>
+<path class="a" d="M0 0"/><rect fill="url(#g)" stroke='black' stroke-width="2"/><circle fill="none" style="stroke:rgb(1,2,3);fill:transparent"/><path d="M1 1"/></svg>`;
+  const out = recolorSvg(svg, '#12ab34');
+  assert.match(out, /\.a\{fill:#12ab34;stroke:none;fill-opacity:\.5\}/);
+  assert.match(out, /stop-color="#12ab34"/); assert.match(out, /stop-color:#12ab34/);
+  assert.match(out, /<rect fill="#12ab34" stroke='#12ab34' stroke-width="2"\/>/);
+  assert.match(out, /<circle fill="none" style="stroke:#12ab34;fill:transparent"\/>/);
+  assert.match(out, /<svg [^>]*fill="#12ab34">/, 'shapes without a fill inherit the new color');
+  assert.doesNotMatch(out, /#f00|red|blue|black|rgb\(/);
+  assert.equal(recolorSvg(svg, 'javascript:alert(1)'), svg, 'only #rrggbb is accepted');
+  assert.equal(recolorSvg(svg, ''), svg);
+});
+

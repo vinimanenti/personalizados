@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, rotateBox, buildCode, packLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, stripIcons, setIcon, mapListNames, PART_SEP, nameIndex, COLOR_PRESETS, PENCIL_COLORS, pencilInk, expandPencilRows, parsePencilList } from "../lib/name-labels.mjs";
+import { DEFAULT_OPTS, parseEntries, buildLabel, buildPencilLabel, rotateBox, buildCode, packLabels, optimizeLabels, sheetToSvg, pdfLayers, sheetContent, stackSheets, letterCmyk, cmykToHex, emojisIn, stripIcons, setIcon, mapListNames, PART_SEP, nameIndex, COLOR_PRESETS, PENCIL_COLORS, pencilInk, expandPencilRows, parsePencilList } from "../lib/name-labels.mjs";
 import { loadEmojiArt } from "../lib/emoji-art.mjs";
 import { ART_KINDS, fitArtBoxes, planRotation } from "../lib/art-upload.mjs";
 import { saveArtFile, loadArtFile, deleteArtFile } from "../lib/art-store.js";
@@ -28,6 +28,8 @@ const VARIANTS = {
   names: { storeKey: STORE_KEY, queueKey: QUEUE_KEY, fonts: NAME_FONTS, defaults: {}, file: "fila-etiquetas-nome" },
   dtf: { storeKey: "pencil_dtf_v1", queueKey: "pencil_dtf_queue_v1", fonts: PENCIL_FONTS, defaults: { nameFont: "cookie", nameSize: 24, maxWidth: 50, autoRotate: true }, file: "fila-lapis-dtf-uv" },
 };
+// Cores prontas para repintar um SVG enviado (as mesmas da letra, mais preto e branco).
+const SVG_COLORS = [["Preto", "#000000"], ["Branco", "#ffffff"], ...COLOR_PRESETS.map(([label, cmyk]) => [label, cmykToHex(cmyk.map(v => v / 100)).toLowerCase()])];
 const EXAMPLE = "Ana Paula - Madrinha\nCarlos Eduardo - Padrinho\nMaria Clara - Dama de Honra";
 
 /* ─── Loaders (mesmo CDN usado pelo PrintLab) ─── */
@@ -66,7 +68,8 @@ const readJson = (key, fallback) => { try { return JSON.parse(localStorage.getIt
 function layoutJob(text, opts, loaded) {
   const fonts = { role: loaded.role, name: loaded.names[opts.nameFont] || loaded.names[DEFAULT_OPTS.nameFont] };
   const labels = parseEntries(text, opts).map(e => buildLabel(e, fonts, opts)).filter(Boolean);
-  return packLabels(labels, opts, buildCode(fonts, opts));
+  const code = buildCode(fonts, opts);
+  return packLabels(opts.optimize !== false ? optimizeLabels(labels, opts, code) : labels, opts, code);
 }
 
 // Lápis DTF UV: cada nome vira `qty` etiquetas iguais (até 2 linhas, no máximo `maxWidth` mm).
@@ -211,16 +214,31 @@ export default function NameLabels({ variant = "names" }) {
   const [loadingArt, setLoadingArt] = useState(false);
   const fileRef = useRef(null);
   const curArt = cur && arts.get(cur.fileId);
-  const readArt = async (id, file) => {
+  const rawArt = useRef(new Map()); // id → arquivo original, para repintar um SVG sem enviar de novo
+  const readArt = async (id, file, color = "") => {
+    rawArt.current.set(id, file);
     const { prepareArt } = await import("../lib/art-prepare.js");
-    const prepared = await prepareArt(file);
+    const prepared = await prepareArt({ ...file, color });
     setArts(m => new Map(m).set(id, prepared));
     return prepared;
+  };
+  // Cor do SVG: "" = cores originais; senão a arte inteira sai nessa cor.
+  const setArtColor = async color => {
+    if (!cur || color === (cur.color || "")) return;
+    const id = cur.fileId;
+    setErr(""); setLoadingArt(true);
+    try {
+      const file = rawArt.current.get(id) || await loadArtFile(id);
+      if (!file) throw new Error("arquivo original não encontrado — envie de novo");
+      await readArt(id, file, color);
+      setCur(c => (c && c.fileId === id ? { ...c, color } : c));
+    } catch (e) { setErr(`Não foi possível trocar a cor: ${e.message}`); }
+    setLoadingArt(false);
   };
   // Artes da fila: os arquivos ficam no IndexedDB e são lidos de novo ao abrir a aba.
   useEffect(() => {
     for (const j of readJson(QUEUE_KEY, []).filter(j => j.kind === "art")) {
-      loadArtFile(j.artId).then(f => f ? readArt(j.artId, f) : setErr(`Arquivo de ${j.name} não encontrado — remova e envie de novo`))
+      loadArtFile(j.artId).then(f => f ? readArt(j.artId, f, j.color || "") : setErr(`Arquivo de ${j.name} não encontrado — remova e envie de novo`))
         .catch(e => setErr(`Erro ao ler ${j.name}: ${e.message}`));
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -249,7 +267,7 @@ export default function NameLabels({ variant = "names" }) {
     }
     return n;
   });
-  const curArtJob = cur && curArt ? { id: "current", kind: "art", artId: cur.fileId, name: curArt.name, fileType: curArt.kind, w: cur.w, h: cur.h, qty: cur.qty, mask: cur.mask, autoRotate: cur.autoRotate !== false, opts, count: cur.qty } : null;
+  const curArtJob = cur && curArt ? { id: "current", kind: "art", artId: cur.fileId, name: curArt.name, fileType: curArt.kind, w: cur.w, h: cur.h, qty: cur.qty, mask: cur.mask, autoRotate: cur.autoRotate !== false, color: cur.color || "", opts, count: cur.qty } : null;
 
   const [art, setArt] = useState(() => new Map()); // emoji → formas coloridas (null = sem desenho)
   const [lastEmoji, setLastEmoji] = useState("💖");
@@ -300,7 +318,7 @@ export default function NameLabels({ variant = "names" }) {
   const layoutQueued = j => j.kind === "art" ? layoutArtJob(j, fonts, arts.get(j.artId)) : j.kind === "dtf" ? layoutPencilJob(j.names, j.opts, fonts) : layoutJob(j.text, j.opts, fonts);
   const queueJobs = useMemo(() => fonts ? queue.map(j => ({ ...j, sheets: layoutQueued(j) })) : [], [fonts, queue, arts]); // eslint-disable-line react-hooks/exhaustive-deps
   const queueH = queueJobs.flatMap(j => j.sheets).reduce((h, s, i) => h + s.h + (i ? opts.gap : 0), 0);
-  const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin));
+  const tooWide = sheets.some(s => s.placed.some(p => p.box.maxX - p.box.minX > opts.sheetW - 2 * opts.margin + 1e-6));
 
   const up = (k, v) => setOpts(p => ({ ...p, [k]: v }));
   const stamp = () => new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
@@ -351,7 +369,7 @@ export default function NameLabels({ variant = "names" }) {
     } else if (job.kind === "art") {
       if (cur && !queue.some(j => j.artId === cur.fileId)) deleteArtFile(cur.fileId).catch(() => {});
       setMode("art");
-      setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true, autoRotate: job.autoRotate !== false });
+      setCur({ fileId: job.artId, w: job.w, h: job.h, qty: job.qty, mask: job.mask, lock: true, autoRotate: job.autoRotate !== false, color: job.color || "" });
     } else {
       setMode("names");
       setText(job.text);
@@ -434,6 +452,18 @@ export default function NameLabels({ variant = "names" }) {
         <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
           <input type="checkbox" checked={cur.autoRotate !== false} onChange={e => setCur(c => ({ ...c, autoRotate: e.target.checked }))} /> Girar automaticamente para economizar material
         </label>
+        {curArt.kind === "svg" && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--t2)", flexWrap: "wrap" }}>
+          <span style={{ width: 60 }}>Cor</span>
+          <button className={!cur.color ? "bp" : "bs"} disabled={loadingArt} style={{ padding: "6px 10px", fontSize: 12 }} onClick={() => setArtColor("")}>Original</button>
+          {SVG_COLORS.map(([label, hex]) => (
+            <button key={hex} title={label} aria-label={label} disabled={loadingArt} onClick={() => setArtColor(hex)}
+              style={{ width: 26, height: 26, borderRadius: 6, background: hex, cursor: "pointer", border: (cur.color || "").toLowerCase() === hex ? "2px solid var(--acc, #4361ee)" : "1px solid var(--brd)", outline: (cur.color || "").toLowerCase() === hex ? "2px solid var(--card)" : "none", outlineOffset: -4 }} />
+          ))}
+          <label title="Outra cor" style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+            <input type="color" disabled={loadingArt} value={cur.color || "#000000"} onChange={e => setArtColor(e.target.value.toLowerCase())}
+              style={{ width: 30, height: 26, padding: 0, border: "1px solid var(--brd)", borderRadius: 6, background: "none", cursor: "pointer" }} /> outra
+          </label>
+        </div>}
         <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
           <span style={{ width: 60 }}>Quantidade</span>
           <input type="number" min={1} value={cur.qty} onChange={e => setCur(c => ({ ...c, qty: Math.max(1, parseInt(e.target.value, 10) || 1) }))} style={field} />
@@ -447,6 +477,7 @@ export default function NameLabels({ variant = "names" }) {
         </div>
         {curArt.kind === "jpg" && warn("JPG não tem transparência: Branco e Verniz saem no retângulo da imagem.")}
         {cur.mask === "shape" && curArt.coverage > 0.97 && warn("Este arquivo não tem fundo transparente — o contorno vai sair igual ao retângulo.")}
+        {cur.color && warn("Cor única: todo preenchimento e traço do SVG sai nessa cor (inclusive fundos e degradês).")}
         {curArt.hasText && warn("O SVG tem textos que não foram convertidos em curvas; eles podem sair com outra fonte. Converta em curvas no Corel antes de exportar.")}
         {curArt.pages > 1 && warn(`O PDF tem ${curArt.pages} páginas; só a primeira é usada.`)}
         {dpi && dpi < 200 && warn(`Resolução baixa para esse tamanho: ${dpi} dpi (o ideal é 300).`)}
@@ -671,6 +702,9 @@ export default function NameLabels({ variant = "names" }) {
             {num("Cópias de cada", "copies", "×")}
             {num("Código do pedido", "codeSize", "pt", 0.5)}
             {num("Emoji (× texto)", "emojiScale", "×", 0.05)}
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }} title="Testa reordenar os nomes e virar alguns em pé, e fica com o encaixe que gasta menos material">
+              <input type="checkbox" checked={opts.optimize !== false} onChange={e => up("optimize", e.target.checked)} /> Otimizar espaço (reordena e vira nomes em pé se economizar)
+            </label>
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--t2)" }}>
               <input type="checkbox" checked={opts.roleUpper} onChange={e => up("roleUpper", e.target.checked)} /> Linhas em Times em MAIÚSCULAS
             </label>
@@ -692,7 +726,7 @@ export default function NameLabels({ variant = "names" }) {
           {err && <p style={{ color: "#f87171", fontSize: 13, marginBottom: 10 }}>{err}</p>}
           {noArt.length > 0 && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Sem desenho para: {noArt.join(" ")} — esse emoji não vai sair.</p>}
           {mode === "art" && !curArt && !loadingArt && <p style={{ color: "var(--t2)", fontSize: 13 }}>Envie um arquivo para ver as cópias na folha.</p>}
-          {mode === "names" && tooWide && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>Algum nome é mais largo que a folha — diminua o tamanho da fonte.</p>}
+          {mode === "names" && tooWide && <p style={{ color: "#fbbf24", fontSize: 13, marginBottom: 10 }}>{opts.optimize !== false ? "Algum nome não cabe na folha nem em pé — diminua o tamanho da fonte." : "Algum nome é mais largo que a folha — diminua o tamanho da fonte ou ligue Otimizar espaço."}</p>}
           {!fonts && !err && <p style={{ color: "var(--t2)", fontSize: 13 }}>Carregando fontes…</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: 16, maxHeight: "75vh", overflow: "auto" }}>
             {sheets.map((s, i) => (

@@ -83,3 +83,15 @@ export function fitArtBoxes(qty, w, h, { W, gap, autoRotate = true }, extra = {}
   const p = planRotation(qty, w, h, W, gap);
   return [...artBoxes(p.tall, w, h, extra, p.tallRot), ...artBoxes(p.short, w, h, extra, !p.tallRot)];
 }
+
+// Pinta um SVG inteiro de uma cor só: troca todo preenchimento e traço (atributos, style e
+// <style>, incluindo degradês) por `hex`. "none" e "transparent" continuam como estão, e o que
+// não tinha cor nenhuma (preto por padrão) herda a cor nova pela raiz.
+export function recolorSvg(svgText, hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(String(hex))) return svgText;
+  const keep = v => /^\s*(none|transparent)\s*$/i.test(v);
+  let out = svgText
+    .replace(/(\s(?:fill|stroke|stop-color)\s*=\s*)(["'])(.*?)\2/gi, (m, pre, q, v) => (keep(v) ? m : `${pre}${q}${hex}${q}`))
+    .replace(/((?:^|[;{"'\s])(?:fill|stroke|stop-color)\s*:\s*)([^;"'}]+)/gi, (m, pre, v) => (keep(v) ? m : `${pre}${hex}`));
+  return out.replace(/<svg\b([^>]*)>/i, (m, attrs) => (/\sfill\s*=/.test(attrs) ? m : `<svg${attrs} fill="${hex}">`));
+}

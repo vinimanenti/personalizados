@@ -5,7 +5,7 @@
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import { jsPDF } from "jspdf";
 import "svg2pdf.js";
-import { artKind, svgSizeMM, alphaToStencil } from "./art-upload.mjs";
+import { artKind, svgSizeMM, alphaToStencil, recolorSvg } from "./art-upload.mjs";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.mjs", import.meta.url).href;
 
@@ -46,7 +46,8 @@ async function svgToPdf(svgText, wMM, hMM) {
 
 // Arquivo (bytes) → arte pronta para a folha e o PDF:
 // { kind, name, w, h (mm naturais), bytes, pdfBytes (svg/pdf), preview (data URL), stencil, hasText }
-export async function prepareArt({ name, type, bytes }) {
+// `color` (#rrggbb) só vale para SVG: a arte inteira sai nessa cor (ver recolorSvg).
+export async function prepareArt({ name, type, bytes, color = "" }) {
   const kind = artKind(name, type);
   if (!kind) throw new Error("Formato não suportado — use PNG, JPG, SVG ou PDF");
   const art = { kind, name, bytes };
@@ -57,7 +58,9 @@ export async function prepareArt({ name, type, bytes }) {
     art.h = (img.naturalHeight / PNG_DPI) * 25.4;
     art.px = [img.naturalWidth, img.naturalHeight];
   } else if (kind === "svg") {
-    const text = new TextDecoder().decode(bytes);
+    const original = new TextDecoder().decode(bytes);
+    const text = color ? recolorSvg(original, color) : original;
+    if (color) { art.color = color; bytes = new TextEncoder().encode(text); }
     Object.assign(art, svgSizeMM(text));
     art.hasText = /<text\b/i.test(text);
     art.pdfBytes = await svgToPdf(text, art.w, art.h);
